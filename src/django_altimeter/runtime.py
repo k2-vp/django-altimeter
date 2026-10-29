@@ -14,7 +14,7 @@ import os
 from dataclasses import dataclass, replace
 from glob import escape
 from math import isfinite
-from threading import Event, Lock, Thread
+from threading import Event, Lock, Thread, get_ident
 from time import monotonic
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
@@ -72,6 +72,10 @@ def _process_session(
     class ProcessSession(SanitizingSession):
         """Apply writer ownership and the shared exit budget before native HTTP."""
 
+        def _export_completed(self) -> None:
+            runtime._record_shutdown_export(self.outcome.code)
+            super()._export_completed()
+
         def request(
             self, method: str, url: str | bytes, *args: Any, **kwargs: Any
         ) -> requests.Response:
@@ -113,16 +117,15 @@ class ProcessRuntime:
         self._log_provider: LoggerProvider | None = None
         self._metric_provider: MeterProvider | None = None
         self._sessions: list[SanitizingSession] = []
-        self._policy = replace(
-            config.policy,
-            attribute_values=config.policy.attribute_values
-            | frozenset(config.resource_attributes)
-            | {("service.instance.id", self.instance_id)},
-        )
+        self._policy = config.policy
         self.result = SetupResult()
+        self._initializing_thread = get_ident()
+        self._initialized = Event()
         self._shutdown_deadline: float | None = None
         self._shutdown_result = ShutdownResult(False, ("shutdown.pending",))
         self._shutdown_lock = Lock()
+        self._export_failure_lock = Lock()
+        self._shutdown_export_failures: list[str] = []
         self._stop = Event()
         self._finished = Event()
         self._coordinator: Thread | None = None
@@ -290,6 +293,15 @@ class ProcessRuntime:
         return min(self.config.export_timeout, self.config.shutdown_timeout, 2.0)
 
     def initialize(self, inherited_signals: tuple[str, ...] = ()) -> SetupResult:
+        try:
+            return self._initialize(inherited_signals)
+        except Exception:
+            self.result = SetupResult(codes=("setup.failed",))
+            return self.result
+        finally:
+            self._initialized.set()
+
+    def _initialize(self, inherited_signals: tuple[str, ...]) -> SetupResult:
         if not self.config.enabled:
             self.result = SetupResult(codes=("setup.disabled",))
             return self.result
@@ -298,13 +310,17 @@ class ProcessRuntime:
         # may perform arbitrary I/O; unsupported ambient plugins fail open.
         if os.environ.get("OTEL_EXPERIMENTAL_RESOURCE_DETECTORS"):
             self.result = SetupResult(codes=("setup.resource_detector_conflict",))
-            _report("setup.resource_detector_conflict")
             return self.result
         if not _otel_compat.configure_http_semantics():
             self.result = SetupResult(codes=("setup.semconv_conflict",))
-            _report("setup.semconv_conflict")
             return self.result
         _otel_compat.prepare_fork_support()
+        self._policy = replace(
+            self.config.policy,
+            attribute_values=self.config.policy.attribute_values
+            | frozenset(self.config.resource_attributes)
+            | {("service.instance.id", self.instance_id)},
+        )
         enabled: list[str] = []
         codes: list[str] = []
         # A fixed three-element composition, not a provider registry.
@@ -342,7 +358,6 @@ class ProcessRuntime:
             except Exception:
                 code = f"setup.{signal}_failed"
             codes.append(code)
-            _report(code)
         self.result = SetupResult(tuple(enabled), tuple(codes))
         # Start once at setup, not at atexit. Even unsuccessful partial
         # construction can leave native workers that need bounded cleanup.
@@ -354,6 +369,32 @@ class ProcessRuntime:
             )
             self._coordinator.start()
         return self.result
+
+    def _record_shutdown_export(self, code: str) -> None:
+        if os.getpid() != self.pid or self._shutdown_deadline is None:
+            return
+        if code == "export.partial":
+            failure = "shutdown.partial"
+        elif code not in {
+            "export.not_sent",
+            "export.accepted",
+            "export.warning",
+            "export.empty",
+        }:
+            failure = "shutdown.export_failed"
+        else:
+            return
+        # Native workers and the coordinator can finish exports concurrently.
+        # This fixed two-code history cannot be overwritten by a later success.
+        with self._export_failure_lock:
+            if failure not in self._shutdown_export_failures:
+                self._shutdown_export_failures.append(failure)
+
+    def _shutdown_export_codes(self) -> tuple[str, ...]:
+        for session in self._sessions:
+            self._record_shutdown_export(session.outcome.code)
+        with self._export_failure_lock:
+            return tuple(self._shutdown_export_failures)
 
     def _coordinate_shutdown(self) -> None:
         self._stop.wait()
@@ -375,16 +416,7 @@ class ProcessRuntime:
                         codes.append("shutdown.flush_failed")
                 except Exception:
                     codes.append("shutdown.flush_failed")
-            for session in self._sessions:
-                if session.outcome.code == "export.partial":
-                    codes.append("shutdown.partial")
-                elif session.outcome.code not in {
-                    "export.not_sent",
-                    "export.accepted",
-                    "export.warning",
-                    "export.empty",
-                }:
-                    codes.append("shutdown.export_failed")
+            codes.extend(self._shutdown_export_codes())
             for provider in providers:
                 if provider is None:
                     continue
@@ -399,6 +431,8 @@ class ProcessRuntime:
                         provider.shutdown()
                 except Exception:
                     codes.append("shutdown.cleanup_failed")
+                finally:
+                    codes.extend(self._shutdown_export_codes())
             for session in self._sessions:
                 if monotonic() >= deadline:
                     codes.append("shutdown.deadline")
@@ -409,6 +443,7 @@ class ProcessRuntime:
         except Exception:
             codes.append("shutdown.cleanup_failed")
         finally:
+            codes.extend(self._shutdown_export_codes())
             fixed_codes = tuple(dict.fromkeys(codes))
             self._shutdown_result = ShutdownResult(not fixed_codes, fixed_codes)
             self._finished.set()
@@ -419,6 +454,11 @@ class ProcessRuntime:
         if type(timeout) not in (int, float) or not isfinite(timeout) or timeout < 0:
             return ShutdownResult(False, ("shutdown.invalid_timeout",))
         deadline = monotonic() + min(timeout, self.config.shutdown_timeout, 2.0)
+        if not self._initialized.is_set():
+            if self._initializing_thread == get_ident():
+                return ShutdownResult(False, ("shutdown.pending",))
+            if not self._initialized.wait(max(0, deadline - monotonic())):
+                return ShutdownResult(False, ("shutdown.deadline",))
         if not self._shutdown_lock.acquire(timeout=max(0, deadline - monotonic())):
             return ShutdownResult(False, ("shutdown.deadline",))
         try:
@@ -461,23 +501,42 @@ def setup(config: Config) -> SetupResult:
             return SetupResult(codes=validated.codes)
         config = validated.config
         with _setup_lock:
-            inherited: tuple[str, ...] = ()
-            if _runtime is not None:
-                if _runtime.pid == os.getpid():
-                    if _runtime.config != config:
-                        _report("setup.config_conflict")
-                        return SetupResult(codes=("setup.config_conflict",))
-                    if _runtime._shutdown_deadline is not None:
-                        return SetupResult(codes=("setup.stopped",))
-                    return _runtime.result
-                inherited = _runtime.result.enabled_signals
-            runtime = ProcessRuntime(config)
+            runtime = _runtime
+            install = runtime is None or runtime.pid != os.getpid()
+            if install:
+                inherited = () if runtime is None else runtime.result.enabled_signals
+                runtime = ProcessRuntime(config)
+                # Claim the single writer before native construction, which can
+                # invoke logging handlers on this thread or an SDK helper thread.
+                _runtime = runtime
+        assert runtime is not None
+        if install:
             result = runtime.initialize(inherited)
-            _runtime = runtime
-            if not _atexit_registered and runtime._coordinator is not None:
-                atexit.register(shutdown)
-                _atexit_registered = True
-            return result
+            with _setup_lock:
+                if not _atexit_registered and runtime._coordinator is not None:
+                    atexit.register(shutdown)
+                    _atexit_registered = True
+        else:
+            if not runtime._initialized.is_set():
+                if runtime._initializing_thread == get_ident():
+                    return SetupResult(codes=("setup.in_progress",))
+                # A native constructor may be waiting on a handler in another
+                # thread. Bound that reentry instead of waiting on each other.
+                if not runtime._initialized.wait(1.0):
+                    return SetupResult(codes=("setup.in_progress",))
+            # Callback objects may implement equality; compare outside locks.
+            if runtime.config != config:
+                result = SetupResult(codes=("setup.config_conflict",))
+            elif runtime._shutdown_deadline is not None:
+                return SetupResult(codes=("setup.stopped",))
+            else:
+                return runtime.result
+        # Publish initialization before diagnostics, so identical reentry sees
+        # the completed result and does not recursively emit the same codes.
+        for code in result.codes:
+            if code != "setup.disabled":
+                _report(code)
+        return result
     except Exception:
         _report("setup.failed")
         return SetupResult(codes=("setup.failed",))
@@ -499,6 +558,7 @@ def get_owned_trace_runtime() -> ProcessRuntime | None:
     if (
         runtime is None
         or runtime.pid != os.getpid()
+        or not runtime._initialized.is_set()
         or runtime._shutdown_deadline is not None
         or "traces" not in runtime.result.enabled_signals
     ):
@@ -517,6 +577,7 @@ def get_process_runtime() -> ProcessRuntime | None:
     if (
         runtime is None
         or runtime.pid != os.getpid()
+        or not runtime._initialized.is_set()
         or runtime._shutdown_deadline is not None
         or not runtime.result.enabled_signals
     ):

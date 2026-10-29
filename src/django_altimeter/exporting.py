@@ -19,6 +19,7 @@ from io import BytesIO
 from math import isfinite
 from os import dup
 from socket import SHUT_RDWR, socket
+from sys import exception
 from threading import Lock, Timer
 from time import monotonic
 from traceback import clear_frames
@@ -690,16 +691,17 @@ class SanitizingSession(requests.Session):
         except Exception:
             self._outcome = replace(self._outcome, code="export.failed")
 
-    def _clear_failure_frames(self) -> None:
+    def _clear_failure_frames(self, caller_exception: BaseException | None) -> None:
         failures = self._failures.get()
         self._failures.set(())
         try:
             for failure in failures:
                 error: BaseException | None = failure()
-                # Requests/urllib3 can chain their error before our fixed code.
-                # Public exception/traceback APIs only; no native private state.
+                # Native transport failures can chain through Requests/urllib3.
+                # The exception active at export entry predates all of them:
+                # never traverse or clear that caller-owned chain or its frames.
                 for _ in range(8):
-                    if error is None:
+                    if error is None or error is caller_exception:
                         break
                     chained = error.__cause__ or error.__context__
                     if error.__traceback__ is not None:
@@ -710,6 +712,10 @@ class SanitizingSession(requests.Session):
                     error = chained
         except Exception:
             self._outcome = replace(self._outcome, code="export.failed")
+
+    def _export_completed(self) -> None:
+        """Finish one native export, after its own retry loop has returned."""
+        self._emit_diagnostic()
 
     def _emit_diagnostic(self) -> None:
         # One fixed signal per session, and a closed code set bounds this map.
@@ -933,14 +939,15 @@ def create_span_exporter(
 
     class _SanitizingSpanExporter(OTLPSpanExporter):
         def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
+            caller_exception = exception()
             session._outcome = ExportOutcome()
             failures_token = session._failures.set(())
             try:
                 return super().export(spans)
             finally:
-                session._clear_failure_frames()
+                session._clear_failure_frames(caller_exception)
                 session._failures.reset(failures_token)
-                session._emit_diagnostic()
+                session._export_completed()
 
     return _SanitizingSpanExporter(
         endpoint=session.endpoint,
@@ -968,14 +975,15 @@ def create_log_exporter(
 
     class _SanitizingLogExporter(OTLPLogExporter):
         def export(self, batch: Sequence[ReadableLogRecord]) -> LogRecordExportResult:
+            caller_exception = exception()
             session._outcome = ExportOutcome()
             failures_token = session._failures.set(())
             try:
                 return super().export(batch)
             finally:
-                session._clear_failure_frames()
+                session._clear_failure_frames(caller_exception)
                 session._failures.reset(failures_token)
-                session._emit_diagnostic()
+                session._export_completed()
 
     return _SanitizingLogExporter(
         endpoint=session.endpoint,
@@ -1039,6 +1047,7 @@ def create_metric_exporter(
             timeout_millis: float | None = 10_000,
             **kwargs: Any,
         ) -> MetricExportResult:
+            caller_exception = exception()
             session._outcome = ExportOutcome()
             if (
                 timeout_millis is not None
@@ -1084,10 +1093,10 @@ def create_metric_exporter(
                     session._outcome = replace(
                         session._outcome, code="metrics.timeout_unsupported"
                     )
-                session._clear_failure_frames()
+                session._clear_failure_frames(caller_exception)
                 session._failures.reset(failures_token)
                 session._deadline.reset(token)
                 self._export_lock.release()
-                session._emit_diagnostic()
+                session._export_completed()
 
     return _DeadlineMetricExporter()

@@ -4,9 +4,10 @@ This package provides bounded, privacy-preserving OpenTelemetry components for
 Django applications: record admission, allow-list projection, and OTLP/HTTP
 export.
 
-The current development release supports explicit composition with native
-OpenTelemetry providers. Runtime setup (`setup()` and `shutdown()`) and
-Django/queue integration are not available yet.
+The current development release provides explicit runtime setup and shutdown,
+safe application spans, correlation, and trusted identity enrichment. Automatic
+HTTP and queue instrumentation are not included yet. Telemetry is disabled by
+default.
 
 ## Install
 
@@ -39,9 +40,151 @@ matching 0.66b1 semantic conventions. Queue extras use Celery >=5.6.3,<5.7
 and Kombu >=5.6.2,<5.7, or RQ >=2.10.0,<2.11. The development lock currently
 resolves those families to 1.45.1/0.66b1, 5.6.3/5.6.2, and 2.10.0 respectively.
 
-## Usage
+## Runtime lifecycle
 
-Construct providers explicitly and give each signal its own sanitizing session.
+Add `"django_altimeter"` to Django's `INSTALLED_APPS` to register configuration
+checks. `AppConfig.ready()` only registers these checks. Importing the package,
+running migrations, and opening a Django shell do not initialize telemetry.
+Invalid telemetry settings produce fixed-code `django_altimeter.W001` warnings
+without preventing Django startup.
+
+Enable telemetry and set the required resource identity. For a local OTLP/HTTP
+collector, configure one full endpoint per signal:
+
+```sh
+export ALTIMETER_ENABLED=true
+export ALTIMETER_SERVICE_NAME=example-app
+export ALTIMETER_DEPLOYMENT_ENVIRONMENT=development
+export ALTIMETER_RELEASE=local
+export ALTIMETER_TRACES_COLLECTOR_ENDPOINT=http://127.0.0.1:4318/v1/traces
+export ALTIMETER_LOGS_COLLECTOR_ENDPOINT=http://127.0.0.1:4318/v1/logs
+export ALTIMETER_METRICS_COLLECTOR_ENDPOINT=http://127.0.0.1:4318/v1/metrics
+export OTEL_SEMCONV_STABILITY_OPT_IN=http
+```
+
+Signals default to enabled when the package is enabled. Set, for example,
+`ALTIMETER_LOGS_ENABLED=false` to disable one signal. Disabled signals need no
+destination. Endpoints require HTTPS except for literal loopback HTTP collector
+addresses. Each signal has one destination; conflicting routes are rejected.
+Collector authentication is separate from PostHog ingestion credentials. Set
+`ALTIMETER_{TRACES,LOGS,METRICS}_COLLECTOR_HEADERS` for collector authentication;
+non-loopback collectors require their own credentials.
+
+For PostHog, use `ALTIMETER_{TRACES,LOGS,METRICS}_ENDPOINT` with the corresponding
+`https://us.i.posthog.com/i/v1/{signal}` or EU regional URL, and supply the project
+ingestion token in `ALTIMETER_POSTHOG_TOKEN`. Configure only one route per signal.
+
+Environment values control deployment settings. A small `settings.ALTIMETER`
+dictionary supplies trusted static policy and callback configuration. Explicit
+`setup(role=...)` overrides the environment role; `ALTIMETER_*` values take
+precedence over supported standard `OTEL_*` values and defaults. Credentials
+never enter resource attributes or displayed configuration. Auto-discovered
+native resource detectors are unsupported: a nonempty
+`OTEL_EXPERIMENTAL_RESOURCE_DETECTORS` setting disables setup with
+`setup.resource_detector_conflict`. Use validated static resource values.
+For example:
+
+```python
+ALTIMETER = {
+    "SPAN_NAMES": frozenset({"report.generate"}),
+    "LOG_BODIES": frozenset({"request.complete"}),
+    "METRIC_INSTRUMENTS": frozenset({("django_altimeter", "runtime.calls")}),
+}
+```
+
+`IDENTITY_RESOLVER` accepts a trusted callable or dotted path, loaded only after
+Django's app registry is ready. It must use already-resolved in-memory facts and
+return `django_altimeter.context.Identity(distinct_id=..., tenant_id=...)` or
+`None`; it must not perform authentication, ORM queries, or other I/O.
+
+| Environment setting | Default and range |
+| --- | --- |
+| `ALTIMETER_SAMPLE_RATE` | `1.0`, from `0` to `1`; metrics are independent |
+| `ALTIMETER_TRUST_REMOTE_PARENT` | `false`; supported parent-based OTel sampler settings can opt in |
+| `ALTIMETER_EXPORT_TIMEOUT` | `1` second, from `0.001` to `2` |
+| `ALTIMETER_SHUTDOWN_TIMEOUT` | `2` seconds, from `0.001` to `2` |
+| `ALTIMETER_BATCH_SCHEDULE_DELAY_MILLIS` | `5000`, from `1` to `60000` |
+| `ALTIMETER_METRIC_EXPORT_INTERVAL_MILLIS` | `10000`, from `1` to `60000` |
+
+`ALTIMETER_MAX_*` settings match the `PrivacyLimits` field names below and can
+only lower their ceilings. Shared standard OTel span/log queue and batch limits
+must agree unless an Altimeter value overrides them.
+
+Call `setup(role="web")` explicitly after Django initializes, in the worker that
+will serve requests. Enabled setup starts native batch workers. The pinned
+urllib3 import may create and bind a local IPv6 socket to `::1` on port `0` to
+check IPv6 support; setup makes no outbound connection, sends no data, resolves
+no DNS name, and probes no export endpoint. Disabled, invalid, and unowned setup
+create no sockets. Inspect `SetupResult.enabled_signals` and `codes`;
+`ok` means at least one signal is enabled, so a partial ownership conflict may
+still leave other signals working.
+
+| Function | Behavior |
+| --- | --- |
+| `setup(*, role=None)` | Loads and validates Django/environment configuration, then installs owned providers. Returns frozen `SetupResult(enabled_signals, codes)`. |
+| `shutdown(*, timeout=2.0)` | Drains owned signals within one shared deadline. Returns frozen `ShutdownResult(completed, codes)`. |
+| `span(name, *, attributes=None)` | Creates a registered span, or an explicit no-op when tracing is unavailable. Pass a plain dictionary of bounded scalar values; unsupported containers are ignored before the SDK can inspect them. Application exceptions propagate unchanged. |
+| `get_correlation()` | Returns native trace/span IDs and trace flags only while this worker owns tracing; otherwise returns `None`. |
+| `enrich(subject)` | Calls the configured trusted identity resolver for an already-resolved subject. It never authenticates a request or loads a Django model. |
+
+For a script with `DJANGO_SETTINGS_MODULE` already set, initialize Django before
+calling the public API:
+
+```python
+import django
+
+from django_altimeter import get_correlation, setup, shutdown, span
+
+django.setup()
+result = setup(role="web")
+try:
+    print(result.enabled_signals, result.codes)
+    with span("GET", attributes={"http.response.status_code": 200}):
+        print(get_correlation())
+finally:
+    print(shutdown(timeout=2.0))
+```
+
+Repeated or concurrent setup with the same effective configuration installs once.
+Changing configuration after setup requires a worker restart. Each signal checks
+ownership independently: an existing third-party provider is left untouched, and
+Altimeter disables its use of that signal. Unowned tracing discloses no
+correlation or identity. Every exporting worker has a fresh UUID
+`service.instance.id`, including for delta metrics.
+
+Keep setup and shutdown in the application's explicit startup and cleanup
+hooks. **Gunicorn preload is unsupported.** Initialize after forking; a child
+that inherits initialized providers disables the affected signals. Automatic
+HTTP instrumentation and server lifecycle adapters are not included.
+
+Use one shutdown call at worker exit, outside request and task bodies:
+
+```python
+from django_altimeter import shutdown
+
+result = shutdown(timeout=2.0)
+print(result.completed, result.codes)
+```
+
+Two seconds is the total default budget across traces, logs, metrics, HTTP
+retries, and cleanup, capped further by configuration or a shorter caller
+budget. Native providers have independent exit drains disabled; one coordinator
+owns normal-exit cleanup. A timeout can leave pending telemetry unsent. SIGKILL,
+a crash, or container termination before the drain can also lose queued data.
+There is no disk spool or durable outbox. A completed shutdown does not imply
+durable remote ingestion.
+
+To disable telemetry, set the environment value and restart the workers:
+
+```sh
+export ALTIMETER_ENABLED=false
+```
+
+## Direct component usage
+
+For standalone component use, run these examples in a separate script without
+calling `setup()`. Construct providers explicitly and give each signal its own
+sanitizing session.
 Use a static policy containing only the names and values your application may
 export. Creating a batch processor starts its native worker; shut down its
 provider when you finish.
@@ -156,9 +299,17 @@ Raw paths and queries, SQL text and parameters, bodies, cookies, authentication
 headers, task arguments/results, exception prose/locals, and unknown structured
 fields are excluded. Status descriptions and stack traces are removed. Metrics
 require exact scope/instrument pairs; exemplar filtered attributes are removed
-while native trace/span IDs can remain. Default policy includes no application
-log bodies or metric instruments. Wire projection does not implement metric
-Views or limit series retained before aggregation.
+while native trace/span IDs can remain. The identity resolver may supply only
+`posthogDistinctId` and `altimeter.tenant_id` as nonblank strings of at most
+200 UTF-8 bytes, also respecting a smaller configured string limit. These fields
+are confined to span/log records; resources, metrics, exemplars, events, and
+links exclude them. Session identifiers are excluded. `span(attributes=...)`
+cannot supply identity fields; use a trusted resolver through `enrich()`.
+Default policy includes no application log bodies or metric instruments. Wire projection does not implement metric
+Views or limit series retained before aggregation. Runtime-owned metric Views
+select exact scope/instrument pairs, drop all attributes before aggregation,
+and disable exemplars. This keeps one series per registered instrument; route,
+status, and other metric dimensions are not available yet.
 
 `django_altimeter.exporting` supplies `BoundedSpanProcessor` and the
 `bounded_log_processor()` construction function. Each resulting processor owns
@@ -196,10 +347,14 @@ walking them. Structured log reconstruction is a separate projection path.
 Projection also bounds groups, scopes, and records/points using the 128-entry
 batch ceiling, and metric buckets/quantiles/exemplars using the 16-child ceiling.
 The retained-record estimate and protobuf output limit do not measure Python
-heap usage or peak transient memory. Steady-state RSS under load has not been
-measured. Transport enforces `max_batch_bytes` before parsing and after projection,
-and `max_response_bytes` while streaming. Response reads retain at most 64 KiB
-plus one byte used to detect overflow.
+heap usage or peak transient memory. Each span/log signal can retain up to
+512 queued records plus a batch of 128 in flight. Runtime metric Views keep one
+aggregate series per registered instrument and drop dimensions even for rejected
+instruments. Python objects, encoding buffers, and allocator behavior also
+contribute to RSS; these payload ceilings are not a total process memory limit.
+Transport enforces `max_batch_bytes` before parsing and after projection, and
+`max_response_bytes` while streaming. Response reads retain at most 64 KiB plus
+one byte used to detect overflow.
 
 ## OTLP transport, acceptance, and loss
 
@@ -290,6 +445,8 @@ uv run mypy src
 uv build
 uv run pytest tests/unit/test_privacy.py tests/unit/test_admission.py tests/integration/test_wheel.py
 uv run pytest tests/integration/test_otlp_transport.py
+uv run pytest tests/unit/test_conf.py tests/unit/test_context.py
+uv run pytest tests/integration/test_django_boundary.py tests/integration/test_context_export.py tests/integration/test_runtime_process.py
 ```
 
 Distribution tests use the existing `dist/` artifacts; rebuild after changing
@@ -313,15 +470,24 @@ docker compose -p <unique-asgi-transport-name> -f reference/compose.yaml --profi
 docker compose -p <unique-wsgi-transport-name> -f reference/compose.yaml --profile wsgi run --build --rm verify-wsgi python -m pytest tests/integration/test_otlp_transport.py
 ```
 
+Test explicit runtime ownership and Django startup in both profiles:
+
+```sh
+docker compose -p <unique-asgi-runtime-name> -f reference/compose.yaml --profile asgi run --build --rm verify-asgi python -m pytest tests/integration/test_django_boundary.py tests/integration/test_runtime_process.py
+docker compose -p <unique-wsgi-runtime-name> -f reference/compose.yaml --profile wsgi run --build --rm verify-wsgi python -m pytest tests/integration/test_django_boundary.py tests/integration/test_runtime_process.py
+```
+
 The ASGI image pins Requests 2.33.1 / urllib3 2.6.3; the WSGI image pins
 Requests 2.32.3 / urllib3 1.26.20. Both exercise the same transport contract.
 
 The images install the built wheel, copy both distribution artifacts and tests,
-and verify the installed package against that wheel. They contain no source
-checkout or editable package installation. The image and its nested clean venv
-both use the declared Python/Django profile. These profiles currently verify
-packaging and local OTLP behavior; server and worker workloads are not covered
-yet.
+and verify the installed package against that wheel. They contain no package
+source checkout or editable installation. The image and its nested clean venv
+both use the declared Python/Django profile. The Django boundary tests use the
+small reference settings and health callable in fresh subprocesses, including
+migrations and shell commands. Tests cover packaging, explicit runtime ownership,
+Django startup, and local OTLP behavior. Server and worker workloads are not
+covered yet.
 
 The function-scoped `otlp_receiver` fixture listens on an ephemeral loopback
 port. `.endpoint` gives the base URL and `.url("traces")`, `.url("logs")`, or

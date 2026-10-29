@@ -12,3 +12,5 @@
 **/__pycache__/
 **/*.py[cod]
 **/.pytest_cache/
+!reference/altimeter_reference/
+!reference/altimeter_reference/*.py

@@ -1,0 +1,74 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "django-altimeter"
+version = "0.1.0.dev0"
+description = "Bounded, privacy-preserving OpenTelemetry for Django"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{name = "K2 Venture Partners"}]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Framework :: Django",
+    "Framework :: Django :: 5.2",
+    "Framework :: Django :: 6.0",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Typing :: Typed",
+]
+dependencies = [
+    "Django>=5.2,<6.1",
+    "opentelemetry-api>=1.45.1,<1.46",
+    "opentelemetry-sdk>=1.45.1,<1.46",
+    "opentelemetry-exporter-otlp-proto-http>=1.45.1,<1.46",
+]
+
+[project.optional-dependencies]
+celery = ["celery>=5.6.3,<5.7", "kombu>=5.6.2,<5.7"]
+rq = ["rq>=2.10.0,<2.11"]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.18,<2",
+    "pytest>=8.4,<10",
+    "pytest-django>=4.11,<5",
+    "ruff>=0.14,<1",
+    "types-protobuf>=6.32,<8",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = false
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["django_altimeter*"]
+namespaces = false
+
+[tool.setuptools.package-data]
+django_altimeter = ["py.typed"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+
+[[tool.mypy.overrides]]
+module = ["opentelemetry.proto.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tests"]
+addopts = "--strict-markers --strict-config"
+markers = ["integration: built-artifact or real-process integration checks"]

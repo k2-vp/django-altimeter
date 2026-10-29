@@ -1,0 +1,33 @@
+# Local planning and agent-coordination state; never pushed.
+# docs/ is for package documentation; only these paths stay local.
+/docs/plans/
+/docs/design/
+/2026-10-27-k2-observability-brainstorm-requirements.md
+/.skill-loop-progress.md
+/.beads/
+/.bv/
+/.cass/
+/.ntm/
+/.plans/
+
+# Python build, environment and tool caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+/build/
+/dist/
+/.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Browser test tooling
+node_modules/
+/tests/browser/test-results/
+/tests/browser/playwright-report/
+
+# OS
+.DS_Store

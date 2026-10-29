@@ -11,11 +11,12 @@ from __future__ import annotations
 import atexit
 import logging
 import os
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
+from datetime import UTC, datetime
 from glob import escape
 from math import isfinite
 from threading import Event, Lock, Thread, get_ident
-from time import monotonic
+from time import monotonic, time_ns
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
@@ -281,11 +282,14 @@ class ProcessRuntime:
             raise RuntimeError("setup.metrics_race")
         self.meter_provider = provider
 
-    def _resource_attributes(self) -> dict[str, str]:
-        return {
+    def _resource_attributes(self) -> dict[str, str | bool]:
+        attributes: dict[str, str | bool] = {
             **dict(self.config.resource_attributes),
             "service.instance.id": self.instance_id,
         }
+        if self.config.role == "probe":
+            attributes["altimeter.probe"] = True
+        return attributes
 
     def _export_timeout(self) -> float:
         # An export already in progress when shutdown begins cannot consume an
@@ -583,3 +587,350 @@ def get_process_runtime() -> ProcessRuntime | None:
     ):
         return None
     return runtime
+
+
+def validate_runtime(config: Config) -> tuple[str, ...]:
+    """Read the same configuration/ownership boundaries without starting work."""
+    try:
+        validation = validate_config(config)
+        if validation.config is None:
+            return validation.codes
+        if not config.enabled:
+            return ()
+        codes: list[str] = []
+        if os.environ.get("OTEL_EXPERIMENTAL_RESOURCE_DETECTORS"):
+            codes.append("setup.resource_detector_conflict")
+        if not _otel_compat.http_semantics_are_compatible():
+            codes.append("setup.semconv_conflict")
+        current = _runtime
+        if current is not None and current.pid == os.getpid():
+            if not current._initialized.is_set():
+                return (*codes, "setup.in_progress")
+            # Validation must not invoke callback objects' custom equality.
+            callbacks_match = (
+                current.config.identity_resolver is config.identity_resolver
+                and current.config.log_scrubber is config.log_scrubber
+            )
+            values_match = current.config.enabled == config.enabled and replace(
+                current.config, identity_resolver=None, log_scrubber=None
+            ) == replace(config, identity_resolver=None, log_scrubber=None)
+            if not callbacks_match or not values_match:
+                codes.append("setup.config_conflict")
+            if current._shutdown_deadline is not None:
+                codes.append("setup.stopped")
+        for name, available in (
+            ("traces", _otel_compat.trace_provider_is_unset),
+            ("logs", _otel_compat.log_provider_is_unset),
+            ("metrics", _otel_compat.metric_provider_is_unset),
+        ):
+            if not getattr(config, name).enabled:
+                continue
+            if current is not None and name in current.result.enabled_signals:
+                if current.pid != os.getpid():
+                    codes.append(f"setup.{name}_inherited")
+                continue
+            if not available():
+                codes.append(f"setup.{name}_foreign")
+        return tuple(dict.fromkeys(codes))
+    except Exception:
+        return ("setup.failed",)
+
+
+@dataclass(frozen=True)
+class ProbeSignalResult:
+    signal: str
+    code: str = "export.not_sent"
+    accepted_records: int = 0
+    rejected_records: int = 0
+    local_dropped_records: int = 0
+
+    @property
+    def accepted(self) -> bool:
+        return (
+            self.code in {"export.accepted", "export.warning"}
+            and self.accepted_records == 1
+            and self.rejected_records == 0
+            and self.local_dropped_records == 0
+        )
+
+
+@dataclass(frozen=True)
+class ProbeResult:
+    instance_id: str | None
+    started_at: datetime
+    finished_at: datetime
+    signals: tuple[ProbeSignalResult, ...] = ()
+    codes: tuple[str, ...] = ()
+
+    @property
+    def ok(self) -> bool:
+        return (
+            bool(self.signals)
+            and not self.codes
+            and all(signal.accepted for signal in self.signals)
+        )
+
+
+_PROBE_SIGNALS = ("traces", "logs", "metrics")
+_PROBE_NAME = "altimeter.probe"
+_PROBE_INPUT_LIMIT = 256 * 1024
+_PROBE_OUTPUT_LIMIT = 16 * 1024
+
+
+def _probe_configuration(config: Config, signals: tuple[str, ...]) -> dict[str, Any]:
+    # Transfer only the deployment values needed by the existing composition.
+    # Callbacks, request policy and operator/read-back credentials never cross.
+    from django_altimeter.conf import SignalConfig
+
+    return {
+        "service_name": config.service_name,
+        "deployment_environment": config.deployment_environment,
+        "release": config.release,
+        "traces": asdict(config.traces if "traces" in signals else SignalConfig()),
+        "logs": asdict(config.logs if "logs" in signals else SignalConfig()),
+        "metrics": asdict(config.metrics if "metrics" in signals else SignalConfig()),
+        "limits": asdict(config.limits),
+        "export_timeout": config.export_timeout,
+        "shutdown_timeout": config.shutdown_timeout,
+    }
+
+
+def _probe_config_from_json(values: dict[str, Any]) -> Config:
+    from django_altimeter.conf import SignalConfig
+    from django_altimeter.privacy import PrivacyLimits, PrivacyPolicy
+
+    def signal(name: str) -> SignalConfig:
+        data = values[name]
+        return SignalConfig(
+            enabled=data["enabled"],
+            endpoint=data["endpoint"],
+            headers=tuple(tuple(pair) for pair in data["headers"]),
+            destination=data["destination"],
+        )
+
+    # This is a private value transfer, not another configuration parser:
+    # validate_config below applies the same public deployment contract.
+    return Config(
+        enabled=True,
+        service_name=values["service_name"],
+        deployment_environment=values["deployment_environment"],
+        release=values["release"],
+        role="probe",
+        traces=signal("traces"),
+        logs=signal("logs"),
+        metrics=signal("metrics"),
+        limits=PrivacyLimits(**values["limits"]),
+        policy=PrivacyPolicy(
+            span_names=frozenset({_PROBE_NAME}),
+            log_bodies=frozenset({_PROBE_NAME}),
+            metric_instruments=frozenset({("django_altimeter", _PROBE_NAME)}),
+        ),
+        export_timeout=values["export_timeout"],
+        shutdown_timeout=values["shutdown_timeout"],
+        # One explicit drain owns collection. Probe sampling is always on.
+        batch_schedule_delay_millis=60000,
+        metric_export_interval_millis=60000,
+    )
+
+
+def _perform_probe(
+    config: Config, started_at: datetime, deadline: float
+) -> ProbeResult:
+    from opentelemetry._logs import SeverityNumber
+    from opentelemetry.context import Context
+
+    requested = tuple(name for name in _PROBE_SIGNALS if getattr(config, name).enabled)
+    validation = validate_config(config)
+    if validation.config is None:
+        return ProbeResult(None, started_at, datetime.now(UTC), codes=validation.codes)
+    runtime = ProcessRuntime(config)
+    codes: list[str] = []
+    try:
+        initialized = runtime.initialize()
+        codes.extend(initialized.codes)
+        if monotonic() >= deadline:
+            codes.append("probe.deadline")
+        else:
+            if "traces" in initialized.enabled_signals:
+                span = runtime.tracer_provider.get_tracer(
+                    "django_altimeter"
+                ).start_span(_PROBE_NAME, context=Context())
+                span.end()
+            if "logs" in initialized.enabled_signals:
+                runtime.logger_provider.get_logger("django_altimeter").emit(
+                    timestamp=time_ns(),
+                    observed_timestamp=time_ns(),
+                    body=_PROBE_NAME,
+                    severity_number=SeverityNumber.INFO,
+                )
+            if "metrics" in initialized.enabled_signals:
+                runtime.meter_provider.get_meter("django_altimeter").create_counter(
+                    _PROBE_NAME, unit="1"
+                ).add(1)
+    except Exception:
+        codes.append("probe.failed")
+    finally:
+        stopped = runtime.shutdown(timeout=max(0, deadline - monotonic()))
+        codes.extend(stopped.codes)
+    results = []
+    for name in requested:
+        session = next(
+            (item for item in runtime._sessions if item.signal == name), None
+        )
+        if session is None:
+            results.append(ProbeSignalResult(name))
+        else:
+            outcome = session.outcome
+            results.append(
+                ProbeSignalResult(
+                    name,
+                    outcome.code,
+                    outcome.accepted_records,
+                    outcome.rejected_records,
+                    outcome.local_dropped_records,
+                )
+            )
+    return ProbeResult(
+        runtime.instance_id,
+        started_at,
+        datetime.now(UTC),
+        tuple(results),
+        tuple(dict.fromkeys(codes)),
+    )
+
+
+def _probe_child() -> None:
+    """Private, one-request helper; never load a Django app or operator key."""
+    import json
+    import sys
+
+    started = datetime.now(UTC)
+    try:
+        raw = sys.stdin.buffer.read(_PROBE_INPUT_LIMIT + 1)
+        if len(raw) > _PROBE_INPUT_LIMIT:
+            raise ValueError("probe.input_size")
+        request = json.loads(raw)
+        started = datetime.fromisoformat(request["started_at"])
+        result = _perform_probe(
+            _probe_config_from_json(request["config"]), started, request["deadline"]
+        )
+    except Exception:
+        result = ProbeResult(None, started, datetime.now(UTC), codes=("probe.failed",))
+    output = {
+        "instance_id": result.instance_id,
+        "started_at": result.started_at.isoformat(),
+        "finished_at": result.finished_at.isoformat(),
+        "signals": [asdict(signal) for signal in result.signals],
+        "codes": result.codes,
+    }
+    sys.stdout.write(json.dumps(output))
+    sys.stdout.flush()
+
+
+def probe(
+    config: Config,
+    *,
+    signals: tuple[str, ...] | None = None,
+    timeout: float = 2.0,
+) -> ProbeResult:
+    """Send one isolated safe probe per selected signal within a total budget.
+
+    A fresh helper owns all providers, native workers and at-fork hooks. Its
+    bounded stdin contains validated values, never command-line credentials.
+    No application provider or module runtime is installed in the caller.
+    """
+    import json
+    import subprocess
+    import sys
+
+    started = datetime.now(UTC)
+    requested: tuple[str, ...] = ()
+
+    def failure(*codes: str) -> ProbeResult:
+        return ProbeResult(
+            None,
+            started,
+            datetime.now(UTC),
+            tuple(ProbeSignalResult(name) for name in requested),
+            tuple(codes),
+        )
+
+    try:
+        if type(timeout) not in (int, float) or not isfinite(timeout) or timeout <= 0:
+            return failure("probe.invalid_timeout")
+        deadline = monotonic() + min(timeout, 2.0)
+        validation = validate_config(config)
+        if validation.config is None:
+            return failure(*validation.codes)
+        if signals is not None and (
+            type(signals) is not tuple
+            or len(signals) > 3
+            or any(
+                type(name) is not str or name not in _PROBE_SIGNALS for name in signals
+            )
+        ):
+            return failure("probe.invalid_signals")
+        enabled = tuple(
+            name
+            for name in _PROBE_SIGNALS
+            if config.enabled and getattr(config, name).enabled
+        )
+        requested = (
+            enabled
+            if signals is None
+            else tuple(name for name in _PROBE_SIGNALS if name in signals)
+        )
+        if not enabled or not requested:
+            return failure("nothing_to_probe")
+        if any(name not in enabled for name in requested):
+            return failure("probe.signal_disabled")
+        deadline = min(deadline, monotonic() + config.shutdown_timeout)
+        request = json.dumps(
+            {
+                "config": _probe_configuration(config, requested),
+                "started_at": started.isoformat(),
+                "deadline": deadline,
+            },
+            ensure_ascii=False,
+        ).encode("utf-8")
+        if len(request) > _PROBE_INPUT_LIMIT:
+            return failure("probe.input_size")
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith(("ALTIMETER_", "OTEL_"))
+        }
+        # The helper emits exactly one bounded JSON value. Native diagnostics
+        # stay private: only its fixed result codes are exposed to the caller.
+        with subprocess.Popen(
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                "from django_altimeter.runtime import _probe_child; _probe_child()",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=environment,
+        ) as child:
+            try:
+                output, _ = child.communicate(
+                    request, timeout=max(0, deadline - monotonic())
+                )
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.communicate()
+                return failure("probe.deadline")
+        if child.returncode != 0 or len(output) > _PROBE_OUTPUT_LIMIT:
+            return failure("probe.failed")
+        result = json.loads(output)
+        return ProbeResult(
+            result["instance_id"],
+            datetime.fromisoformat(result["started_at"]),
+            datetime.fromisoformat(result["finished_at"]),
+            tuple(ProbeSignalResult(**row) for row in result["signals"]),
+            tuple(result["codes"]),
+        )
+    except Exception:
+        return failure("probe.failed")

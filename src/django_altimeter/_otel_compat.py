@@ -41,8 +41,8 @@ def metric_provider_is_unset() -> bool:
     )
 
 
-def configure_http_semantics() -> bool:
-    """Select stable HTTP before contrib initialization, never reset its state."""
+def http_semantics_are_compatible() -> bool:
+    """Check stable HTTP compatibility without imports or environment writes."""
     key = "OTEL_SEMCONV_STABILITY_OPT_IN"
     configured = os.environ.get(key, "")
     choices = {value.strip() for value in configured.split(",") if value.strip()}
@@ -56,6 +56,17 @@ def configure_http_semantics() -> bool:
         modes = getattr(stability, "_OTEL_SEMCONV_STABILITY_SIGNAL_MAPPING", {})
         if http is None or getattr(modes.get(http), "value", None) != "http":
             return False
+    return True
+
+
+def configure_http_semantics() -> bool:
+    """Select stable HTTP before contrib initialization, never reset its state."""
+    if not http_semantics_are_compatible():
+        return False
+    key = "OTEL_SEMCONV_STABILITY_OPT_IN"
+    choices = {
+        value.strip() for value in os.environ.get(key, "").split(",") if value.strip()
+    }
     os.environ[key] = ",".join(sorted(choices | {"http"}))
     return True
 

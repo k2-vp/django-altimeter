@@ -5,9 +5,9 @@ Django applications: record admission, allow-list projection, and OTLP/HTTP
 export.
 
 The current development release provides explicit runtime setup and shutdown,
-safe application spans, correlation, and trusted identity enrichment. Automatic
-HTTP and queue instrumentation are not included yet. Telemetry is disabled by
-default.
+safe application spans, correlation, trusted identity enrichment, and on-demand
+configuration and delivery checks. Automatic HTTP and queue instrumentation are
+not included yet. Telemetry is disabled by default.
 
 ## Install
 
@@ -179,6 +179,95 @@ To disable telemetry, set the environment value and restart the workers:
 ```sh
 export ALTIMETER_ENABLED=false
 ```
+
+## Check configuration and delivery
+
+Run the management command with your application's Django settings and
+`django_altimeter` in `INSTALLED_APPS`:
+
+```sh
+python manage.py altimeter_check
+```
+
+The default local check validates effective configuration, installed integration
+dependencies, and provider ownership. It starts no exporter, worker thread, or
+network connection. Disabled telemetry is valid; invalid requested configuration,
+a provider conflict, or a missing requested dependency returns a failure. Output
+contains fixed diagnostic codes and safe service metadata, never credentials,
+endpoint URLs, DSNs, or server response text.
+
+Send an explicit probe to the configured destinations:
+
+```sh
+python manage.py altimeter_check --probe
+python manage.py altimeter_check --probe --signal traces --signal logs --json
+```
+
+The probe runs in a short-lived isolated process with role `probe`, a fresh
+`service.instance.id`, and resource flag `altimeter.probe=true`. It sends exactly
+one record for each selected enabled signal: a span, a log record, or a metric
+point. All use the fixed name `altimeter.probe`. The metric has value `1` and
+scope `django_altimeter`. Exclude
+these tagged records from application dashboards. The probe uses a two-second
+deadline and leaves the calling process's providers untouched. With no enabled
+signal it fails with `nothing_to_probe` and sends nothing. Explicitly selecting a
+disabled signal fails with `probe.signal_disabled`. Partial rejection, invalid
+responses, authentication errors, and timeouts fail the acceptance check. A
+zero-rejection warning is accepted with `export.warning`; the warning text is
+discarded.
+
+Read-back also sends a probe, then queries PostHog separately for every requested
+signal:
+
+```sh
+python manage.py altimeter_check --read-back --timeout 10
+python manage.py altimeter_check --read-back --signal metrics --json
+```
+
+Supply `ALTIMETER_READBACK_API_KEY` through the operator's environment or secret
+manager, together with `ALTIMETER_READBACK_PROJECT_ID`. Use a personal API key
+scoped to the target project with `query:read` permission. This key is separate
+from the ingestion token and is never loaded into runtime configuration or
+passed as a command-line argument. `ALTIMETER_READBACK_HOST` defaults to
+`https://us.posthog.com`; use `https://eu.posthog.com` for an EU project.
+
+A match must have the probe's fresh writer ID, fixed resource flag, fixed payload
+name, and a timestamp within its bounded send window. Metrics also require the
+`django_altimeter` instrumentation scope. Old data, another writer, or a trace
+without matching logs and metrics cannot satisfy those other signals. Missing
+operator credentials or unsupported query access fails read-back; successful
+OTLP acceptance alone does not establish storage or query visibility.
+
+Read-back shares one timeout across all signal queries and backoff, with at most
+six query rounds. `--timeout` defaults to 10 seconds and must be finite, greater
+than zero, and at most 30 seconds; it does not extend the probe deadline. Query
+responses are capped at 64 KiB. As with the OTLP transport below, continuous
+trickling of response header bytes is outside the pinned HTTP client's deadline
+guarantee.
+
+| State | Meaning |
+| --- | --- |
+| `configured` | Overall: configuration is valid, including intentionally disabled telemetry. Per signal: that signal is enabled. Dependency and ownership checks can still fail. |
+| `accepted` | The receiver accepted the probe's complete nonempty payload for this signal. |
+| `observed` | A separate PostHog query found this signal's matching probe record. |
+
+`--json` reports `mode`, `ok`, `configured`, `codes`, `service`, `versions`,
+`integrations`, and one row per signal in `signals`. Acceptance and observation
+are `null` for stages that were not requested. Exit status is `0` when all
+requested checks pass, `1` for a failed check, and `2` for invalid command
+arguments. Choose one mode: `--local`, `--probe`, or `--read-back`; the default is
+`--local`. Repeated `--signal` options select a subset of configured signals.
+
+Check the disabled configuration with:
+
+```sh
+ALTIMETER_ENABLED=false python manage.py altimeter_check
+```
+
+Disabling a running application still requires changing its deployment
+environment and restarting its workers. A management command checks its own
+process; it does not inspect existing workers. These checks run on demand and
+start no observer daemon.
 
 ## Direct component usage
 
@@ -445,6 +534,7 @@ uv run mypy src
 uv build
 uv run pytest tests/unit/test_privacy.py tests/unit/test_admission.py tests/integration/test_wheel.py
 uv run pytest tests/integration/test_otlp_transport.py
+uv run pytest tests/integration/test_check_command.py
 uv run pytest tests/unit/test_conf.py tests/unit/test_context.py
 uv run pytest tests/integration/test_django_boundary.py tests/integration/test_context_export.py tests/integration/test_runtime_process.py
 ```
@@ -502,5 +592,22 @@ exercise the transport failure cases. Receiver and processor checks run with:
 uv run pytest tests/support/test_otlp_receiver.py tests/integration/test_processor_export.py
 ```
 
-Tests run against local receivers. PostHog ingestion and deployed application
-behavior remain untested.
+Test the management command from the installed wheel in both profiles:
+
+```sh
+docker compose -p <unique-asgi-check-name> -f reference/compose.yaml --profile asgi run --build --rm verify-asgi python -m pytest tests/integration/test_check_command.py
+docker compose -p <unique-wsgi-check-name> -f reference/compose.yaml --profile wsgi run --build --rm verify-wsgi python -m pytest tests/integration/test_check_command.py
+```
+
+The command tests use real subprocesses and a local OTLP receiver. A local HTTP
+stand-in supplies only the external PostHog query API; it does not ingest or
+store telemetry in PostHog. Run the credential-gated live read-back test with
+real enabled signal destinations and the operator environment described above:
+
+```sh
+uv run pytest tests/integration/test_readback_flow.py -m live
+```
+
+Without the required operator credentials, the live test is skipped, never
+passed. Successful local tests do not verify PostHog ingestion or deployed
+application behavior.

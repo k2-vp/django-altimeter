@@ -1,0 +1,14 @@
+# Send only the built artifacts and their verification inputs to Docker.
+**
+!dist/
+!dist/*.whl
+!dist/*.tar.gz
+!tests/
+!tests/**
+!pyproject.toml
+!reference/
+!reference/Dockerfile
+!reference/Dockerfile.dockerignore
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/

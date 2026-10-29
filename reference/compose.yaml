@@ -1,0 +1,26 @@
+# Give every run a unique project name with `docker compose -p <name>`.
+# The receiver runs inside pytest on an ephemeral loopback port; no published ports.
+services:
+  verify-asgi:
+    profiles: [asgi]
+    build:
+      context: ..
+      dockerfile: reference/Dockerfile
+      args:
+        PYTHON_VERSION: "3.13"
+        DJANGO_VERSION: "6.0.9"
+        # Locked transport versions of the supported ASGI deployment shape.
+        REQUESTS_VERSION: "2.33.1"
+        URLLIB3_VERSION: "2.6.3"
+
+  verify-wsgi:
+    profiles: [wsgi]
+    build:
+      context: ..
+      dockerfile: reference/Dockerfile
+      args:
+        PYTHON_VERSION: "3.12"
+        DJANGO_VERSION: "5.2.18"
+        # Locked transport versions of the supported WSGI deployment shape.
+        REQUESTS_VERSION: "2.32.3"
+        URLLIB3_VERSION: "1.26.20"

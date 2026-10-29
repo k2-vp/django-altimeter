@@ -836,3 +836,104 @@ def test_denied_key_is_rejected_before_materializing_large_protobuf_value(
     assert reads == []
     assert CANARY.encode() not in result.SerializeToString()
     assert b"/items/{id}" in result.SerializeToString()
+
+
+@pytest.mark.parametrize("key", ["posthogDistinctId", "altimeter.tenant_id"])
+@pytest.mark.parametrize("value", ["opaque-42", "x" * 200, "é" * 100])
+def test_identity_survives_only_span_and_log_record_attributes(key, value):
+    traces = trace_request()
+    logs = log_request()
+    span = traces.resource_spans[0].scope_spans[0].spans[0]
+    record = logs.resource_logs[0].scope_logs[0].log_records[0]
+    span.attributes.append(attribute(key, value))
+    record.attributes.append(attribute(key, value))
+    # The identity keys are fixed policy, not configured attribute-value pairs.
+    assert (key, value) not in POLICY.attribute_values
+    assert is_allowed_attribute(key, value, policy=POLICY)
+    projected_trace = project_traces(traces, policy=POLICY)
+    projected_log = project_logs(logs, policy=POLICY)
+    safe_span = projected_trace.resource_spans[0].scope_spans[0].spans[0]
+    safe_log = projected_log.resource_logs[0].scope_logs[0].log_records[0]
+    assert attribute(key, value) in safe_span.attributes
+    assert attribute(key, value) in safe_log.attributes
+    assert attribute("http.response.status_code", 503) in safe_span.attributes
+    assert attribute("http.response.status_code", 503) in safe_log.attributes
+    assert CANARY.encode() not in projected_trace.SerializeToString()
+    assert CANARY.encode() not in projected_log.SerializeToString()
+
+
+@pytest.mark.parametrize("key", ["posthogDistinctId", "altimeter.tenant_id"])
+@pytest.mark.parametrize("value", ["", " \t\n", "x" * 201, "é" * 101, 17, 2.5])
+def test_invalid_identity_is_dropped_beside_valid_identity_and_safe_status(key, value):
+    traces = trace_request()
+    logs = log_request()
+    other = "altimeter.tenant_id" if key == "posthogDistinctId" else "posthogDistinctId"
+    span = traces.resource_spans[0].scope_spans[0].spans[0]
+    record = logs.resource_logs[0].scope_logs[0].log_records[0]
+    for target in (span, record):
+        target.attributes.extend([attribute(key, value), attribute(other, "opaque-ok")])
+    assert not is_allowed_attribute(key, value, policy=POLICY)
+    outputs = (project_traces(traces, policy=POLICY), project_logs(logs, policy=POLICY))
+    safe_records = (
+        outputs[0].resource_spans[0].scope_spans[0].spans[0],
+        outputs[1].resource_logs[0].scope_logs[0].log_records[0],
+    )
+    for target in safe_records:
+        assert key not in {a.key for a in target.attributes}
+        assert attribute(other, "opaque-ok") in target.attributes
+        assert attribute("http.response.status_code", 503) in target.attributes
+    assert all(CANARY.encode() not in output.SerializeToString() for output in outputs)
+
+
+@pytest.mark.parametrize("key", ["posthogDistinctId", "altimeter.tenant_id"])
+def test_identity_never_survives_other_locations_even_with_explicit_value_pair(key):
+    policy = replace(POLICY, attribute_values=POLICY.attribute_values | {(key, CANARY)})
+    traces, logs, metrics = trace_request(), log_request(), metric_request()
+    span = traces.resource_spans[0].scope_spans[0].spans[0]
+    record = logs.resource_logs[0].scope_logs[0].log_records[0]
+    point = (
+        metrics.resource_metrics[0].scope_metrics[0].metrics[0].histogram.data_points[0]
+    )
+    for resource in (
+        traces.resource_spans[0].resource,
+        logs.resource_logs[0].resource,
+        metrics.resource_metrics[0].resource,
+    ):
+        resource.attributes.append(attribute(key, CANARY))
+    span.events[0].attributes.append(attribute(key, CANARY))
+    span.links[0].attributes.append(attribute(key, CANARY))
+    record.body.kvlist_value.values.append(attribute(key, CANARY))
+    point.attributes.append(attribute(key, CANARY))
+    point.exemplars[0].filtered_attributes.append(attribute(key, CANARY))
+    span.attributes.append(attribute(key, "person-ok"))
+    record.attributes.append(attribute(key, "person-ok"))
+    outputs = (
+        project_traces(traces, policy=policy),
+        project_logs(logs, policy=policy),
+        project_metrics(metrics, policy=policy),
+    )
+    assert all(CANARY.encode() not in output.SerializeToString() for output in outputs)
+    assert (
+        attribute(key, "person-ok")
+        in outputs[0].resource_spans[0].scope_spans[0].spans[0].attributes
+    )
+    assert (
+        attribute(key, "person-ok")
+        in outputs[1].resource_logs[0].scope_logs[0].log_records[0].attributes
+    )
+    safe_point = (
+        outputs[2]
+        .resource_metrics[0]
+        .scope_metrics[0]
+        .metrics[0]
+        .histogram.data_points[0]
+    )
+    assert safe_point.count == 1 and safe_point.sum == 0.25
+    assert attribute("http.route", "/items/{id}") in safe_point.attributes
+    assert not safe_point.exemplars[0].filtered_attributes
+
+
+def test_identity_respects_a_smaller_configured_string_limit():
+    limits = replace(DEFAULT_LIMITS, max_string_bytes=12)
+    assert is_allowed_attribute("posthogDistinctId", "x" * 12, limits=limits)
+    assert not is_allowed_attribute("posthogDistinctId", "x" * 13, limits=limits)

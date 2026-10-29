@@ -779,3 +779,15 @@ def test_header_decoding_errors_return_only_the_header_code(source, value):
         )
     assert result.config is None and result.codes == ("config.invalid_headers",)
     assert "opaque-key" not in repr(result)
+
+
+def test_explicit_probe_role_validates_without_changing_default_role():
+    assert parsed().role == "web"
+    config = parsed(environ=enabled_env(ALTIMETER_ROLE="web"), role="probe")
+    assert config.role == "probe"
+    assert validate_config(config).ok
+    assert dict(config.resource_attributes)["altimeter.role"] == "probe"
+    assert load_config(environ={}, role="probe").config == Config(role="probe")
+    rejected = load_config(environ=enabled_env(), role=CANARY)
+    assert rejected.config is None and rejected.codes == ("config.invalid_role",)
+    assert CANARY not in repr(rejected)

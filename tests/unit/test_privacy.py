@@ -937,3 +937,133 @@ def test_identity_respects_a_smaller_configured_string_limit():
     limits = replace(DEFAULT_LIMITS, max_string_bytes=12)
     assert is_allowed_attribute("posthogDistinctId", "x" * 12, limits=limits)
     assert not is_allowed_attribute("posthogDistinctId", "x" * 13, limits=limits)
+
+
+@pytest.mark.parametrize(
+    "build,project,groups",
+    [
+        (trace_request, project_traces, "resource_spans"),
+        (log_request, project_logs, "resource_logs"),
+        (metric_request, project_metrics, "resource_metrics"),
+    ],
+)
+def test_probe_flag_true_survives_only_resources(build, project, groups):
+    request = build()
+    resource = getattr(request, groups)[0].resource
+    resource.attributes.append(attribute("service.name", "reference"))
+    flag = KeyValue(key="altimeter.probe", value=AnyValue(bool_value=True))
+    resource.attributes.append(flag)
+    if groups == "resource_spans":
+        record = request.resource_spans[0].scope_spans[0].spans[0]
+        record.attributes.append(flag)
+        record.events[0].attributes.append(flag)
+        record.links[0].attributes.append(flag)
+    elif groups == "resource_logs":
+        record = request.resource_logs[0].scope_logs[0].log_records[0]
+        record.attributes.append(flag)
+        record.body.kvlist_value.values.append(flag)
+    else:
+        point = (
+            request.resource_metrics[0]
+            .scope_metrics[0]
+            .metrics[0]
+            .histogram.data_points[0]
+        )
+        point.attributes.append(flag)
+        point.exemplars[0].filtered_attributes.append(flag)
+    assert CANARY.encode() in request.SerializeToString()
+    projected = project(request, policy=POLICY)
+    safe_resource = getattr(projected, groups)[0].resource
+    assert flag in safe_resource.attributes
+    assert attribute("service.name", "reference") in safe_resource.attributes
+    assert projected.SerializeToString().count(b"altimeter.probe") == 1
+    assert CANARY.encode() not in projected.SerializeToString()
+    assert b"/items/{id}" in projected.SerializeToString()
+    assert is_allowed_attribute("altimeter.probe", True, resource=True)
+    assert not is_allowed_attribute("altimeter.probe", True)
+
+
+@pytest.mark.parametrize(
+    "build,project,groups",
+    [
+        (trace_request, project_traces, "resource_spans"),
+        (log_request, project_logs, "resource_logs"),
+        (metric_request, project_metrics, "resource_metrics"),
+    ],
+)
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        AnyValue(),
+        AnyValue(bool_value=False),
+        AnyValue(int_value=1),
+        AnyValue(double_value=1.0),
+        AnyValue(string_value="true"),
+        AnyValue(string_value=CANARY),
+        AnyValue(bytes_value=CANARY.encode()),
+        AnyValue(array_value={"values": [AnyValue(bool_value=True)]}),
+        AnyValue(kvlist_value={"values": [attribute("secret", CANARY)]}),
+    ],
+)
+def test_probe_resource_flag_rejects_other_values_beside_safe_group(
+    build, project, groups, invalid
+):
+    request = build()
+    group = getattr(request, groups)[0]
+    group.resource.attributes.append(attribute("service.name", "reference"))
+    group.resource.attributes.add(key="altimeter.probe", value=invalid)
+    neighbor = getattr(request, groups).add()
+    neighbor.CopyFrom(group)
+    neighbor.resource.attributes[-1].value.CopyFrom(AnyValue(bool_value=True))
+    policy = replace(
+        POLICY,
+        attribute_values=POLICY.attribute_values
+        | {("altimeter.probe", "true"), ("altimeter.probe", CANARY)},
+    )
+    projected = project(request, policy=policy)
+    safe_groups = getattr(projected, groups)
+    assert len(safe_groups) == 2
+    assert "altimeter.probe" not in {a.key for a in safe_groups[0].resource.attributes}
+    assert KeyValue(key="altimeter.probe", value=AnyValue(bool_value=True)) in (
+        safe_groups[1].resource.attributes
+    )
+    assert attribute("service.name", "reference") in safe_groups[0].resource.attributes
+    assert CANARY.encode() not in projected.SerializeToString()
+    assert b"/items/{id}" in projected.SerializeToString()
+
+
+@pytest.mark.parametrize(
+    "build,project,groups",
+    [
+        (trace_request, project_traces, "resource_spans"),
+        (log_request, project_logs, "resource_logs"),
+        (metric_request, project_metrics, "resource_metrics"),
+    ],
+)
+def test_probe_resource_rejects_large_string_before_materialization(
+    monkeypatch, build, project, groups
+):
+    request = build()
+    attributes = getattr(request, groups)[0].resource.attributes
+    denied = attributes.add(key="altimeter.probe").value
+    denied.string_value = CANARY + "x" * 1_000_000
+    flag = KeyValue(key="altimeter.probe", value=AnyValue(bool_value=True))
+    attributes.append(flag)
+    reads = []
+    original_get = AnyValue.__getattribute__
+
+    def guard_get(value, name):
+        if value is denied and name == "string_value":
+            reads.append(name)
+            raise AssertionError("Non-boolean probe flag was materialized")
+        return original_get(value, name)
+
+    monkeypatch.setattr(AnyValue, "__getattribute__", guard_get)
+    with pytest.raises(AssertionError, match="Non-boolean probe flag"):
+        _ = denied.string_value
+    reads.clear()
+    projected = project(request, policy=POLICY)
+    assert reads == []
+    assert flag in getattr(projected, groups)[0].resource.attributes
+    assert b"/items/{id}" in projected.SerializeToString()
+    assert CANARY.encode() not in projected.SerializeToString()

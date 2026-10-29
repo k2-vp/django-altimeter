@@ -22,6 +22,7 @@ Scalar = str | bool | int | float
 _ROLES = frozenset(
     {
         "web",
+        "probe",
         "celery-prefork",
         "celery-solo",
         "beat",

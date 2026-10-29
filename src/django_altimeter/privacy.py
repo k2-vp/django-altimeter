@@ -154,7 +154,7 @@ _RECORD_KEYS = (
     | _DURATION_KEYS
     | {"trace_id", "span_id", "altimeter.overflow"}
 )
-_RESOURCE_ATTRIBUTE_KEYS = _RESOURCE_KEYS | {"process.pid"}
+_RESOURCE_ATTRIBUTE_KEYS = _RESOURCE_KEYS | {"process.pid", "altimeter.probe"}
 _METRIC_KEYS = (
     (_STRING_KEYS - {"exception.type", "error.type"})
     | _STATUS_KEYS
@@ -199,6 +199,8 @@ def _allowed_attribute(
     if not _text(key, limits.max_key_bytes):
         return False
     if resource:
+        if key == "altimeter.probe":
+            return value is True
         if key == "process.pid":
             return type(value) is int and 0 < value <= 2**31 - 1
         return (
@@ -319,6 +321,8 @@ def _attributes(
         ):
             continue
         kind = item.value.WhichOneof("value")
+        if key == "altimeter.probe" and kind != "bool_value":
+            continue
         if kind not in {"string_value", "bool_value", "int_value", "double_value"}:
             continue  # Never descend into unapproved structured attributes.
         value = getattr(item.value, kind)

@@ -642,3 +642,140 @@ print(json.dumps([unconfigured.codes, malformed.codes, invalid_path.codes]))
         ["config.invalid_settings"],
         ["config.invalid_callback"],
     ]
+
+
+def header_result(headers, source):
+    from urllib.parse import quote
+
+    env = enabled_env(ALTIMETER_LOGS_ENABLED="false", ALTIMETER_METRICS_ENABLED="false")
+    if source == "direct":
+        config = parsed(env)
+        return validate_config(
+            replace(
+                config, traces=replace(config.traces, headers=tuple(headers.items()))
+            )
+        )
+    if source == "settings":
+        return load_config(
+            environ=env, values={"DESTINATIONS": {"traces": {"headers": headers}}}
+        )
+    env["ALTIMETER_TRACES_COLLECTOR_HEADERS"] = ",".join(
+        f"{key}={quote(value, safe='') if source == 'encoded_environment' else value}"
+        for key, value in headers.items()
+    )
+    return load_config(environ=env)
+
+
+@pytest.mark.parametrize(
+    "source", ["settings", "direct", "environment", "encoded_environment"]
+)
+@pytest.mark.parametrize(
+    "value",
+    [
+        CANARY + "\u0100",
+        " " + CANARY,
+        CANARY + " ",
+        "\t" + CANARY,
+        CANARY + "\r\n",
+        CANARY + "\x00",
+        CANARY + "\x7f",
+        CANARY + "\x85",
+        "\xa0" + CANARY,
+        "",
+        "   ",
+    ],
+    ids=[
+        "non-latin1",
+        "leading-space",
+        "trailing-space",
+        "leading-tab",
+        "crlf",
+        "nul",
+        "del",
+        "c1-control",
+        "leading-nbsp",
+        "empty",
+        "all-spaces",
+    ],
+)
+def test_unusable_header_values_fail_closed_with_valid_auth_neighbor(source, value):
+    valid_headers = {
+        "authorization": "Bearer opaque-key",
+        "x-client": "r\u00e9f\u00e9rence",
+    }
+    accepted = header_result(valid_headers, source)
+    assert accepted.ok and accepted.config is not None
+    assert dict(accepted.config.traces.headers) == valid_headers
+    rejected = header_result({**valid_headers, "x-api-key": value}, source)
+    assert rejected.config is None
+    assert not rejected.ok and rejected.codes == ("config.invalid_headers",)
+    assert CANARY not in repr(rejected)
+    assert CANARY not in repr(accepted.config.resource_attributes)
+
+
+@pytest.mark.integration
+def test_configured_auth_header_exports_a_safe_span_to_real_receiver(tmp_path):
+    from support.otlp_receiver import OTLPReceiver
+
+    with OTLPReceiver() as receiver:
+        result = run_python(
+            """
+import json, os
+from django_altimeter.conf import load_config
+from django_altimeter.context import get_correlation, span
+from django_altimeter.runtime import setup, shutdown
+config = load_config(environ=json.loads(os.environ["TEST_CONFIG_ENV"]), values={
+    "DESTINATIONS": {"traces": {"headers": {
+        "authorization": "Bearer opaque-key", "x-client": "r\\u00e9f\\u00e9rence"}}}})
+assert config.ok and config.config is not None, config.codes
+assert setup(config.config).enabled_signals == ("traces",)
+with span("GET", attributes={"http.response.status_code": 200}):
+    correlation = get_correlation()
+    assert correlation is not None
+assert shutdown().completed
+print(json.dumps({"trace_id": correlation.trace_id, "span_id": correlation.span_id}))
+""",
+            tmp_path,
+            env=enabled_env(
+                ALTIMETER_LOGS_ENABLED="false",
+                ALTIMETER_METRICS_ENABLED="false",
+                ALTIMETER_TRACES_COLLECTOR_ENDPOINT=receiver.url("traces"),
+            ),
+        )
+        requests = receiver.wait_for_requests()
+        assert len(requests) == 1 and requests[0].path == "/v1/traces"
+        request = requests[0]
+        assert request.headers["Authorization"] == "Bearer opaque-key"
+        assert request.headers["X-Client"] == "r\u00e9f\u00e9rence"
+        spans = [
+            span
+            for group in request.message.resource_spans
+            for scope in group.scope_spans
+            for span in scope.spans
+        ]
+        assert len(spans) == 1 and spans[0].name == "GET"
+        assert spans[0].trace_id.hex() == result["trace_id"]
+        assert spans[0].span_id.hex() == result["span_id"]
+        assert {item.key: item.value.int_value for item in spans[0].attributes} == {
+            "http.response.status_code": 200
+        }
+        assert b"opaque-key" not in request.message.SerializeToString()
+
+
+@pytest.mark.parametrize("source", ["environment", "settings-string"])
+@pytest.mark.parametrize(
+    "value", ["\ud800", "%ED%A0%80"], ids=["surrogate", "encoded-surrogate"]
+)
+def test_header_decoding_errors_return_only_the_header_code(source, value):
+    assert header_result({"authorization": "Bearer opaque-key"}, "settings").ok
+    env = enabled_env(ALTIMETER_LOGS_ENABLED="false", ALTIMETER_METRICS_ENABLED="false")
+    headers = "authorization=Bearer%20opaque-key,x-api-key=" + value
+    if source == "environment":
+        env["ALTIMETER_TRACES_COLLECTOR_HEADERS"] = headers
+        result = load_config(environ=env)
+    else:
+        result = load_config(
+            environ=env, values={"DESTINATIONS": {"traces": {"headers": headers}}}
+        )
+    assert result.config is None and result.codes == ("config.invalid_headers",)
+    assert "opaque-key" not in repr(result)

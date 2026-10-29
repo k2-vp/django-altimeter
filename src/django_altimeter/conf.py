@@ -264,31 +264,42 @@ def _headers(value: object) -> tuple[tuple[str, str], ...]:
         return ()
     pairs: list[tuple[str, object]] = []
     if type(value) is str:
-        _text(value, 8192)
-        parts = value.split(",")
-        if len(parts) > 16:
-            raise _Invalid("config.invalid_headers")
-        for part in parts:
-            key, separator, item = part.partition("=")
-            if not separator:
+        try:
+            _text(value, 8192)
+            parts = value.split(",")
+            if len(parts) > 16:
                 raise _Invalid("config.invalid_headers")
-            pairs.append(
-                (
-                    unquote(key.strip(), errors="strict"),
-                    unquote(item.strip(), errors="strict"),
+            for part in parts:
+                key, separator, item = part.partition("=")
+                if not separator:
+                    raise _Invalid("config.invalid_headers")
+                pairs.append(
+                    (
+                        unquote(key.strip(), errors="strict"),
+                        unquote(item, errors="strict"),
+                    )
                 )
-            )
+        except (_Invalid, UnicodeError):
+            raise _Invalid("config.invalid_headers") from None
     else:
         pairs = list(_mapping(value, maximum=16).items())
     result: dict[str, str] = {}
     for key, header_value in pairs:
         key = _text(key, 128).lower()
-        header = _text(header_value, 2048)
+        try:
+            header = _text(header_value, 2048, empty=True)
+            # The pinned requests/http.client path encodes str headers as Latin-1.
+            # _text bounds characters and UTF-8 bytes before this second encoding.
+            header.encode("latin-1")
+        except (_Invalid, UnicodeEncodeError):
+            raise _Invalid("config.invalid_headers") from None
         if (
             not _HEADER_NAME.fullmatch(key)
             or key in result
             or key in _TRANSPORT_HEADERS
-            or any(ord(char) < 32 or ord(char) == 127 for char in header)
+            or not header
+            or header != header.strip()
+            or any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in header)
         ):
             raise _Invalid("config.invalid_headers")
         result[key] = header
@@ -378,7 +389,10 @@ def _signal(
         header_names.insert(0, f"ALTIMETER_{upper}_COLLECTOR_HEADERS")
     raw_headers: object = values.get("headers")
     for header_name in header_names:
-        candidate = _env(environ, header_name)
+        try:
+            candidate = _env(environ, header_name)
+        except (_Invalid, UnicodeError):
+            raise _Invalid("config.invalid_headers") from None
         if candidate is not None:
             raw_headers = candidate
             break

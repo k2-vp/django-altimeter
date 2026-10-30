@@ -41,13 +41,17 @@ once `pyproject.toml` exists:
 - Build wheel and sdist: `uv build`
 - Real-process profiles, after `uv build`, with a unique project name per run:
   `docker compose -p <unique-name> -f reference/compose.yaml --profile asgi run --build --rm verify-asgi python -m pytest <paths>`
-  (use `--profile wsgi` and `verify-wsgi` for the Python 3.12 gunicorn/RQ shape)
+  then `docker compose -p <unique-name> -f reference/compose.yaml --profile asgi down --remove-orphans`
+  (use `--profile wsgi` in both commands and `verify-wsgi` for the Python 3.12 gunicorn/RQ shape)
 - Wall-clock performance acceptance, only in the local ASGI image after `uv build`:
   `docker compose -p <unique> -f reference/compose.yaml --profile asgi run --build --rm verify-asgi python -m pytest -m performance tests/performance/test_web_overhead.py`
+  then `docker compose -p <unique> -f reference/compose.yaml --profile asgi down --remove-orphans`
 - Request-work reference checks, after `uv build`, with isolated Compose services:
   `docker compose -p <unique-asgi-work-name> -f reference/compose.yaml --profile asgi run --build --rm verify-asgi python -m pytest tests/integration/test_reference_work.py`
+  then `docker compose -p <unique-asgi-work-name> -f reference/compose.yaml --profile asgi down --remove-orphans`
   and standalone Python 3.12 checks:
   `docker compose -p <unique-wsgi-work-name> -f reference/compose.yaml --profile wsgi run --build --rm verify-wsgi python -m pytest tests/integration/test_reference_work.py::TestStandaloneReferenceWork tests/integration/test_reference_work.py::test_request_work_extras_install_pinned_clients`
+  then `docker compose -p <unique-wsgi-work-name> -f reference/compose.yaml --profile wsgi down --remove-orphans`
 - Browser tests: `cd tests/browser && bun run test:unit <spec>` or `bun run test:e2e <spec>`
 
 Default test runs, including CI, deselect the `performance` marker. Explicit
@@ -62,6 +66,11 @@ README in the same commit.
 In a swarm, run full-suite, full-build and Docker profile runs through the
 build slot: `am am-run build --exclusive -- <command>`. Targeted per-file checks
 may run directly. The orchestrator runs the integrated gate for each slice.
+After every Compose run, whether it succeeds or fails, run the matching project's
+`down --remove-orphans` before releasing the build slot. `run --rm` removes only
+the test container; Postgres, Redis and the network otherwise remain. Clean up
+only your own project, never another agent's. Use a shell exit trap or an
+`if: always()` CI step so a failing test cannot bypass cleanup.
 
 ## Code style
 

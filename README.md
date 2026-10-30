@@ -840,21 +840,33 @@ name for each run:
 
 ```sh
 docker compose -p <unique-asgi-name> -f reference/compose.yaml --profile asgi run --build --rm verify-asgi python -m pytest tests/integration/test_wheel.py
+docker compose -p <unique-asgi-name> -f reference/compose.yaml --profile asgi down --remove-orphans
 docker compose -p <unique-wsgi-name> -f reference/compose.yaml --profile wsgi run --build --rm verify-wsgi python -m pytest tests/integration/test_wheel.py
+docker compose -p <unique-wsgi-name> -f reference/compose.yaml --profile wsgi down --remove-orphans
 ```
+
+Run the matching cleanup command after every verification run, including a
+failed run. `run --rm` removes only the test container; `down --remove-orphans`
+also stops that project's Postgres and Redis and removes its network. In a
+script, use an exit trap so failure cannot bypass cleanup. Keep each project
+name identical between its run and cleanup commands.
 
 Verify the native transport against both installed-wheel profiles:
 
 ```sh
 docker compose -p <unique-asgi-transport-name> -f reference/compose.yaml --profile asgi run --build --rm verify-asgi python -m pytest tests/integration/test_otlp_transport.py
+docker compose -p <unique-asgi-transport-name> -f reference/compose.yaml --profile asgi down --remove-orphans
 docker compose -p <unique-wsgi-transport-name> -f reference/compose.yaml --profile wsgi run --build --rm verify-wsgi python -m pytest tests/integration/test_otlp_transport.py
+docker compose -p <unique-wsgi-transport-name> -f reference/compose.yaml --profile wsgi down --remove-orphans
 ```
 
 Test explicit runtime ownership and Django startup in both profiles:
 
 ```sh
 docker compose -p <unique-asgi-runtime-name> -f reference/compose.yaml --profile asgi run --build --rm verify-asgi python -m pytest tests/integration/test_django_boundary.py tests/integration/test_runtime_process.py
+docker compose -p <unique-asgi-runtime-name> -f reference/compose.yaml --profile asgi down --remove-orphans
 docker compose -p <unique-wsgi-runtime-name> -f reference/compose.yaml --profile wsgi run --build --rm verify-wsgi python -m pytest tests/integration/test_django_boundary.py tests/integration/test_runtime_process.py
+docker compose -p <unique-wsgi-runtime-name> -f reference/compose.yaml --profile wsgi down --remove-orphans
 ```
 
 The ASGI image also pins Ninja 1.6.2 and uvicorn 0.46.0. It uses
@@ -889,24 +901,39 @@ cleans up only that namespace and never flushes shared Redis. PostgreSQL trust
 authentication is confined to this local, unexposed test network. The reference
 app reuses Django's existing ContentType model and adds no model or migration.
 
+The full host test suite also needs real Postgres and Redis services. Point
+`ALTIMETER_TEST_POSTGRES_DSN` and `ALTIMETER_TEST_REDIS_URL` at isolated test
+services before running `uv run pytest -q`. For example, use
+`host=127.0.0.1 port=<postgres-port> dbname=postgres user=postgres` and
+`redis://127.0.0.1:<redis-port>/0`. The CI host jobs provision health-checked
+services with these settings and pinned image digests. The Compose profiles
+provide the settings automatically.
+
 Run real uvicorn request-to-driver/client/log checks in the ASGI image, and the
 standalone work in both Python environments, after rebuilding the wheel:
 
 ```sh
 docker compose -p <unique-asgi-work-name> -f reference/compose.yaml --profile asgi run --build --rm verify-asgi python -m pytest tests/integration/test_reference_work.py
+docker compose -p <unique-asgi-work-name> -f reference/compose.yaml --profile asgi down --remove-orphans
 docker compose -p <unique-wsgi-work-name> -f reference/compose.yaml --profile wsgi run --build --rm verify-wsgi python -m pytest tests/integration/test_reference_work.py::TestStandaloneReferenceWork tests/integration/test_reference_work.py::test_request_work_extras_install_pinned_clients
+docker compose -p <unique-wsgi-work-name> -f reference/compose.yaml --profile wsgi down --remove-orphans
 ```
 
 The `/work/` endpoints run sync/async ORM queries, direct psycopg, 4,096-row
 materialization/serialization, Requests and HTTPX calls, redirects, Redis
 commands, and safe/canary logs. They are enabled only by the reference test
-launcher. The Python 3.12 standalone checks do not run a WSGI server.
+launcher. Outgoing checks delay a real HTTP response by 150 ms and require the
+application span to contain that delay and parent its client spans, covering
+Requests and synchronous/asynchronous HTTPX. The Python 3.12 standalone checks
+do not run a WSGI server.
 
 Test the management command from the installed wheel in both profiles:
 
 ```sh
 docker compose -p <unique-asgi-check-name> -f reference/compose.yaml --profile asgi run --build --rm verify-asgi python -m pytest tests/integration/test_check_command.py
+docker compose -p <unique-asgi-check-name> -f reference/compose.yaml --profile asgi down --remove-orphans
 docker compose -p <unique-wsgi-check-name> -f reference/compose.yaml --profile wsgi run --build --rm verify-wsgi python -m pytest tests/integration/test_check_command.py
+docker compose -p <unique-wsgi-check-name> -f reference/compose.yaml --profile wsgi down --remove-orphans
 ```
 
 The command tests use real subprocesses and a local OTLP receiver. A local HTTP
@@ -928,6 +955,7 @@ with the installed wheel:
 ```sh
 uv build
 docker compose -p <unique-asgi-web-name> -f reference/compose.yaml --profile asgi run --build --rm verify-asgi python -m pytest tests/unit/test_metrics.py tests/integration/test_asgi.py tests/integration/test_uvicorn_server.py tests/performance/test_web_overhead.py -s
+docker compose -p <unique-asgi-web-name> -f reference/compose.yaml --profile asgi down --remove-orphans
 ```
 
 Default test runs, including CI, exclude the wall-clock acceptance test through
@@ -937,6 +965,7 @@ verification image after `uv build`, using a unique project name:
 
 ```sh
 docker compose -p <unique> -f reference/compose.yaml --profile asgi run --build --rm verify-asgi python -m pytest -m performance tests/performance/test_web_overhead.py
+docker compose -p <unique> -f reference/compose.yaml --profile asgi down --remove-orphans
 ```
 
 The explicit `-m performance` overrides the default selection and selects one

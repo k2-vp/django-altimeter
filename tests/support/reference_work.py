@@ -42,7 +42,10 @@ def isolated_services():
     base_dsn = os.environ.get("ALTIMETER_TEST_POSTGRES_DSN")
     base_redis = os.environ.get("ALTIMETER_TEST_REDIS_URL")
     if not base_dsn or not base_redis:
-        raise RuntimeError("Run this test in a reference Compose profile")
+        raise RuntimeError(
+            "Set ALTIMETER_TEST_POSTGRES_DSN and ALTIMETER_TEST_REDIS_URL "
+            "to isolated test services"
+        )
     identity = uuid4()
     database = f"altimeter_{identity.hex}"
     redis_parts = urlsplit(base_redis)

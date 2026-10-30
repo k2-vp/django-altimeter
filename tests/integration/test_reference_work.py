@@ -161,7 +161,7 @@ class TestASGIReferenceWork:
             HTTPReceiver() as external,
             OTLPReceiver() as receiver,
         ):
-            internal.respond(body=b"internal-body-canary")
+            internal.respond(body=b"internal-body-canary", delay=0.15)
             external.respond(body=b"external-body-canary")
             with running_server(
                 tmp_path,
@@ -205,10 +205,33 @@ class TestASGIReferenceWork:
             assert roots[0].trace_id != bytes.fromhex("1" * 32)
             assert {span.name for span in clients} == {"GET"}
             assert all(span.trace_id == roots[0].trace_id for span in clients)
+            outgoing = [span for span in spans if span.name == "reference.outgoing"]
+            assert len(outgoing) == 1
+            application = outgoing[0]
+            assert application.parent_span_id == roots[0].span_id
+            assert {span.parent_span_id for span in clients} == {application.span_id}
+            assert (
+                application.end_time_unix_nano - application.start_time_unix_nano
+            ) >= 150_000_000
+            assert all(
+                application.start_time_unix_nano
+                <= span.start_time_unix_nano
+                <= span.end_time_unix_nano
+                <= application.end_time_unix_nano
+                for span in clients
+            )
             assert sent["traceparent"].split("-")[1] == roots[0].trace_id.hex()
             assert bytes.fromhex(sent["traceparent"].split("-")[2]) in {
                 span.span_id for span in clients
             }
+            delayed_client = next(
+                span
+                for span in clients
+                if span.span_id.hex() == sent["traceparent"].split("-")[2]
+            )
+            assert (
+                delayed_client.end_time_unix_nano - delayed_client.start_time_unix_nano
+            ) >= 150_000_000
             assert not any(
                 value in str(receiver.requests)
                 for value in (
@@ -400,7 +423,7 @@ class TestStandaloneReferenceWork:
             HTTPReceiver() as external,
             OTLPReceiver() as receiver,
         ):
-            internal.respond(body=b"internal-body-canary")
+            internal.respond(body=b"internal-body-canary", delay=0.15)
             external.respond(body=b"external-body-canary")
             result = run_work_script(
                 work_wheel,
@@ -469,6 +492,9 @@ print("WORK_RESULT " + json.dumps({
             outgoing = [span for span in spans if span.name == "reference.outgoing"]
             assert len(outgoing) == 1
             assert {span.parent_span_id for span in http} == {outgoing[0].span_id}
+            assert (
+                outgoing[0].end_time_unix_nano - outgoing[0].start_time_unix_nano
+            ) >= 150_000_000
             redis = [
                 span
                 for span in clients

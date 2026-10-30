@@ -20,6 +20,23 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.12", "3.13"]
+    services:
+      postgres:
+        image: postgres:17.6-alpine@sha256:ef257d85f76e48da1c64832459b59fcaba1a4dac97bf5d7450c77753542eee94
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432/tcp
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 1s --health-timeout 3s --health-retries 30
+      redis:
+        image: redis:7.4.0-alpine@sha256:c35af3bbcef51a62c8bae5a9a563c6f1b60d7ebaea4cb5a3ccbcc157580ae098
+        ports:
+          - 6379/tcp
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 1s --health-timeout 3s --health-retries 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -34,6 +51,9 @@ jobs:
       - run: uv run mypy src
       - run: uv build
       - run: uv run pytest -q
+        env:
+          ALTIMETER_TEST_POSTGRES_DSN: host=127.0.0.1 port=${{ job.services.postgres.ports[5432] }} dbname=postgres user=postgres
+          ALTIMETER_TEST_REDIS_URL: redis://127.0.0.1:${{ job.services.redis.ports[6379] }}/0
 
   reference-images:
     runs-on: ubuntu-latest
@@ -52,8 +72,18 @@ jobs:
           docker compose -p altimeter-ci-asgi-${{ github.run_id }}
           -f reference/compose.yaml --profile asgi run --build --rm
           verify-asgi python -m pytest -q tests
+      - name: Clean up ASGI services
+        if: always()
+        run: >-
+          docker compose -p altimeter-ci-asgi-${{ github.run_id }}
+          -f reference/compose.yaml --profile asgi down --remove-orphans
       - name: Verify WSGI image
         run: >-
           docker compose -p altimeter-ci-wsgi-${{ github.run_id }}
           -f reference/compose.yaml --profile wsgi run --build --rm
           verify-wsgi python -m pytest -q tests
+      - name: Clean up WSGI services
+        if: always()
+        run: >-
+          docker compose -p altimeter-ci-wsgi-${{ github.run_id }}
+          -f reference/compose.yaml --profile wsgi down --remove-orphans

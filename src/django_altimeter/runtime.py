@@ -37,6 +37,7 @@ if TYPE_CHECKING:
 
     from django_altimeter.conf import SignalConfig
     from django_altimeter.exporting import SanitizingSession
+    from django_altimeter.metrics import RequestMetrics
 
 
 @dataclass(frozen=True)
@@ -114,6 +115,7 @@ class ProcessRuntime:
         self.tracer_provider: trace.TracerProvider = NoOpTracerProvider()
         self.logger_provider: APILoggerProvider = NoOpLoggerProvider()
         self.meter_provider: metrics.MeterProvider = NoOpMeterProvider()
+        self.request_metrics: RequestMetrics | None = None
         self._trace_provider: TracerProvider | None = None
         self._log_provider: LoggerProvider | None = None
         self._metric_provider: MeterProvider | None = None
@@ -236,10 +238,15 @@ class ProcessRuntime:
         from opentelemetry.sdk.resources import Resource
 
         from django_altimeter.exporting import create_metric_exporter
+        from django_altimeter.metrics import (
+            REQUEST_INSTRUMENTS,
+            RequestMetrics,
+            request_metric_views,
+        )
 
-        # Until the request recorder supplies its finite dimensions, each
-        # registered instrument has one aggregate series. Unknown instruments
-        # never allocate aggregation series. Writer identity stays on resource.
+        # The native request pair admits finite dimensions before aggregation.
+        # Other registered instruments keep one aggregate series until their
+        # owning recorder supplies an explicit bounded schema.
         # Even DropAggregation retains an internal entry per attribute set in
         # SDK1.45.x. Filter its keys too, before the SDK hashes measurements.
         views = [
@@ -247,9 +254,12 @@ class ProcessRuntime:
                 instrument_name="*", aggregation=DropAggregation(), attribute_keys=set()
             )
         ]
+        views.extend(request_metric_views())
         views.extend(
             View(meter_name=scope, instrument_name=escape(name), attribute_keys=set())
-            for scope, name in sorted(self.config.policy.metric_instruments)
+            for scope, name in sorted(
+                self.config.policy.metric_instruments - REQUEST_INSTRUMENTS
+            )
         )
         exporter = create_metric_exporter(
             self._session("metrics", self.config.metrics),
@@ -281,6 +291,11 @@ class ProcessRuntime:
         if metrics.get_meter_provider() is not provider:
             raise RuntimeError("setup.metrics_race")
         self.meter_provider = provider
+        self.request_metrics = RequestMetrics(
+            provider,
+            policy=self._policy,
+            limits=self.config.limits,
+        )
 
     def _resource_attributes(self) -> dict[str, str | bool]:
         attributes: dict[str, str | bool] = {
@@ -319,9 +334,12 @@ class ProcessRuntime:
             self.result = SetupResult(codes=("setup.semconv_conflict",))
             return self.result
         _otel_compat.prepare_fork_support()
+        from django_altimeter.metrics import request_metric_policy
+
+        request_policy = request_metric_policy(self.config.policy)
         self._policy = replace(
-            self.config.policy,
-            attribute_values=self.config.policy.attribute_values
+            request_policy,
+            attribute_values=request_policy.attribute_values
             | frozenset(self.config.resource_attributes)
             | {("service.instance.id", self.instance_id)},
         )

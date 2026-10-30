@@ -59,8 +59,68 @@ class PrivacyLimits:
 
 
 DEFAULT_LIMITS = PrivacyLimits()
+# This one fixed numeric shape exceeds the generic nested-collection ceiling.
+HTTP_REQUEST_DURATION_BUCKETS = (
+    0.005,
+    0.01,
+    0.025,
+    0.05,
+    0.075,
+    0.1,
+    0.25,
+    0.5,
+    0.75,
+    1,
+    2.5,
+    5,
+    7.5,
+    10,
+    15,
+    30,
+    45,
+    60,
+    120,
+)
+HTTP_ATTRIBUTE_VALUES = frozenset(
+    {("altimeter.surface", value) for value in ("django", "mcp")}
+    | {
+        ("http.response.status_class", value)
+        for value in ("1xx", "2xx", "3xx", "4xx", "5xx", "absent")
+    }
+    | {("altimeter.http.outcome", value) for value in ("completed", "aborted")}
+    | {
+        ("altimeter.response_mode", value)
+        for value in ("buffered", "streaming", "unknown")
+    }
+    | {("error.type", "after_response")}
+)
+_HTTP_CATEGORY_KEYS = frozenset(
+    {
+        "altimeter.surface",
+        "http.response.status_class",
+        "altimeter.http.outcome",
+        "altimeter.response_mode",
+    }
+)
+_HTTP_SERVER_KEYS = frozenset(
+    {
+        "altimeter.http.server.concurrent_at_start",
+        "altimeter.http.response_ready.duration",
+    }
+)
 _HTTP_METHODS = frozenset(
-    {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "CONNECT", "TRACE"}
+    {
+        "GET",
+        "POST",
+        "PUT",
+        "PATCH",
+        "DELETE",
+        "HEAD",
+        "OPTIONS",
+        "CONNECT",
+        "TRACE",
+        "_OTHER",
+    }
 )
 _DB_OPERATIONS = frozenset(
     {
@@ -124,6 +184,8 @@ _STRING_KEYS = frozenset(
         "http.route",
         "http.method",
         "http.request.method",
+        "http.response.status_class",
+        "altimeter.http.outcome",
         "db.system",
         "db.system.name",
         "db.operation",
@@ -212,7 +274,9 @@ def _allowed_attribute(
         return _text(value, min(200, limits.max_string_bytes)) and bool(value.strip())
     if key in _STATUS_KEYS:
         return type(value) is int and 100 <= value <= 599
-    if key in _DURATION_KEYS:
+    if key == "altimeter.http.server.concurrent_at_start":
+        return type(value) is int and 1 <= value <= 2**63 - 1
+    if key in _DURATION_KEYS or key == "altimeter.http.response_ready.duration":
         if type(value) is int:
             return 0 <= value <= 2**63 - 1
         if type(value) is float:
@@ -227,6 +291,10 @@ def _allowed_attribute(
         return len(value) == size and all(c in "0123456789abcdef" for c in value)
     if key not in _STRING_KEYS:
         return False
+    if key in _HTTP_CATEGORY_KEYS:
+        return (key, value) in HTTP_ATTRIBUTE_VALUES
+    if key == "error.type" and value == "after_response":
+        return True
     if key in {"http.method", "http.request.method"}:
         return value in _HTTP_METHODS
     if key in {"db.operation", "db.operation.name"}:
@@ -295,6 +363,7 @@ def _attributes(
     resource: bool = False,
     metric: bool = False,
     identity: bool = False,
+    server: bool = False,
 ) -> list[KeyValue]:
     maximum = limits.max_resource_attributes if resource else limits.max_attributes
     if len(source) > maximum:
@@ -308,6 +377,8 @@ def _attributes(
         if identity
         else _RECORD_KEYS
     )
+    if server:
+        allowed_keys |= _HTTP_SERVER_KEYS
     result: list[KeyValue] = []
     seen: set[str] = set()
     for item in source:
@@ -361,7 +432,13 @@ def _span(source: Span, policy: PrivacyPolicy, limits: PrivacyLimits) -> Span | 
         or not _text(source.name, limits.max_string_bytes)
     ):
         return None
-    attributes = _attributes(source.attributes, policy, limits, identity=True)
+    attributes = _attributes(
+        source.attributes,
+        policy,
+        limits,
+        identity=True,
+        server=source.kind == Span.SPAN_KIND_SERVER,
+    )
     name = normalize_span_name(source.name, policy=policy, limits=limits)
     if name == "SPAN" and any(
         _text(a.key, limits.max_key_bytes)
@@ -607,11 +684,24 @@ def _number(
 
 
 def _histogram(
-    source: HistogramDataPoint, policy: PrivacyPolicy, limits: PrivacyLimits
+    source: HistogramDataPoint,
+    policy: PrivacyPolicy,
+    limits: PrivacyLimits,
+    *,
+    request_duration: bool = False,
 ) -> HistogramDataPoint | None:
+    # Keep the nested-value bound unchanged. Only the exact owned HTTP shape
+    # gets its fixed 20-count allowance; length checks precede bounded copying.
+    maximum = limits.max_children
     if (
-        len(source.bucket_counts) > limits.max_children
-        or len(source.explicit_bounds) > limits.max_children
+        request_duration
+        and len(source.explicit_bounds) == len(HTTP_REQUEST_DURATION_BUCKETS)
+        and tuple(source.explicit_bounds) == HTTP_REQUEST_DURATION_BUCKETS
+    ):
+        maximum = len(HTTP_REQUEST_DURATION_BUCKETS) + 1
+    if (
+        len(source.bucket_counts) > maximum
+        or len(source.explicit_bounds) > maximum
         or len(source.bucket_counts) != len(source.explicit_bounds) + 1
         or any(not isfinite(b) for b in source.explicit_bounds)
     ):
@@ -779,7 +869,16 @@ def project_metrics(
                         if kind in {"gauge", "sum"}:
                             safe = _number(point, policy, limits)
                         elif kind == "histogram":
-                            safe = _histogram(point, policy, limits)
+                            safe = _histogram(
+                                point,
+                                policy,
+                                limits,
+                                request_duration=(
+                                    name == "django_altimeter"
+                                    and metric.name == "http.server.request.duration"
+                                    and metric.unit == "s"
+                                ),
+                            )
                         elif kind == "exponential_histogram":
                             safe = _exponential(point, policy, limits)
                         elif kind == "summary":

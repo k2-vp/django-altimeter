@@ -1022,6 +1022,7 @@ def create_metric_exporter(
                 headers=headers,
                 compression=Compression.NoCompression,
                 max_request_size=session.limits.max_batch_bytes,
+                max_export_batch_size=session.limits.max_batch_size,
                 meter_provider=meter_provider,
                 preferred_temporality=preferred_temporality,
             )

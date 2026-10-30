@@ -759,13 +759,25 @@ Without the required operator credentials, the live test is skipped, never
 passed. Successful local tests do not verify PostHog ingestion or deployed
 application behavior.
 
-Verify ASGI request handling, multiprocess startup and the predeclared overhead
-workload with the installed wheel:
+Verify ASGI request handling, multiprocess startup and the harness self-tests
+with the installed wheel:
 
 ```sh
 uv build
 docker compose -p <unique-asgi-web-name> -f reference/compose.yaml --profile asgi run --build --rm verify-asgi python -m pytest tests/unit/test_metrics.py tests/integration/test_asgi.py tests/integration/test_uvicorn_server.py tests/performance/test_web_overhead.py -s
 ```
+
+Default test runs, including CI, exclude the wall-clock acceptance test through
+the `performance` marker. The harness self-tests remain in the default host,
+ASGI and WSGI suites. Run the timing test explicitly only in the local ASGI
+verification image after `uv build`, using a unique project name:
+
+```sh
+docker compose -p <unique> -f reference/compose.yaml --profile asgi run --build --rm verify-asgi python -m pytest -m performance tests/performance/test_web_overhead.py
+```
+
+The explicit `-m performance` overrides the default selection and selects one
+test. A command that selects zero tests fails.
 
 The performance test uses one worker, four persistent connections and a static
 1 KiB response. Each fresh process warms 200 requests, settles for one second,

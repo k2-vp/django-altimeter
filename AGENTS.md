@@ -42,7 +42,14 @@ once `pyproject.toml` exists:
 - Real-process profiles, after `uv build`, with a unique project name per run:
   `docker compose -p <unique-name> -f reference/compose.yaml --profile asgi run --build --rm verify-asgi python -m pytest <paths>`
   (use `--profile wsgi` and `verify-wsgi` for the Python 3.12 gunicorn/RQ shape)
+- Wall-clock performance acceptance, only in the local ASGI image after `uv build`:
+  `docker compose -p <unique> -f reference/compose.yaml --profile asgi run --build --rm verify-asgi python -m pytest -m performance tests/performance/test_web_overhead.py`
 - Browser tests: `cd tests/browser && bun run test:unit <spec>` or `bun run test:e2e <spec>`
+
+Default test runs, including CI, deselect the `performance` marker. Explicit
+`-m performance` overrides that default. Only the wall-clock acceptance test has
+this marker; its harness self-tests remain in the default suite. A performance
+command that selects zero tests is a failure.
 
 Do not add a second command layer (Makefile, justfile, scripts) unless a bead
 asks for it. When a change adds or changes a command, update this list and the

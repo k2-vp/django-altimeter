@@ -325,6 +325,7 @@ def _server_versions(python: Path) -> dict[str, str]:
     return json.loads(result.stdout)
 
 
+@pytest.mark.performance
 def test_native_web_overhead_and_failure_plateau(tmp_path):
     wheel = install_wheel(tmp_path / "wheel")
     print(

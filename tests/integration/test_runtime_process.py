@@ -1173,3 +1173,108 @@ def test_shutdown_keeps_failure_before_a_later_batch_succeeds(
     assert len(spans) == 129
     assert all(span.name == "GET" for span in spans)
     assert all(span.attributes[0].value.int_value == 200 for span in spans)
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["accepted", "retry_recovered", "partial_first", "partial_middle", "partial_last"],
+)
+def test_shutdown_preserves_partial_across_native_metric_batches(
+    otlp_receiver: OTLPReceiver, case: str
+) -> None:
+    from opentelemetry.proto.collector.metrics.v1.metrics_service_pb2 import (
+        ExportMetricsServiceResponse,
+    )
+
+    partial = ExportMetricsServiceResponse()
+    partial.partial_success.rejected_data_points = 1
+    partial.partial_success.error_message = "CANARY_response_prose"
+    partial_index = {
+        "partial_first": 0,
+        "partial_middle": 1,
+        "partial_last": 2,
+    }.get(case)
+    if case == "retry_recovered":
+        otlp_receiver.queue_response(status=503, headers={"Retry-After": "1"})
+    for index in range(3):
+        otlp_receiver.queue_response(
+            body=partial.SerializeToString() if index == partial_index else b""
+        )
+    source = """
+        routes = frozenset(f'items/{index}/<item_id>' for index in range(65))
+        config = configuration(
+            signals=('metrics',), metric_export_interval_millis=60000,
+            export_timeout=1.5,
+            policy=replace(DEFAULT_POLICY, attribute_values=frozenset(
+                ('http.route', route) for route in routes)),
+        )
+        assert setup(config).ok
+        runtime = get_process_runtime()
+        assert runtime is not None and runtime.request_metrics is not None
+        for route in sorted(routes):
+            for method in ('GET', 'POST'):
+                runtime.request_metrics.record(
+                    0.25, surface='django', method=method, route=route, status=200,
+                    outcome='completed', response_mode='buffered',
+                )
+        stopped = shutdown(timeout=2)
+        again = shutdown()
+        print(json.dumps({'complete': stopped.completed, 'codes': stopped.codes,
+                          'again': again == stopped,
+                          'latest': runtime._sessions[0].outcome.code}))
+    """
+    process = subprocess.run(
+        [sys.executable, "-c", _IMPORTS + textwrap.dedent(source)],
+        env=_environment(otlp_receiver),
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert process.returncode == 0, process.stderr
+    assert "CANARY" not in process.stdout + process.stderr
+    result = json.loads(process.stdout)
+    requests = _signals(otlp_receiver)["metrics"]
+    sizes = [
+        sum(
+            len(getattr(metric, metric.WhichOneof("data")).data_points)
+            for resource in request.resource_metrics
+            for scope in resource.scope_metrics
+            for metric in scope.metrics
+        )
+        for request in requests
+    ]
+    assert sizes == ([128, 128, 128, 4] if case == "retry_recovered" else [128, 128, 4])
+    if case == "retry_recovered":
+        assert requests[0].SerializeToString() == requests[1].SerializeToString()
+        requests = requests[1:]
+    totals = {"altimeter.http.server.requests": 0, "http.server.request.duration": 0}
+    for request in requests:
+        for resource in request.resource_metrics:
+            for scope in resource.scope_metrics:
+                for metric in scope.metrics:
+                    kind = metric.WhichOneof("data")
+                    for point in getattr(metric, kind).data_points:
+                        totals[metric.name] += (
+                            point.as_int if kind == "sum" else point.count
+                        )
+                        attributes = {
+                            item.key: getattr(
+                                item.value, item.value.WhichOneof("value")
+                            )
+                            for item in point.attributes
+                        }
+                        assert attributes["http.route"].startswith("items/")
+                        assert attributes["http.request.method"] in {"GET", "POST"}
+    assert totals == {
+        "altimeter.http.server.requests": 130,
+        "http.server.request.duration": 130,
+    }
+    assert result["latest"] == (
+        "export.partial" if case == "partial_last" else "export.accepted"
+    )
+    assert result["again"] is True
+    assert result["codes"] == (
+        ["shutdown.partial"] if partial_index is not None else []
+    )
+    assert result["complete"] is (partial_index is None)

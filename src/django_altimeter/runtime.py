@@ -36,7 +36,9 @@ if TYPE_CHECKING:
     from opentelemetry.sdk.trace import TracerProvider
 
     from django_altimeter.conf import SignalConfig
-    from django_altimeter.exporting import SanitizingSession
+    from django_altimeter.exporting import ExportOutcome, SanitizingSession
+    from django_altimeter.headers import ResponseHeaderPolicy
+    from django_altimeter.metrics import RequestMetrics
 
 
 @dataclass(frozen=True)
@@ -73,9 +75,9 @@ def _process_session(
     class ProcessSession(SanitizingSession):
         """Apply writer ownership and the shared exit budget before native HTTP."""
 
-        def _export_completed(self) -> None:
-            runtime._record_shutdown_export(self.outcome.code)
-            super()._export_completed()
+        def _export_completed(self, outcome: ExportOutcome | None = None) -> None:
+            runtime._record_shutdown_export((outcome or self.outcome).code)
+            super()._export_completed(outcome)
 
         def request(
             self, method: str, url: str | bytes, *args: Any, **kwargs: Any
@@ -112,8 +114,11 @@ class ProcessRuntime:
         self.pid = os.getpid()
         self.instance_id = str(uuid4())
         self.tracer_provider: trace.TracerProvider = NoOpTracerProvider()
+        self.tracer: trace.Tracer = trace.NoOpTracer()
         self.logger_provider: APILoggerProvider = NoOpLoggerProvider()
         self.meter_provider: metrics.MeterProvider = NoOpMeterProvider()
+        self.request_metrics: RequestMetrics | None = None
+        self.response_header_policy: ResponseHeaderPolicy | None = None
         self._trace_provider: TracerProvider | None = None
         self._log_provider: LoggerProvider | None = None
         self._metric_provider: MeterProvider | None = None
@@ -141,7 +146,13 @@ class ProcessRuntime:
     def _install_traces(self) -> None:
         from opentelemetry.sdk.resources import Resource
         from opentelemetry.sdk.trace import TracerProvider
-        from opentelemetry.sdk.trace.sampling import ParentBased, TraceIdRatioBased
+        from opentelemetry.sdk.trace.sampling import (
+            ALWAYS_OFF,
+            ALWAYS_ON,
+            ParentBased,
+            Sampler,
+            TraceIdRatioBased,
+        )
 
         from django_altimeter.exporting import (
             BoundedSpanProcessor,
@@ -149,7 +160,14 @@ class ProcessRuntime:
             native_span_limits,
         )
 
-        root = TraceIdRatioBased(self.config.sample_rate)
+        rate = self.config.sample_rate
+        root: Sampler
+        if rate == 1:
+            root = ALWAYS_ON
+        elif rate == 0:
+            root = ALWAYS_OFF
+        else:
+            root = TraceIdRatioBased(rate)
         sampler = (
             ParentBased(root)
             if self.config.trust_remote_parent
@@ -183,6 +201,7 @@ class ProcessRuntime:
         if trace.get_tracer_provider() is not provider:
             raise RuntimeError("setup.traces_race")
         self.tracer_provider = provider
+        self.tracer = provider.get_tracer("django_altimeter")
 
     def _install_logs(self) -> None:
         from opentelemetry._logs import get_logger_provider, set_logger_provider
@@ -236,10 +255,15 @@ class ProcessRuntime:
         from opentelemetry.sdk.resources import Resource
 
         from django_altimeter.exporting import create_metric_exporter
+        from django_altimeter.metrics import (
+            REQUEST_INSTRUMENTS,
+            RequestMetrics,
+            request_metric_views,
+        )
 
-        # Until the request recorder supplies its finite dimensions, each
-        # registered instrument has one aggregate series. Unknown instruments
-        # never allocate aggregation series. Writer identity stays on resource.
+        # The native request pair admits finite dimensions before aggregation.
+        # Other registered instruments keep one aggregate series until their
+        # owning recorder supplies an explicit bounded schema.
         # Even DropAggregation retains an internal entry per attribute set in
         # SDK1.45.x. Filter its keys too, before the SDK hashes measurements.
         views = [
@@ -247,9 +271,12 @@ class ProcessRuntime:
                 instrument_name="*", aggregation=DropAggregation(), attribute_keys=set()
             )
         ]
+        views.extend(request_metric_views())
         views.extend(
             View(meter_name=scope, instrument_name=escape(name), attribute_keys=set())
-            for scope, name in sorted(self.config.policy.metric_instruments)
+            for scope, name in sorted(
+                self.config.policy.metric_instruments - REQUEST_INSTRUMENTS
+            )
         )
         exporter = create_metric_exporter(
             self._session("metrics", self.config.metrics),
@@ -281,6 +308,11 @@ class ProcessRuntime:
         if metrics.get_meter_provider() is not provider:
             raise RuntimeError("setup.metrics_race")
         self.meter_provider = provider
+        self.request_metrics = RequestMetrics(
+            provider,
+            policy=self._policy,
+            limits=self.config.limits,
+        )
 
     def _resource_attributes(self) -> dict[str, str | bool]:
         attributes: dict[str, str | bool] = {
@@ -319,9 +351,16 @@ class ProcessRuntime:
             self.result = SetupResult(codes=("setup.semconv_conflict",))
             return self.result
         _otel_compat.prepare_fork_support()
+        from django_altimeter.headers import prepare_response_header_policy
+        from django_altimeter.metrics import request_metric_policy
+
+        self.response_header_policy = prepare_response_header_policy(
+            self.config.frontend_origins
+        )
+        request_policy = request_metric_policy(self.config.policy)
         self._policy = replace(
-            self.config.policy,
-            attribute_values=self.config.policy.attribute_values
+            request_policy,
+            attribute_values=request_policy.attribute_values
             | frozenset(self.config.resource_attributes)
             | {("service.instance.id", self.instance_id)},
         )
@@ -557,20 +596,20 @@ def shutdown(*, timeout: float = 2.0) -> ShutdownResult:
         return ShutdownResult(False, ("shutdown.failed",))
 
 
+def _owns_trace_provider(runtime: ProcessRuntime) -> bool:
+    """Check provider ownership after get_process_runtime validates the lifetime."""
+    return (
+        "traces" in runtime.result.enabled_signals
+        and trace.get_tracer_provider() is runtime.tracer_provider
+    )
+
+
 def get_owned_trace_runtime() -> ProcessRuntime | None:
-    runtime = _runtime
-    if (
-        runtime is None
-        or runtime.pid != os.getpid()
-        or not runtime._initialized.is_set()
-        or runtime._shutdown_deadline is not None
-        or "traces" not in runtime.result.enabled_signals
-    ):
-        return None
+    runtime = get_process_runtime()
     try:
-        if trace.get_tracer_provider() is runtime.tracer_provider:
-            return runtime
-        return None
+        return (
+            runtime if runtime is not None and _owns_trace_provider(runtime) else None
+        )
     except Exception:
         return None
 

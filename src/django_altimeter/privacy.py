@@ -7,10 +7,12 @@ Projection is the final boundary, not a replacement for admission before batchin
 or metric Views/cardinality admission before aggregation.
 """
 
+from __future__ import annotations
+
 from collections.abc import Sequence
 from dataclasses import dataclass, fields
 from math import isfinite
-from typing import TypeGuard
+from typing import TYPE_CHECKING, TypeGuard
 
 from opentelemetry.proto.collector.logs.v1.logs_service_pb2 import (
     ExportLogsServiceRequest,
@@ -31,12 +33,14 @@ from opentelemetry.proto.metrics.v1.metrics_pb2 import (
     Exemplar,
     ExponentialHistogramDataPoint,
     HistogramDataPoint,
-    Metric,
     NumberDataPoint,
     SummaryDataPoint,
 )
 from opentelemetry.proto.resource.v1.resource_pb2 import Resource
 from opentelemetry.proto.trace.v1.trace_pb2 import Span, Status
+
+if TYPE_CHECKING:
+    from google.protobuf.internal.containers import RepeatedCompositeFieldContainer
 
 
 @dataclass(frozen=True)
@@ -59,8 +63,68 @@ class PrivacyLimits:
 
 
 DEFAULT_LIMITS = PrivacyLimits()
+# This one fixed numeric shape exceeds the generic nested-collection ceiling.
+HTTP_REQUEST_DURATION_BUCKETS = (
+    0.005,
+    0.01,
+    0.025,
+    0.05,
+    0.075,
+    0.1,
+    0.25,
+    0.5,
+    0.75,
+    1,
+    2.5,
+    5,
+    7.5,
+    10,
+    15,
+    30,
+    45,
+    60,
+    120,
+)
+HTTP_ATTRIBUTE_VALUES = frozenset(
+    {("altimeter.surface", value) for value in ("django", "mcp")}
+    | {
+        ("http.response.status_class", value)
+        for value in ("1xx", "2xx", "3xx", "4xx", "5xx", "absent")
+    }
+    | {("altimeter.http.outcome", value) for value in ("completed", "aborted")}
+    | {
+        ("altimeter.response_mode", value)
+        for value in ("buffered", "streaming", "unknown")
+    }
+    | {("error.type", "after_response")}
+)
+_HTTP_CATEGORY_KEYS = frozenset(
+    {
+        "altimeter.surface",
+        "http.response.status_class",
+        "altimeter.http.outcome",
+        "altimeter.response_mode",
+    }
+)
+_HTTP_SERVER_KEYS = frozenset(
+    {
+        "altimeter.http.server.concurrent_at_start",
+        "altimeter.http.response_ready.duration",
+    }
+)
 _HTTP_METHODS = frozenset(
-    {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "CONNECT", "TRACE"}
+    {
+        "GET",
+        "POST",
+        "PUT",
+        "PATCH",
+        "DELETE",
+        "HEAD",
+        "OPTIONS",
+        "CONNECT",
+        "TRACE",
+        "_OTHER",
+    }
 )
 _DB_OPERATIONS = frozenset(
     {
@@ -124,6 +188,8 @@ _STRING_KEYS = frozenset(
         "http.route",
         "http.method",
         "http.request.method",
+        "http.response.status_class",
+        "altimeter.http.outcome",
         "db.system",
         "db.system.name",
         "db.operation",
@@ -212,7 +278,9 @@ def _allowed_attribute(
         return _text(value, min(200, limits.max_string_bytes)) and bool(value.strip())
     if key in _STATUS_KEYS:
         return type(value) is int and 100 <= value <= 599
-    if key in _DURATION_KEYS:
+    if key == "altimeter.http.server.concurrent_at_start":
+        return type(value) is int and 1 <= value <= 2**63 - 1
+    if key in _DURATION_KEYS or key == "altimeter.http.response_ready.duration":
         if type(value) is int:
             return 0 <= value <= 2**63 - 1
         if type(value) is float:
@@ -227,6 +295,10 @@ def _allowed_attribute(
         return len(value) == size and all(c in "0123456789abcdef" for c in value)
     if key not in _STRING_KEYS:
         return False
+    if key in _HTTP_CATEGORY_KEYS:
+        return (key, value) in HTTP_ATTRIBUTE_VALUES
+    if key == "error.type" and value == "after_response":
+        return True
     if key in {"http.method", "http.request.method"}:
         return value in _HTTP_METHODS
     if key in {"db.operation", "db.operation.name"}:
@@ -234,6 +306,20 @@ def _allowed_attribute(
     if key in {"db.system", "db.system.name"}:
         return value in _DB_SYSTEMS
     return (key, value) in policy.attribute_values
+
+
+def _is_allowed_attribute(
+    key: object,
+    value: object,
+    policy: PrivacyPolicy,
+    limits: PrivacyLimits,
+    resource: bool = False,
+) -> bool:
+    """Check a dynamic scalar after the caller validates frozen configuration."""
+    try:
+        return _allowed_attribute(key, value, policy, limits, resource)
+    except Exception:
+        return False
 
 
 def is_allowed_attribute(
@@ -249,7 +335,7 @@ def is_allowed_attribute(
         return (
             type(resource) is bool
             and is_valid_configuration(policy, limits)
-            and _allowed_attribute(key, value, policy, limits, resource)
+            and _is_allowed_attribute(key, value, policy, limits, resource)
         )
     except Exception:
         # Telemetry boundary: unknown/malformed values cannot reach the app.
@@ -270,6 +356,16 @@ def normalize_span_name(
     try:
         if not is_valid_configuration(policy, limits):
             return "SPAN"
+        return _normalize_span_name(name, policy, limits)
+    except Exception:
+        return "SPAN"
+
+
+def _normalize_span_name(
+    name: object, policy: PrivacyPolicy, limits: PrivacyLimits
+) -> str:
+    """Normalize dynamic input after the caller validates frozen configuration."""
+    try:
         if not _text(name, limits.max_string_bytes):
             return "SPAN"
         first = name.split(None, 1)[0].upper() if name.strip() else ""
@@ -289,16 +385,19 @@ def normalize_span_name(
 
 def _attributes(
     source: Sequence[KeyValue],
+    target: RepeatedCompositeFieldContainer[KeyValue],
     policy: PrivacyPolicy,
     limits: PrivacyLimits,
     *,
     resource: bool = False,
     metric: bool = False,
     identity: bool = False,
-) -> list[KeyValue]:
+    server: bool = False,
+) -> None:
+    """Write only approved scalars into a fresh destination, never source messages."""
     maximum = limits.max_resource_attributes if resource else limits.max_attributes
     if len(source) > maximum:
-        return []
+        return
     allowed_keys = (
         _RESOURCE_ATTRIBUTE_KEYS
         if resource
@@ -308,7 +407,8 @@ def _attributes(
         if identity
         else _RECORD_KEYS
     )
-    result: list[KeyValue] = []
+    if server:
+        allowed_keys |= _HTTP_SERVER_KEYS
     seen: set[str] = set()
     for item in source:
         key = item.key
@@ -327,42 +427,52 @@ def _attributes(
             continue  # Never descend into unapproved structured attributes.
         value = getattr(item.value, kind)
         if _allowed_attribute(key, value, policy, limits, resource):
-            result.append(KeyValue(key=key, value=AnyValue(**{kind: value})))
+            setattr(target.add(key=key).value, kind, value)
             seen.add(key)
-    return result
 
 
 def _resource(
-    source: Resource, policy: PrivacyPolicy, limits: PrivacyLimits
-) -> Resource:
-    return Resource(
-        attributes=_attributes(source.attributes, policy, limits, resource=True)
-    )
+    source: Resource, target: Resource, policy: PrivacyPolicy, limits: PrivacyLimits
+) -> None:
+    target.SetInParent()
+    _attributes(source.attributes, target.attributes, policy, limits, resource=True)
 
 
 def _scope(
-    source: InstrumentationScope, policy: PrivacyPolicy, limits: PrivacyLimits
-) -> InstrumentationScope:
+    source: InstrumentationScope,
+    target: InstrumentationScope,
+    policy: PrivacyPolicy,
+    limits: PrivacyLimits,
+) -> None:
+    target.SetInParent()
     name = source.name
     if _text(name, limits.max_string_bytes) and name in policy.scope_names:
-        return InstrumentationScope(name=name)
-    return InstrumentationScope()
+        target.name = name
 
 
 def _id(value: bytes, size: int) -> bytes:
     return value if len(value) == size else b""
 
 
-def _span(source: Span, policy: PrivacyPolicy, limits: PrivacyLimits) -> Span | None:
+def _span(
+    source: Span, result: Span, policy: PrivacyPolicy, limits: PrivacyLimits
+) -> bool:
     if (
         len(source.attributes) > limits.max_attributes
         or len(source.events) > limits.max_events
         or len(source.links) > limits.max_links
         or not _text(source.name, limits.max_string_bytes)
     ):
-        return None
-    attributes = _attributes(source.attributes, policy, limits, identity=True)
-    name = normalize_span_name(source.name, policy=policy, limits=limits)
+        return False
+    _attributes(
+        source.attributes,
+        result.attributes,
+        policy,
+        limits,
+        identity=True,
+        server=source.kind == Span.SPAN_KIND_SERVER,
+    )
+    name = _normalize_span_name(source.name, policy, limits)
     if name == "SPAN" and any(
         _text(a.key, limits.max_key_bytes)
         and a.key
@@ -379,24 +489,21 @@ def _span(source: Span, policy: PrivacyPolicy, limits: PrivacyLimits) -> Span | 
         name = next(
             (
                 a.value.string_value
-                for a in attributes
+                for a in result.attributes
                 if a.key in {"db.operation", "db.operation.name"}
             ),
             "DB",
         )
     if not _text(name, limits.max_string_bytes):
-        return None
-    result = Span(
-        name=name,
-        trace_id=_id(source.trace_id, 16),
-        span_id=_id(source.span_id, 8),
-        parent_span_id=_id(source.parent_span_id, 8),
-        flags=source.flags & 0x301,
-        kind=source.kind if source.kind in range(6) else Span.SPAN_KIND_UNSPECIFIED,
-        start_time_unix_nano=source.start_time_unix_nano,
-        end_time_unix_nano=source.end_time_unix_nano,
-        attributes=attributes,
-    )
+        return False
+    result.name = name
+    result.trace_id = _id(source.trace_id, 16)
+    result.span_id = _id(source.span_id, 8)
+    result.parent_span_id = _id(source.parent_span_id, 8)
+    result.flags = source.flags & 0x301
+    result.kind = source.kind if source.kind in range(6) else Span.SPAN_KIND_UNSPECIFIED
+    result.start_time_unix_nano = source.start_time_unix_nano
+    result.end_time_unix_nano = source.end_time_unix_nano
     result.status.code = (
         source.status.code
         if source.status.code in (0, 1, 2)
@@ -408,20 +515,20 @@ def _span(source: Span, policy: PrivacyPolicy, limits: PrivacyLimits) -> Span | 
             and event.name in policy.event_names
             and len(event.attributes) <= limits.max_attributes
         ):
-            result.events.add(
+            target = result.events.add(
                 name=event.name,
                 time_unix_nano=event.time_unix_nano,
-                attributes=_attributes(event.attributes, policy, limits),
             )
+            _attributes(event.attributes, target.attributes, policy, limits)
     for link in source.links:
         if len(link.attributes) <= limits.max_attributes:
-            result.links.add(
+            target_link = result.links.add(
                 trace_id=_id(link.trace_id, 16),
                 span_id=_id(link.span_id, 8),
                 flags=link.flags & 0x301,
-                attributes=_attributes(link.attributes, policy, limits),
             )
-    return result if result.ByteSize() <= limits.max_record_bytes else None
+            _attributes(link.attributes, target_link.attributes, policy, limits)
+    return result.ByteSize() <= limits.max_record_bytes
 
 
 def project_traces(
@@ -447,20 +554,17 @@ def project_traces(
             scopes_left -= len(group.scope_spans)
             if len(group.resource.attributes) > limits.max_resource_attributes:
                 continue
-            target_group = result.resource_spans.add(
-                resource=_resource(group.resource, policy, limits)
-            )
+            target_group = result.resource_spans.add()
+            _resource(group.resource, target_group.resource, policy, limits)
             for scope in group.scope_spans:
                 if len(scope.spans) > remaining:
                     return ExportTraceServiceRequest()
                 remaining -= len(scope.spans)
-                target = target_group.scope_spans.add(
-                    scope=_scope(scope.scope, policy, limits)
-                )
+                target = target_group.scope_spans.add()
+                _scope(scope.scope, target.scope, policy, limits)
                 for span in scope.spans:
-                    projected = _span(span, policy, limits)
-                    if projected is not None:
-                        target.spans.append(projected)
+                    if not _span(span, target.spans.add(), policy, limits):
+                        del target.spans[-1]
         if result.ByteSize() > limits.max_batch_bytes:
             return ExportTraceServiceRequest()
         return result
@@ -492,34 +596,37 @@ def _body(
             if nested.WhichOneof("value"):
                 result.kvlist_value.values.add(key=key, value=nested)
         else:
-            result.kvlist_value.values.extend(_attributes([child], policy, limits))
+            # The previous empty extend retained the map's wire presence even
+            # when this child was denied. Preserve that distinction from no body.
+            result.kvlist_value.SetInParent()
+            _attributes([child], result.kvlist_value.values, policy, limits)
         seen.add(key)
     return result
 
 
 def _log(
-    source: LogRecord, policy: PrivacyPolicy, limits: PrivacyLimits
-) -> LogRecord | None:
+    source: LogRecord, result: LogRecord, policy: PrivacyPolicy, limits: PrivacyLimits
+) -> bool:
     if len(source.attributes) > limits.max_attributes:
-        return None
-    result = LogRecord(
-        time_unix_nano=source.time_unix_nano,
-        observed_time_unix_nano=source.observed_time_unix_nano,
-        severity_number=source.severity_number
+        return False
+    result.time_unix_nano = source.time_unix_nano
+    result.observed_time_unix_nano = source.observed_time_unix_nano
+    result.severity_number = (
+        source.severity_number
         if source.severity_number in range(25)
-        else SeverityNumber.SEVERITY_NUMBER_UNSPECIFIED,
-        body=_body(source.body, policy, limits),
-        attributes=_attributes(source.attributes, policy, limits, identity=True),
-        flags=source.flags & 1,
-        trace_id=_id(source.trace_id, 16),
-        span_id=_id(source.span_id, 8),
+        else SeverityNumber.SEVERITY_NUMBER_UNSPECIFIED
     )
+    result.body.CopyFrom(_body(source.body, policy, limits))
+    _attributes(source.attributes, result.attributes, policy, limits, identity=True)
+    result.flags = source.flags & 1
+    result.trace_id = _id(source.trace_id, 16)
+    result.span_id = _id(source.span_id, 8)
     if (
         _text(source.event_name, limits.max_string_bytes)
         and source.event_name in policy.event_names
     ):
         result.event_name = source.event_name
-    return result if result.ByteSize() <= limits.max_record_bytes else None
+    return result.ByteSize() <= limits.max_record_bytes
 
 
 def project_logs(
@@ -545,20 +652,17 @@ def project_logs(
             scopes_left -= len(group.scope_logs)
             if len(group.resource.attributes) > limits.max_resource_attributes:
                 continue
-            target_group = result.resource_logs.add(
-                resource=_resource(group.resource, policy, limits)
-            )
+            target_group = result.resource_logs.add()
+            _resource(group.resource, target_group.resource, policy, limits)
             for scope in group.scope_logs:
                 if len(scope.log_records) > remaining:
                     return ExportLogsServiceRequest()
                 remaining -= len(scope.log_records)
-                target = target_group.scope_logs.add(
-                    scope=_scope(scope.scope, policy, limits)
-                )
+                target = target_group.scope_logs.add()
+                _scope(scope.scope, target.scope, policy, limits)
                 for record in scope.log_records:
-                    projected = _log(record, policy, limits)
-                    if projected is not None:
-                        target.log_records.append(projected)
+                    if not _log(record, target.log_records.add(), policy, limits):
+                        del target.log_records[-1]
         return (
             result
             if result.ByteSize() <= limits.max_batch_bytes
@@ -568,10 +672,13 @@ def project_logs(
         return ExportLogsServiceRequest()
 
 
-def _exemplars(source: Sequence[Exemplar], limits: PrivacyLimits) -> list[Exemplar]:
+def _exemplars(
+    source: Sequence[Exemplar],
+    target: RepeatedCompositeFieldContainer[Exemplar],
+    limits: PrivacyLimits,
+) -> None:
     if len(source) > limits.max_children:
-        return []
-    result = []
+        return
     for exemplar in source:
         kind = exemplar.WhichOneof("value")
         if kind not in {"as_int", "as_double"}:
@@ -579,82 +686,94 @@ def _exemplars(source: Sequence[Exemplar], limits: PrivacyLimits) -> list[Exempl
         value = getattr(exemplar, kind)
         if not isfinite(value):
             continue
-        result.append(
-            Exemplar(
-                time_unix_nano=exemplar.time_unix_nano,
-                trace_id=_id(exemplar.trace_id, 16),
-                span_id=_id(exemplar.span_id, 8),
-                **{kind: value},
-            )
+        target.add(
+            time_unix_nano=exemplar.time_unix_nano,
+            trace_id=_id(exemplar.trace_id, 16),
+            span_id=_id(exemplar.span_id, 8),
+            **{kind: value},
         )
-    return result
 
 
 def _number(
-    source: NumberDataPoint, policy: PrivacyPolicy, limits: PrivacyLimits
-) -> NumberDataPoint | None:
+    source: NumberDataPoint,
+    result: NumberDataPoint,
+    policy: PrivacyPolicy,
+    limits: PrivacyLimits,
+) -> bool:
     kind = source.WhichOneof("value")
     if kind not in {"as_int", "as_double"} or not isfinite(getattr(source, kind)):
-        return None
-    return NumberDataPoint(
-        attributes=_attributes(source.attributes, policy, limits, metric=True),
-        start_time_unix_nano=source.start_time_unix_nano,
-        time_unix_nano=source.time_unix_nano,
-        flags=source.flags & 1,
-        exemplars=_exemplars(source.exemplars, limits),
-        **{kind: getattr(source, kind)},
-    )
+        return False
+    _attributes(source.attributes, result.attributes, policy, limits, metric=True)
+    result.start_time_unix_nano = source.start_time_unix_nano
+    result.time_unix_nano = source.time_unix_nano
+    result.flags = source.flags & 1
+    _exemplars(source.exemplars, result.exemplars, limits)
+    setattr(result, kind, getattr(source, kind))
+    return True
 
 
 def _histogram(
-    source: HistogramDataPoint, policy: PrivacyPolicy, limits: PrivacyLimits
-) -> HistogramDataPoint | None:
+    source: HistogramDataPoint,
+    result: HistogramDataPoint,
+    policy: PrivacyPolicy,
+    limits: PrivacyLimits,
+    *,
+    request_duration: bool = False,
+) -> bool:
+    # Keep the nested-value bound unchanged. Only the exact owned HTTP shape
+    # gets its fixed 20-count allowance; length checks precede bounded copying.
+    maximum = limits.max_children
     if (
-        len(source.bucket_counts) > limits.max_children
-        or len(source.explicit_bounds) > limits.max_children
+        request_duration
+        and len(source.explicit_bounds) == len(HTTP_REQUEST_DURATION_BUCKETS)
+        and tuple(source.explicit_bounds) == HTTP_REQUEST_DURATION_BUCKETS
+    ):
+        maximum = len(HTTP_REQUEST_DURATION_BUCKETS) + 1
+    if (
+        len(source.bucket_counts) > maximum
+        or len(source.explicit_bounds) > maximum
         or len(source.bucket_counts) != len(source.explicit_bounds) + 1
         or any(not isfinite(b) for b in source.explicit_bounds)
     ):
-        return None
-    result = HistogramDataPoint(
-        attributes=_attributes(source.attributes, policy, limits, metric=True),
-        start_time_unix_nano=source.start_time_unix_nano,
-        time_unix_nano=source.time_unix_nano,
-        count=source.count,
-        bucket_counts=source.bucket_counts,
-        explicit_bounds=source.explicit_bounds,
-        flags=source.flags & 1,
-        exemplars=_exemplars(source.exemplars, limits),
-    )
+        return False
+    _attributes(source.attributes, result.attributes, policy, limits, metric=True)
+    result.start_time_unix_nano = source.start_time_unix_nano
+    result.time_unix_nano = source.time_unix_nano
+    result.count = source.count
+    result.bucket_counts.extend(source.bucket_counts)
+    result.explicit_bounds.extend(source.explicit_bounds)
+    result.flags = source.flags & 1
+    _exemplars(source.exemplars, result.exemplars, limits)
     for field in ("sum", "min", "max"):
         if source.HasField(field):
             value = getattr(source, field)
             if not isfinite(value):
-                return None
+                return False
             setattr(result, field, value)
-    return result
+    return True
 
 
 def _exponential(
-    source: ExponentialHistogramDataPoint, policy: PrivacyPolicy, limits: PrivacyLimits
-) -> ExponentialHistogramDataPoint | None:
+    source: ExponentialHistogramDataPoint,
+    result: ExponentialHistogramDataPoint,
+    policy: PrivacyPolicy,
+    limits: PrivacyLimits,
+) -> bool:
     if (
         len(source.positive.bucket_counts) > limits.max_children
         or len(source.negative.bucket_counts) > limits.max_children
         or not isfinite(source.zero_threshold)
     ):
-        return None
-    result = ExponentialHistogramDataPoint(
-        attributes=_attributes(source.attributes, policy, limits, metric=True),
-        start_time_unix_nano=source.start_time_unix_nano,
-        time_unix_nano=source.time_unix_nano,
-        count=source.count,
-        scale=source.scale,
-        zero_count=source.zero_count,
-        zero_threshold=source.zero_threshold,
-        flags=source.flags & 1,
-        exemplars=_exemplars(source.exemplars, limits),
-    )
+        return False
+    _attributes(source.attributes, result.attributes, policy, limits, metric=True)
+    result.start_time_unix_nano = source.start_time_unix_nano
+    result.time_unix_nano = source.time_unix_nano
+    result.count = source.count
+    result.scale = source.scale
+    result.zero_count = source.zero_count
+    result.zero_threshold = source.zero_threshold
+    result.flags = source.flags & 1
+    _exemplars(source.exemplars, result.exemplars, limits)
     result.positive.offset = source.positive.offset
     result.positive.bucket_counts.extend(source.positive.bucket_counts)
     result.negative.offset = source.negative.offset
@@ -663,29 +782,30 @@ def _exponential(
         if source.HasField(field):
             value = getattr(source, field)
             if not isfinite(value):
-                return None
+                return False
             setattr(result, field, value)
-    return result
+    return True
 
 
 def _summary(
-    source: SummaryDataPoint, policy: PrivacyPolicy, limits: PrivacyLimits
-) -> SummaryDataPoint | None:
+    source: SummaryDataPoint,
+    result: SummaryDataPoint,
+    policy: PrivacyPolicy,
+    limits: PrivacyLimits,
+) -> bool:
     if len(source.quantile_values) > limits.max_children or not isfinite(source.sum):
-        return None
-    result = SummaryDataPoint(
-        attributes=_attributes(source.attributes, policy, limits, metric=True),
-        start_time_unix_nano=source.start_time_unix_nano,
-        time_unix_nano=source.time_unix_nano,
-        count=source.count,
-        sum=source.sum,
-        flags=source.flags & 1,
-    )
+        return False
+    _attributes(source.attributes, result.attributes, policy, limits, metric=True)
+    result.start_time_unix_nano = source.start_time_unix_nano
+    result.time_unix_nano = source.time_unix_nano
+    result.count = source.count
+    result.sum = source.sum
+    result.flags = source.flags & 1
     for quantile in source.quantile_values:
         if not 0 <= quantile.quantile <= 1 or not isfinite(quantile.value):
-            return None
+            return False
         result.quantile_values.add(quantile=quantile.quantile, value=quantile.value)
-    return result
+    return True
 
 
 def project_metrics(
@@ -717,9 +837,8 @@ def project_metrics(
             scopes_left -= len(group.scope_metrics)
             if len(group.resource.attributes) > limits.max_resource_attributes:
                 continue
-            target_group = result.resource_metrics.add(
-                resource=_resource(group.resource, policy, limits)
-            )
+            target_group = result.resource_metrics.add()
+            _resource(group.resource, target_group.resource, policy, limits)
             for scope in group.scope_metrics:
                 if len(scope.metrics) > instruments_left:
                     return ExportMetricsServiceRequest()
@@ -730,9 +849,8 @@ def project_metrics(
                     or name not in policy.scope_names
                 ):
                     continue
-                target = target_group.scope_metrics.add(
-                    scope=_scope(scope.scope, policy, limits)
-                )
+                target = target_group.scope_metrics.add()
+                _scope(scope.scope, target.scope, policy, limits)
                 for metric in scope.metrics:
                     if (
                         not _text(metric.name, limits.max_string_bytes)
@@ -752,7 +870,7 @@ def project_metrics(
                     if len(data.data_points) > points_left:
                         return ExportMetricsServiceRequest()
                     points_left -= len(data.data_points)
-                    projected = Metric(
+                    projected = target.metrics.add(
                         name=metric.name,
                         unit=metric.unit
                         if _text(metric.unit, limits.max_string_bytes)
@@ -762,6 +880,7 @@ def project_metrics(
                     output = getattr(projected, kind)
                     if kind in {"sum", "histogram", "exponential_histogram"}:
                         if data.aggregation_temporality not in (1, 2):
+                            del target.metrics[-1]
                             continue
                         output.aggregation_temporality = data.aggregation_temporality
                     if kind == "sum":
@@ -769,28 +888,33 @@ def project_metrics(
                     for point in data.data_points:
                         if len(point.attributes) > limits.max_attributes:
                             continue
-                        safe: (
-                            NumberDataPoint
-                            | HistogramDataPoint
-                            | ExponentialHistogramDataPoint
-                            | SummaryDataPoint
-                            | None
-                        ) = None
+                        destination = output.data_points.add()
+                        valid = False
                         if kind in {"gauge", "sum"}:
-                            safe = _number(point, policy, limits)
+                            valid = _number(point, destination, policy, limits)
                         elif kind == "histogram":
-                            safe = _histogram(point, policy, limits)
+                            valid = _histogram(
+                                point,
+                                destination,
+                                policy,
+                                limits,
+                                request_duration=(
+                                    name == "django_altimeter"
+                                    and metric.name == "http.server.request.duration"
+                                    and metric.unit == "s"
+                                ),
+                            )
                         elif kind == "exponential_histogram":
-                            safe = _exponential(point, policy, limits)
+                            valid = _exponential(point, destination, policy, limits)
                         elif kind == "summary":
-                            safe = _summary(point, policy, limits)
+                            valid = _summary(point, destination, policy, limits)
                         if (
-                            safe is not None
-                            and safe.ByteSize() <= limits.max_record_bytes
+                            not valid
+                            or destination.ByteSize() > limits.max_record_bytes
                         ):
-                            output.data_points.append(safe)
-                    if output.data_points:
-                        target.metrics.append(projected)
+                            del output.data_points[-1]
+                    if not output.data_points:
+                        del target.metrics[-1]
         return (
             result
             if result.ByteSize() <= limits.max_batch_bytes

@@ -33,6 +33,8 @@ rq = ["rq>=2.10.0,<2.11"]
 
 [dependency-groups]
 dev = [
+    "django-ninja==1.6.2",
+    "uvicorn==0.46.0",
     "mypy>=1.18,<2",
     "pytest>=8.4,<10",
     "pytest-django>=4.11,<5",
@@ -70,5 +72,9 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["tests"]
-addopts = "--strict-markers --strict-config"
-markers = ["integration: built-artifact or real-process integration checks", "live: credential-gated live PostHog checks; skipped without credentials"]
+addopts = "--strict-markers --strict-config -m 'not performance'"
+markers = [
+    "integration: built-artifact or real-process integration checks",
+    "live: credential-gated live PostHog checks; skipped without credentials",
+    "performance: predeclared wall-clock acceptance; run explicitly in the ASGI verification image",
+]

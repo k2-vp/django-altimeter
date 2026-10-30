@@ -1067,3 +1067,257 @@ def test_probe_resource_rejects_large_string_before_materialization(
     assert flag in getattr(projected, groups)[0].resource.attributes
     assert b"/items/{id}" in projected.SerializeToString()
     assert CANARY.encode() not in projected.SerializeToString()
+
+
+@pytest.mark.parametrize(
+    ("key", "safe", "invalid"),
+    [
+        ("http.request.method", "_OTHER", CANARY),
+        ("http.response.status_class", "5xx", CANARY),
+        ("altimeter.http.outcome", "aborted", CANARY),
+        ("altimeter.surface", "django", CANARY),
+        ("altimeter.response_mode", "streaming", CANARY),
+        ("altimeter.http.server.concurrent_at_start", 3, -1),
+        ("altimeter.http.response_ready.duration", 0.25, float("inf")),
+    ],
+)
+def test_native_http_closed_values_keep_safe_neighbor_and_drop_canary(
+    key, safe, invalid
+):
+    policy = replace(
+        POLICY, attribute_values=POLICY.attribute_values | {(key, str(invalid))}
+    )
+    request = trace_request()
+    spans = request.resource_spans[0].scope_spans[0].spans
+    positive = spans.add(name="GET", kind=2)
+    positive.attributes.extend(
+        [attribute(key, safe), attribute("http.response.status_code", 200)]
+    )
+    negative = spans.add(name="GET", kind=2)
+    negative.attributes.extend(
+        [attribute(key, invalid), attribute("http.response.status_code", 503)]
+    )
+    result = project_traces(request, policy=policy)
+    assert CANARY.encode() not in result.SerializeToString()
+    projected = result.resource_spans[0].scope_spans[0].spans
+    assert projected[-2].attributes == [
+        attribute(key, safe),
+        attribute("http.response.status_code", 200),
+    ]
+    assert projected[-1].attributes == [attribute("http.response.status_code", 503)]
+
+
+def test_request_numeric_details_never_become_metric_dimensions_or_resources():
+    request = metric_request()
+    group = request.resource_metrics[0]
+    point = group.scope_metrics[0].metrics[0].histogram.data_points[0]
+    for key, value in (
+        ("altimeter.http.server.concurrent_at_start", 3),
+        ("altimeter.http.response_ready.duration", 0.25),
+    ):
+        point.attributes.append(attribute(key, value))
+        group.resource.attributes.append(attribute(key, value))
+    result = project_metrics(request, policy=POLICY)
+    safe = (
+        result.resource_metrics[0].scope_metrics[0].metrics[0].histogram.data_points[0]
+    )
+    assert attribute("http.route", "/items/{id}") in safe.attributes
+    assert not any(a.key.startswith("altimeter.http.") for a in safe.attributes)
+    assert not any(
+        a.key.startswith("altimeter.http.")
+        for a in result.resource_metrics[0].resource.attributes
+    )
+
+
+def test_standard_request_histogram_keeps_all_fixed_long_buckets_but_not_other_shapes():
+    boundaries = (
+        0.005,
+        0.01,
+        0.025,
+        0.05,
+        0.075,
+        0.1,
+        0.25,
+        0.5,
+        0.75,
+        1,
+        2.5,
+        5,
+        7.5,
+        10,
+        15,
+        30,
+        45,
+        60,
+        120,
+    )
+    request = metric_request()
+    scope = request.resource_metrics[0].scope_metrics[0]
+    histogram = scope.metrics[0].histogram
+    long = histogram.data_points.add(
+        count=3,
+        sum=116,
+        bucket_counts=[0] * 15 + [1, 1, 1, 0, 0],
+        explicit_bounds=boundaries,
+    )
+    long.attributes.extend(
+        [attribute("http.route", "/items/{id}"), attribute("secret", CANARY)]
+    )
+    wrong_shape = histogram.data_points.add()
+    wrong_shape.CopyFrom(long)
+    wrong_shape.explicit_bounds[-1] = 121
+    foreign = scope.metrics.add(name="other.duration", unit="s")
+    foreign.histogram.CopyFrom(histogram)
+    policy = replace(
+        POLICY,
+        metric_instruments=POLICY.metric_instruments
+        | {("django_altimeter", "other.duration")},
+    )
+    projected = project_metrics(request, policy=policy)
+    assert CANARY.encode() not in projected.SerializeToString()
+    metrics = {
+        metric.name: metric
+        for metric in projected.resource_metrics[0].scope_metrics[0].metrics
+    }
+    points = metrics["http.server.request.duration"].histogram.data_points
+    assert len(points) == 2
+    assert points[-1].explicit_bounds == list(boundaries)
+    assert points[-1].count == 3 and points[-1].sum == 116
+    assert points[-1].bucket_counts[-1] == 0
+    assert points[-1].attributes == [attribute("http.route", "/items/{id}")]
+    assert len(metrics["other.duration"].histogram.data_points) == 1
+    assert DEFAULT_LIMITS.max_children == 16
+
+
+def test_http_numeric_details_are_server_span_only_and_error_event_is_fixed():
+    keys = [
+        attribute("altimeter.http.server.concurrent_at_start", 4),
+        attribute("altimeter.http.response_ready.duration", 0.5),
+    ]
+    request = trace_request()
+    scope = request.resource_spans[0].scope_spans[0]
+    server = scope.spans.add(name="GET", kind=2)
+    server.attributes.extend(keys)
+    server.events.add(name="exception").attributes.extend(
+        keys
+        + [
+            attribute("error.type", "after_response"),
+            attribute("exception.message", CANARY),
+        ]
+    )
+    server.links.add(trace_id=TRACE_ID, span_id=SPAN_ID).attributes.extend(keys)
+    internal = scope.spans.add(name="SPAN", kind=1)
+    internal.attributes.extend(keys + [attribute("http.response.status_code", 200)])
+    result = project_traces(request, policy=POLICY)
+    spans = result.resource_spans[0].scope_spans[0].spans
+    assert spans[-2].attributes == keys
+    assert spans[-2].events[0].attributes == [attribute("error.type", "after_response")]
+    assert not spans[-2].links[0].attributes
+    assert spans[-1].attributes == [attribute("http.response.status_code", 200)]
+    assert CANARY.encode() not in result.SerializeToString()
+    logs = log_request()
+    logs.resource_logs[0].scope_logs[0].log_records[-1].attributes.extend(keys)
+    record = (
+        project_logs(logs, policy=POLICY).resource_logs[0].scope_logs[0].log_records[-1]
+    )
+    assert record.body.string_value == "request.completed"
+    assert not any(item.key in {key.key for key in keys} for item in record.attributes)
+
+
+def _profile_configuration_validation(action):
+    """Observe real validation calls without replacing the policy predicate."""
+    import sys
+
+    calls = 0
+
+    def observe(frame, event, argument):
+        nonlocal calls
+        if event == "call" and frame.f_code is is_valid_configuration.__code__:
+            calls += 1
+
+    previous = sys.getprofile()
+    try:
+        sys.setprofile(observe)
+        result = action()
+    finally:
+        sys.setprofile(previous)
+    return result, calls
+
+
+@pytest.mark.parametrize("span_count", [1, 128])
+def test_trace_projection_validates_configuration_once_per_batch(span_count):
+    request = trace_request()
+    spans = request.resource_spans[0].scope_spans[0].spans
+    for _ in range(span_count - 1):
+        spans.add().CopyFrom(spans[0])
+    result, calls = _profile_configuration_validation(
+        lambda: project_traces(request, policy=POLICY)
+    )
+    projected = result.resource_spans[0].scope_spans[0].spans
+    assert len(projected) == span_count
+    assert {span.name for span in projected} == {"SELECT"}
+    assert all(
+        any(
+            item.key == "http.route" and item.value.string_value == "/items/{id}"
+            for item in span.attributes
+        )
+        for span in projected
+    )
+    assert CANARY.encode() not in result.SerializeToString()
+    assert calls == 1
+
+
+@pytest.mark.parametrize(
+    ("projector", "make"),
+    [(project_logs, log_request), (project_metrics, metric_request)],
+)
+def test_other_projections_validate_configuration_once_per_batch(projector, make):
+    result, calls = _profile_configuration_validation(
+        lambda: projector(make(), policy=POLICY)
+    )
+    assert result.ByteSize() > 0
+    assert CANARY.encode() not in result.SerializeToString()
+    assert calls == 1
+
+
+def test_public_name_normalization_keeps_validating_each_call():
+    for limits, expected in (
+        (DEFAULT_LIMITS, "SELECT"),
+        (replace(DEFAULT_LIMITS, max_batch_size=0), "SPAN"),
+        (DEFAULT_LIMITS, "SELECT"),
+    ):
+        result, calls = _profile_configuration_validation(
+            lambda limits=limits: normalize_span_name(
+                f"SELECT '{CANARY}'", policy=POLICY, limits=limits
+            )
+        )
+        assert result == expected
+        assert calls == 1
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_log_projection_preserves_empty_map_wire_presence_after_scrubbing(nested):
+    request = ExportLogsServiceRequest()
+    scope = request.resource_logs.add().scope_logs.add()
+    scope.scope.name = "django_altimeter"
+    record = scope.log_records.add()
+    body = record.body
+    if nested:
+        body = body.kvlist_value.values.add(key="context").value
+    body.kvlist_value.values.add(key="unknown").value.string_value = CANARY
+    scope.log_records.add(body=AnyValue(string_value="request.completed"))
+    before = request.SerializeToString(deterministic=True)
+
+    result = project_logs(request, policy=POLICY)
+    records = result.resource_logs[0].scope_logs[0].log_records
+    expected = AnyValue()
+    empty_map = expected
+    if nested:
+        empty_map = empty_map.kvlist_value.values.add(key="context").value
+    empty_map.kvlist_value.SetInParent()
+    assert records[0].body.SerializeToString(deterministic=True) == (
+        expected.SerializeToString(deterministic=True)
+    )
+    assert records[1].body.string_value == "request.completed"
+    assert CANARY.encode() not in result.SerializeToString()
+    assert request.SerializeToString(deterministic=True) == before

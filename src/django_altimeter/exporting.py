@@ -13,7 +13,7 @@ import logging
 from collections.abc import Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
-from datetime import UTC
+from datetime import UTC, datetime
 from email.utils import format_datetime, parsedate_to_datetime
 from io import BytesIO
 from math import isfinite
@@ -507,6 +507,25 @@ class ExportOutcome:
     local_dropped_records: int = 0
 
 
+_OUTCOME_PRIORITY = {
+    "export.not_sent": 0,
+    "export.empty": 0,
+    "export.accepted": 0,
+    "export.warning": 1,
+    "export.partial": 2,
+}
+
+
+def _worst_outcome(
+    previous: ExportOutcome | None, latest: ExportOutcome
+) -> ExportOutcome:
+    if previous is None or _OUTCOME_PRIORITY.get(
+        latest.code, 3
+    ) >= _OUTCOME_PRIORITY.get(previous.code, 3):
+        return latest
+    return previous
+
+
 class ExportProtocolError(Exception):
     """Fixed local/protocol code. The native HTTP client must not retry this."""
 
@@ -551,10 +570,12 @@ def _safe_retry_after(value: str | None) -> str | None:
             date = parsedate_to_datetime(value)
             if date.tzinfo is None:
                 date = date.replace(tzinfo=UTC)
+            if (date - datetime.now(UTC)).total_seconds() < 1:
+                return None
             return format_datetime(date.astimezone(UTC), usegmt=True)
         except (TypeError, ValueError, OverflowError):
             return None
-    return value if isfinite(seconds) else None
+    return value if isfinite(seconds) and seconds >= 1 else None
 
 
 def _safe_response(status: int, retry_after: str | None = None) -> requests.Response:
@@ -633,6 +654,41 @@ def _read_response(response: requests.Response, ceiling: int, deadline: float) -
             timer.join()
 
 
+@dataclass(frozen=True)
+class _ProjectedBatch:
+    source: bytes
+    payload: bytes
+    count: int
+    dropped: int
+    signal: Signal
+    policy: PrivacyPolicy
+    limits: PrivacyLimits
+
+
+class _ProjectionScope:
+    """Bounded native-export state, explicitly emptied in every copied context."""
+
+    def __init__(self) -> None:
+        self.batch: _ProjectedBatch | None = None
+        self.terminal_outcome: ExportOutcome | None = None
+        self.active = True
+        # Copied contexts may run on another thread while the export finishes.
+        self.lock = Lock()
+
+    def record_terminal(self, outcome: ExportOutcome) -> None:
+        with self.lock:
+            if self.active:
+                self.terminal_outcome = _worst_outcome(self.terminal_outcome, outcome)
+
+    def close(self) -> ExportOutcome | None:
+        with self.lock:
+            outcome = self.terminal_outcome
+            self.active = False
+            self.batch = None
+            self.terminal_outcome = None
+            return outcome
+
+
 class SanitizingSession(requests.Session):
     """One signal and endpoint, projected bytes, bounded truthful OTLP responses.
 
@@ -678,6 +734,11 @@ class SanitizingSession(requests.Session):
         self._failures: ContextVar[tuple[ReferenceType[Exception], ...]] = ContextVar(
             "altimeter_export_failures", default=()
         )
+        # Native exports own independent holders; copied contexts share the
+        # holder so final cleanup also removes their retained input/output.
+        self._projection_scope: ContextVar[_ProjectionScope | None] = ContextVar(
+            "altimeter_export_projection", default=None
+        )
 
     @property
     def outcome(self) -> ExportOutcome:
@@ -713,8 +774,8 @@ class SanitizingSession(requests.Session):
         except Exception:
             self._outcome = replace(self._outcome, code="export.failed")
 
-    def _export_completed(self) -> None:
-        """Finish one native export, after its own retry loop has returned."""
+    def _export_completed(self, outcome: ExportOutcome | None = None) -> None:
+        """Finish native export with its worst terminal batch, after retries."""
         self._emit_diagnostic()
 
     def _emit_diagnostic(self) -> None:
@@ -734,6 +795,39 @@ class SanitizingSession(requests.Session):
             _DIAGNOSTIC_LOGGER.warning("%s %s", code, self.signal)
         except Exception:
             pass  # Diagnostic/logging failure must not change export behavior.
+
+    def _project_for_attempt(self, data: bytes) -> tuple[bytes, int, int]:
+        signal, policy, limits = self.signal, self.policy, self.limits
+        scope = self._projection_scope.get()
+        if scope is not None:
+            with scope.lock:
+                cached = scope.batch
+                if scope.active and cached is not None:
+                    if (
+                        cached.signal == signal
+                        and cached.policy is policy
+                        and cached.limits is limits
+                        and cached.source == data
+                    ):
+                        return cached.payload, cached.count, cached.dropped
+                    # A different batch replaces the only entry. A failed
+                    # projection must leave neither input nor output cached.
+                    scope.batch = None
+                cached = None
+        projected, count, dropped = self._project(data)
+        if scope is not None:
+            with scope.lock:
+                if scope.active:
+                    scope.batch = _ProjectedBatch(
+                        data,
+                        projected,
+                        count,
+                        dropped,
+                        signal,
+                        policy,
+                        limits,
+                    )
+        return projected, count, dropped
 
     def _project(self, data: bytes) -> tuple[bytes, int, int]:
         source: Message
@@ -816,7 +910,12 @@ class SanitizingSession(requests.Session):
                 code = "export.partial"
             elif warning:
                 code = "export.warning"
-            self._outcome = ExportOutcome(code, count - rejected, rejected, dropped)
+            outcome = ExportOutcome(code, count - rejected, rejected, dropped)
+            self._outcome = outcome
+            if self.signal == "metrics" and (scope := self._projection_scope.get()):
+                # A validated 200 ends this batch. HTTP failures can still retry;
+                # their final outcome is considered when native export finishes.
+                scope.record_terminal(outcome)
             self._emit_diagnostic()
             return _safe_response(200)
         finally:
@@ -862,7 +961,7 @@ class SanitizingSession(requests.Session):
                 raise ExportProtocolError("export.request")
             if len(data) > self.limits.max_batch_bytes:
                 raise ExportProtocolError("export.batch_size")
-            projected, count, dropped = self._project(data)
+            projected, count, dropped = self._project_for_attempt(data)
             self._outcome = ExportOutcome(local_dropped_records=dropped)
             headers["Accept-Encoding"] = "identity"
 
@@ -942,9 +1041,13 @@ def create_span_exporter(
             caller_exception = exception()
             session._outcome = ExportOutcome()
             failures_token = session._failures.set(())
+            projection_scope = _ProjectionScope()
+            projection_token = session._projection_scope.set(projection_scope)
             try:
                 return super().export(spans)
             finally:
+                projection_scope.close()
+                session._projection_scope.reset(projection_token)
                 session._clear_failure_frames(caller_exception)
                 session._failures.reset(failures_token)
                 session._export_completed()
@@ -978,9 +1081,13 @@ def create_log_exporter(
             caller_exception = exception()
             session._outcome = ExportOutcome()
             failures_token = session._failures.set(())
+            projection_scope = _ProjectionScope()
+            projection_token = session._projection_scope.set(projection_scope)
             try:
                 return super().export(batch)
             finally:
+                projection_scope.close()
+                session._projection_scope.reset(projection_token)
                 session._clear_failure_frames(caller_exception)
                 session._failures.reset(failures_token)
                 session._export_completed()
@@ -1022,6 +1129,7 @@ def create_metric_exporter(
                 headers=headers,
                 compression=Compression.NoCompression,
                 max_request_size=session.limits.max_batch_bytes,
+                max_export_batch_size=session.limits.max_batch_size,
                 meter_provider=meter_provider,
                 preferred_temporality=preferred_temporality,
             )
@@ -1069,6 +1177,8 @@ def create_metric_exporter(
                 return MetricExportResult.FAILURE
             token = session._deadline.set(deadline)
             failures_token = session._failures.set(())
+            projection_scope = _ProjectionScope()
+            projection_token = session._projection_scope.set(projection_scope)
             original = self._native_timeout()
             supported = self._timeout_supported and original is not None
             patched = False
@@ -1087,16 +1197,19 @@ def create_metric_exporter(
                 session._outcome = ExportOutcome("export.failed")
                 return MetricExportResult.FAILURE
             finally:
+                terminal_outcome = projection_scope.close()
                 if patched:
                     self._client._timeout = cast(float, original)
                 if not supported:
                     session._outcome = replace(
                         session._outcome, code="metrics.timeout_unsupported"
                     )
+                session._projection_scope.reset(projection_token)
                 session._clear_failure_frames(caller_exception)
                 session._failures.reset(failures_token)
                 session._deadline.reset(token)
+                completed_outcome = _worst_outcome(terminal_outcome, session.outcome)
                 self._export_lock.release()
-                session._export_completed()
+                session._export_completed(completed_outcome)
 
     return _DeadlineMetricExporter()

@@ -519,3 +519,119 @@ def test_rejected_inputs_are_released_before_the_application_body(otlp_receiver)
     spans = _spans(otlp_receiver)
     assert len(spans) == 1
     assert _attributes(spans[0]) == {"http.response.status_code": 200}
+
+
+def test_owned_provider_rejects_foreign_ambient_span_and_preserves_neighbors(
+    otlp_receiver,
+):
+    result = _run(
+        otlp_receiver,
+        """
+        assert 'traces' in configure().enabled_signals
+        foreign = TracerProvider(resource=Resource({}), shutdown_on_exit=False)
+        with span('work.execute'):
+            outer = get_correlation()
+            assert outer is not None
+            with foreign.get_tracer('foreign').start_as_current_span('foreign'):
+                foreign_current = trace.get_current_span()
+                assert get_correlation() is None
+                assert trace.get_current_span() is foreign_current
+            assert get_correlation() == outer
+        assert get_correlation() is None
+        tracer = get_owned_trace_runtime().tracer_provider.get_tracer('owned')
+        with tracer.start_as_current_span('work.child'):
+            native = get_correlation()
+            assert native is not None
+        assert shutdown().completed
+        foreign.shutdown()
+        print(json.dumps({'outer': outer.trace_id, 'native': native.trace_id}))
+    """,
+    )
+    spans = _spans(otlp_receiver)
+    assert len(spans) == 2
+    assert {span.trace_id.hex() for span in spans} == {
+        result["outer"],
+        result["native"],
+    }
+
+
+@pytest.mark.parametrize("rate", [0.0, 1.0])
+def test_owned_marker_keeps_unsampled_ids_and_cleans_concurrent_contexts(
+    otlp_receiver, rate
+):
+    result = _run(
+        otlp_receiver,
+        f"""
+        from concurrent.futures import ThreadPoolExecutor
+        from dataclasses import asdict
+        from threading import Barrier
+        config = Config(enabled=True, service_name='context-test',
+            deployment_environment='test', release='test-1', sample_rate={rate},
+            traces=SignalConfig(enabled=True, endpoint=sys.argv[1],
+                                destination='collector'), policy=POLICY)
+        assert 'traces' in setup(config).enabled_signals
+        barrier = Barrier(4)
+        foreign = trace.NonRecordingSpan(trace.SpanContext(123, 456, False))
+        def work(_):
+            with span('work.execute'):
+                expected = get_correlation()
+                assert expected is not None
+                barrier.wait(timeout=5)
+                with trace.use_span(foreign):
+                    assert get_correlation() is None
+                assert get_correlation() == expected
+                with span('work.child'):
+                    child = get_correlation()
+                    assert child.trace_id == expected.trace_id
+                    assert child.span_id != expected.span_id
+                assert get_correlation() == expected
+            assert get_correlation() is None
+            return asdict(expected)
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            records = list(pool.map(work, range(4)))
+        assert get_correlation() is None
+        assert shutdown().completed
+        print(json.dumps(records))
+    """,
+    )
+    assert len({record["trace_id"] for record in result}) == 4
+    assert all(record["trace_flags"] & 1 == int(rate) for record in result)
+    spans = _spans(otlp_receiver)
+    assert len(spans) == (8 if rate else 0)
+    if rate:
+        assert {record["trace_id"] for record in result} == {
+            span.trace_id.hex() for span in spans
+        }
+
+
+def test_provider_identity_guard_fails_closed_if_sdk_attribute_is_absent(
+    otlp_receiver,
+):
+    result = _run(
+        otlp_receiver,
+        """
+        assert 'traces' in configure().enabled_signals
+        runtime = get_owned_trace_runtime()
+        tracer = runtime.tracer_provider.get_tracer('owned')
+        with tracer.start_as_current_span('work.execute') as current:
+            expected = get_correlation()
+            assert expected is not None
+            processor = current.__dict__.pop('_span_processor')
+            try:
+                assert get_correlation() is None
+            finally:
+                current.__dict__['_span_processor'] = processor
+            assert get_correlation() == expected
+            processor = runtime.tracer_provider.__dict__.pop('_active_span_processor')
+            try:
+                assert get_correlation() is None
+            finally:
+                runtime.tracer_provider.__dict__['_active_span_processor'] = processor
+            assert get_correlation() == expected
+        assert shutdown().completed
+        print(json.dumps({'trace_id': expected.trace_id}))
+    """,
+    )
+    spans = _spans(otlp_receiver)
+    assert len(spans) == 1
+    assert spans[0].trace_id.hex() == result["trace_id"]

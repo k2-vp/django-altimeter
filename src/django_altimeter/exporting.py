@@ -13,7 +13,7 @@ import logging
 from collections.abc import Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
-from datetime import UTC
+from datetime import UTC, datetime
 from email.utils import format_datetime, parsedate_to_datetime
 from io import BytesIO
 from math import isfinite
@@ -570,10 +570,12 @@ def _safe_retry_after(value: str | None) -> str | None:
             date = parsedate_to_datetime(value)
             if date.tzinfo is None:
                 date = date.replace(tzinfo=UTC)
+            if (date - datetime.now(UTC)).total_seconds() < 1:
+                return None
             return format_datetime(date.astimezone(UTC), usegmt=True)
         except (TypeError, ValueError, OverflowError):
             return None
-    return value if isfinite(seconds) else None
+    return value if isfinite(seconds) and seconds >= 1 else None
 
 
 def _safe_response(status: int, retry_after: str | None = None) -> requests.Response:

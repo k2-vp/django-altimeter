@@ -620,6 +620,12 @@ every record was accepted or durably stored.
 | `export.http_error` | Ordinary 4xx/5xx bodies are discarded unread. Actual status and a valid bounded `Retry-After` remain available to the native retry code. The pinned client retries 429, 502, 503, and 504, subject to its deadline and retry budget; connection failures also use its native retry path. |
 | Local sanitizer rejection | Invalid input, excessive counts/bytes, projection failure, or zero surviving records sends nothing for that attempt and reports zero accepted records. There is no fallback to the original bytes. A native no-send path resets the outcome to `export.not_sent`. |
 
+`Retry-After` values below one second are treated as absent, so the SDK uses
+its own exponential backoff. This includes numeric values below one and
+HTTP-dates less than one second ahead, including past dates. Values of one
+second or more remain honored, subject to the same native deadline and retry
+budget.
+
 Request bytes are capped at 1 MiB before protobuf decoding and after projection,
 before serialization/send. The record, field, and count limits above also apply.
 Uncompressed response bodies are capped at 64 KiB; invalid or oversized replies

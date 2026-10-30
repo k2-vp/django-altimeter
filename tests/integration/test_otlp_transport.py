@@ -322,20 +322,25 @@ def test_http_errors_discard_prose_and_keep_native_retry(
     retryable = status in (429, 503)
     receipt = otlp_receiver.queue_response(
         status=status,
-        headers={"Retry-After": "0", "Set-Cookie": f"secret={CANARY}"},
+        headers={"Retry-After": "2", "Set-Cookie": f"secret={CANARY}"},
         reason=CANARY,
         body=CANARY.encode() * 10000,
         body_delay=2,
     )
-    exporter, session = _exporter(signal, otlp_receiver, timeout=0.5)
+    exporter, session = _exporter(signal, otlp_receiver, timeout=3.0)
     start = monotonic()
     try:
         assert exporter.export(_payload(signal)).name == (
             "SUCCESS" if retryable else "FAILURE"
         )
-        # Native first backoff is at least0.8s. Success within0.5s proves the
-        # Retry-After:0 survived, without patching the native retry machinery.
-        assert monotonic() - start < 0.5
+        # Two seconds exceeds native first backoff (0.8..1.2s), proving that
+        # the permitted Retry-After was honored by the unchanged native loop.
+        elapsed = monotonic() - start
+        if retryable:
+            assert elapsed >= 1.9
+            assert elapsed < 3.0
+        else:
+            assert elapsed < 0.5
         assert session.outcome.accepted_records == int(retryable)
         assert session.outcome.code == (
             "export.accepted" if retryable else "export.http_error"
@@ -350,6 +355,137 @@ def test_http_errors_discard_prose_and_keep_native_retry(
         exporter.shutdown()
     assert CANARY not in caplog.text
     assert CANARY not in repr(session.outcome)
+
+
+@pytest.mark.parametrize("signal", SIGNALS)
+@pytest.mark.parametrize("retry_after", ["0", "0.5", "Wed, 21 Oct 2015 07:28:00 GMT"])
+def test_subsecond_retry_after_stops_after_one_attempt_with_short_deadline(
+    signal, retry_after, otlp_receiver, caplog
+):
+    from time import monotonic
+
+    for _ in range(6):
+        otlp_receiver.queue_response(status=503, headers={"Retry-After": retry_after})
+    exporter, session = _exporter(signal, otlp_receiver, timeout=0.2)
+    payload = _payload(signal)
+    try:
+        started = monotonic()
+        assert exporter.export(payload).name == "FAILURE"
+        assert monotonic() - started < 0.2
+        assert len(otlp_receiver.requests) == 1
+        assert session.outcome.code == "export.http_error"
+        assert session.outcome.accepted_records == session.outcome.rejected_records == 0
+        request = otlp_receiver.requests[0]
+        assert len(_records(request.message, signal)) == 1
+        assert CANARY.encode() not in request.message.SerializeToString()
+        assert CANARY not in caplog.text
+    finally:
+        exporter.shutdown()
+
+
+class _RetryTimingSession(SanitizingSession):
+    """Observe real responses; leave native retry timing and transport intact."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.responses = []
+
+    def _response(self, *args):
+        from time import monotonic
+
+        response = super()._response(*args)
+        self.responses.append((monotonic(), response.headers.get("Retry-After")))
+        return response
+
+
+@pytest.mark.parametrize("signal", SIGNALS)
+@pytest.mark.parametrize("retry_after", ["0", "0.5", "Wed, 21 Oct 2015 07:28:00 GMT"])
+def test_subsecond_retry_after_uses_native_exponential_backoff(
+    signal, retry_after, otlp_receiver
+):
+    session = _RetryTimingSession(signal, otlp_receiver.url(signal), policy=POLICY)
+    factory = {
+        "traces": create_span_exporter,
+        "logs": create_log_exporter,
+        "metrics": create_metric_exporter,
+    }[signal]
+    exporter = factory(session, timeout=5)
+    for _ in range(2):
+        otlp_receiver.queue_response(status=503, headers={"Retry-After": retry_after})
+    try:
+        assert exporter.export(_payload(signal)).name == "SUCCESS"
+        assert len(session.responses) == len(otlp_receiver.requests) == 3
+        first, second, third = [time for time, _ in session.responses]
+        # Native jitter is 0.8..1.2 times 2**attempt; allow 0.1s for local I/O.
+        assert 0.8 <= second - first < 1.3
+        assert 1.6 <= third - second < 2.5
+        assert [header for _, header in session.responses] == [None, None, None]
+        assert session.outcome.code == "export.accepted"
+        assert session.outcome.accepted_records == 1
+        wire = [r.message.SerializeToString() for r in otlp_receiver.requests]
+        assert len(set(wire)) == 1
+        assert CANARY.encode() not in wire[0]
+    finally:
+        exporter.shutdown()
+
+
+@pytest.mark.parametrize("signal", SIGNALS)
+@pytest.mark.parametrize("retry_after", ["1", "2", "future-date"])
+def test_retry_after_at_least_one_second_is_honored(signal, retry_after, otlp_receiver):
+    from datetime import UTC, datetime, timedelta
+    from email.utils import format_datetime
+    from time import time
+
+    session = _RetryTimingSession(signal, otlp_receiver.url(signal), policy=POLICY)
+    factory = {
+        "traces": create_span_exporter,
+        "logs": create_log_exporter,
+        "metrics": create_metric_exporter,
+    }[signal]
+    exporter = factory(session, timeout=5)
+    payload = _payload(signal)
+    if retry_after == "future-date":
+        date = (datetime.now(UTC) + timedelta(seconds=3)).replace(microsecond=0)
+        retry_after = format_datetime(date, usegmt=True)
+        expected_delay = date.timestamp() - time()
+    else:
+        expected_delay = float(retry_after)
+    otlp_receiver.queue_response(status=503, headers={"Retry-After": retry_after})
+    try:
+        assert exporter.export(payload).name == "SUCCESS"
+        assert len(session.responses) == len(otlp_receiver.requests) == 2
+        (first, header), (second, _) = session.responses
+        assert header == retry_after
+        assert expected_delay - 0.1 <= second - first < expected_delay + 0.1
+        assert session.outcome.code == "export.accepted"
+        assert session.outcome.accepted_records == 1
+        wire = [r.message.SerializeToString() for r in otlp_receiver.requests]
+        assert wire[0] == wire[1]
+        assert CANARY.encode() not in wire[0]
+    finally:
+        exporter.shutdown()
+
+
+@pytest.mark.parametrize("signal", SIGNALS)
+def test_retry_after_date_less_than_one_second_ahead_is_absent(signal, otlp_receiver):
+    from datetime import UTC, datetime, timedelta
+    from email.utils import format_datetime
+
+    session = SanitizingSession(signal, otlp_receiver.url(signal), policy=POLICY)
+    data = _wire_message(signal).SerializeToString()
+    date = datetime.now(UTC).replace(microsecond=0) + timedelta(seconds=1)
+    otlp_receiver.queue_response(
+        status=503, headers={"Retry-After": format_datetime(date, usegmt=True)}
+    )
+    with session:
+        with _post(session, data) as response:
+            assert response.status_code == 503
+            assert "Retry-After" not in response.headers
+            assert session.outcome.code == "export.http_error"
+            assert session.outcome.accepted_records == 0
+        assert len(otlp_receiver.requests) == 1
+        assert _post(session, data).status_code == 200
+        assert session.outcome.accepted_records == 1
 
 
 @pytest.mark.parametrize("signal", SIGNALS)
@@ -703,7 +839,7 @@ def test_native_no_send_resets_previous_acceptance(signal, otlp_receiver):
 def test_metric_per_call_deadline_also_bounds_native_retry_wait(otlp_receiver):
     from time import monotonic
 
-    otlp_receiver.queue_response(status=503, headers={"Retry-After": "0.5"})
+    otlp_receiver.queue_response(status=503, headers={"Retry-After": "2"})
     exporter, session = _exporter("metrics", otlp_receiver, timeout=2)
     started = monotonic()
     try:
@@ -1156,7 +1292,7 @@ class _CountingProjectionSession(SanitizingSession):
         return super()._project(data)
 
 
-def _counted_exporter(signal, receiver, **session_options):
+def _counted_exporter(signal, receiver, *, timeout=2, **session_options):
     session = _CountingProjectionSession(
         signal, receiver.url(signal), policy=POLICY, **session_options
     )
@@ -1165,7 +1301,7 @@ def _counted_exporter(signal, receiver, **session_options):
         "logs": create_log_exporter,
         "metrics": create_metric_exporter,
     }[signal]
-    return factory(session, timeout=2), session
+    return factory(session, timeout=timeout), session
 
 
 def _assert_projection_released(session):
@@ -1177,7 +1313,7 @@ def _assert_projection_released(session):
 def test_retry_projection_is_once_per_native_export_and_preserves_metadata(
     signal, otlp_receiver
 ):
-    exporter, session = _counted_exporter(signal, otlp_receiver)
+    exporter, session = _counted_exporter(signal, otlp_receiver, timeout=7)
     payload = _mixed_payload(signal)
     try:
         assert exporter.export(payload).name == "SUCCESS"
@@ -1186,7 +1322,7 @@ def test_retry_projection_is_once_per_native_export_and_preserves_metadata(
         assert session.projection_calls == 1
         _assert_projection_released(session)
         for _ in range(6):
-            otlp_receiver.queue_response(status=503, headers={"Retry-After": "0"})
+            otlp_receiver.queue_response(status=503, headers={"Retry-After": "1"})
         assert exporter.export(payload).name == "FAILURE"
         assert len(otlp_receiver.requests) == 7
         assert session.outcome.code == "export.http_error"
@@ -1231,10 +1367,13 @@ def test_retry_projection_replaces_single_entry_for_changed_native_metric_batche
         ),
     )
     exporter, session = _counted_exporter(
-        "metrics", otlp_receiver, limits=replace(DEFAULT_LIMITS, max_batch_size=1)
+        "metrics",
+        otlp_receiver,
+        timeout=5,
+        limits=replace(DEFAULT_LIMITS, max_batch_size=1),
     )
     for _ in range(3):
-        otlp_receiver.queue_response(status=503, headers={"Retry-After": "0"})
+        otlp_receiver.queue_response(status=503, headers={"Retry-After": "1"})
         otlp_receiver.queue_response()
     try:
         assert exporter.export(payload).name == "SUCCESS"
@@ -1355,7 +1494,7 @@ def test_retry_projection_does_not_reuse_under_changed_policy_or_limits(
         "metrics": create_metric_exporter,
     }[signal]
     exporter = factory(session, timeout=2)
-    otlp_receiver.queue_response(status=503, headers={"Retry-After": "0"})
+    otlp_receiver.queue_response(status=503, headers={"Retry-After": "1"})
     try:
         result = exporter.export(_mixed_payload(signal))
         assert session.projection_calls == 2
@@ -1422,7 +1561,7 @@ def test_retry_projection_hit_still_checks_request_boundary(
         "metrics": create_metric_exporter,
     }[signal]
     exporter = factory(session, timeout=2)
-    otlp_receiver.queue_response(status=503, headers={"Retry-After": "0"})
+    otlp_receiver.queue_response(status=503, headers={"Retry-After": "1"})
     try:
         assert exporter.export(_payload(signal)).name == "FAILURE"
         assert session.outcome.code == code
@@ -1460,7 +1599,7 @@ def test_retry_projection_copied_contexts_release_bytes(
 
     from django_altimeter.exporting import _DIAGNOSTIC_LOGGER
 
-    exporter, session = _counted_exporter(signal, otlp_receiver)
+    exporter, session = _counted_exporter(signal, otlp_receiver, timeout=7)
     loop = asyncio.new_event_loop()
     direct_contexts = []
     callback_contexts = []
@@ -1494,7 +1633,7 @@ def test_retry_projection_copied_contexts_release_bytes(
     else:
         failures = 1 if result_kind == "success" else 6
         for _ in range(failures):
-            otlp_receiver.queue_response(status=503, headers={"Retry-After": "0"})
+            otlp_receiver.queue_response(status=503, headers={"Retry-After": "1"})
         expected_requests = 2 if result_kind == "success" else 6
     try:
         result = exporter.export(_payload(signal))
@@ -1570,9 +1709,9 @@ def test_retry_projection_nested_invocations_keep_independent_scopes(
         "logs": create_log_exporter,
         "metrics": create_metric_exporter,
     }[signal]
-    outer, inner = factory(session, timeout=2), factory(session, timeout=2)
+    outer, inner = factory(session, timeout=4), factory(session, timeout=2)
     for status in (503, 503, 200, 200):
-        otlp_receiver.queue_response(status=status, headers={"Retry-After": "0"})
+        otlp_receiver.queue_response(status=status, headers={"Retry-After": "1"})
     try:
         assert outer.export(payload).name == "SUCCESS"
         assert inner_results == ["SUCCESS"]
@@ -1627,7 +1766,7 @@ def test_retry_projection_concurrent_invocations_keep_independent_scopes(
     exporters = [factory(session, timeout=2) for _ in range(2)]
     payload = _payload(signal)
     for _ in range(2):
-        otlp_receiver.queue_response(status=503, headers={"Retry-After": "0"})
+        otlp_receiver.queue_response(status=503, headers={"Retry-After": "1"})
     try:
         with ThreadPoolExecutor(max_workers=2) as workers:
             results = list(

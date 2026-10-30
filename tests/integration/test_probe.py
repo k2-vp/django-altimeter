@@ -238,12 +238,13 @@ def test_probe_reports_each_real_transport_outcome(
 def test_probe_preserves_native_retry_then_acceptance(
     otlp_receiver: OTLPReceiver, signal: str
 ) -> None:
-    otlp_receiver.queue_response(status=503, headers={"Retry-After": "0"})
+    otlp_receiver.queue_response(status=503, headers={"Retry-After": "1"})
     otlp_receiver.queue_response()
     result = _run(
         otlp_receiver,
         f"""
-        print(json.dumps(snapshot(probe(configuration(), signals=({signal!r},)))))
+        config = configuration(export_timeout=1.5)
+        print(json.dumps(snapshot(probe(config, signals=({signal!r},)))))
         """,
     )
     assert result["ok"] is True, result

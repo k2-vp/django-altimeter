@@ -1195,7 +1195,7 @@ def test_shutdown_preserves_partial_across_native_metric_batches(
         "partial_last": 2,
     }.get(case)
     if case == "retry_recovered":
-        otlp_receiver.queue_response(status=503, headers={"Retry-After": "0"})
+        otlp_receiver.queue_response(status=503, headers={"Retry-After": "1"})
     for index in range(3):
         otlp_receiver.queue_response(
             body=partial.SerializeToString() if index == partial_index else b""

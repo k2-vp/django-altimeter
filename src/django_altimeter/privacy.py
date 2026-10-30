@@ -304,6 +304,20 @@ def _allowed_attribute(
     return (key, value) in policy.attribute_values
 
 
+def _is_allowed_attribute(
+    key: object,
+    value: object,
+    policy: PrivacyPolicy,
+    limits: PrivacyLimits,
+    resource: bool = False,
+) -> bool:
+    """Check a dynamic scalar after the caller validates frozen configuration."""
+    try:
+        return _allowed_attribute(key, value, policy, limits, resource)
+    except Exception:
+        return False
+
+
 def is_allowed_attribute(
     key: object,
     value: object,
@@ -317,7 +331,7 @@ def is_allowed_attribute(
         return (
             type(resource) is bool
             and is_valid_configuration(policy, limits)
-            and _allowed_attribute(key, value, policy, limits, resource)
+            and _is_allowed_attribute(key, value, policy, limits, resource)
         )
     except Exception:
         # Telemetry boundary: unknown/malformed values cannot reach the app.
@@ -338,6 +352,16 @@ def normalize_span_name(
     try:
         if not is_valid_configuration(policy, limits):
             return "SPAN"
+        return _normalize_span_name(name, policy, limits)
+    except Exception:
+        return "SPAN"
+
+
+def _normalize_span_name(
+    name: object, policy: PrivacyPolicy, limits: PrivacyLimits
+) -> str:
+    """Normalize dynamic input after the caller validates frozen configuration."""
+    try:
         if not _text(name, limits.max_string_bytes):
             return "SPAN"
         first = name.split(None, 1)[0].upper() if name.strip() else ""
@@ -439,7 +463,7 @@ def _span(source: Span, policy: PrivacyPolicy, limits: PrivacyLimits) -> Span | 
         identity=True,
         server=source.kind == Span.SPAN_KIND_SERVER,
     )
-    name = normalize_span_name(source.name, policy=policy, limits=limits)
+    name = _normalize_span_name(source.name, policy, limits)
     if name == "SPAN" and any(
         _text(a.key, limits.max_key_bytes)
         and a.key

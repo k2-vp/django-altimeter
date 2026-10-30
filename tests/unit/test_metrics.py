@@ -870,3 +870,101 @@ def test_lower_configured_limits_reject_before_aggregation(recording, limit) -> 
     data = _data(reader)
     assert data["altimeter.http.server.requests"].data_points[0].value == 1
     assert data["http.server.request.duration"].data_points[0].count == 1
+
+
+def test_record_does_not_revalidate_frozen_configuration(recording) -> None:
+    from django_altimeter.privacy import is_valid_configuration
+
+    recorder, reader, _ = recording
+    validations = 0
+
+    def observe(frame, event, argument):
+        nonlocal validations
+        if event == "call" and frame.f_code is is_valid_configuration.__code__:
+            validations += 1
+
+    previous = sys.getprofile()
+    try:
+        sys.setprofile(observe)
+        for _ in range(10):
+            _record(recorder)
+            _record(recorder, status=503)
+            _record(recorder, route="CANARY_UNREGISTERED")
+    finally:
+        sys.setprofile(previous)
+    data = _data(reader)
+    for name, stream in data.items():
+
+        def amount(point, metric_name=name):
+            return (
+                point.value
+                if metric_name == "altimeter.http.server.requests"
+                else point.count
+            )
+
+        assert sum(amount(point) for point in stream.data_points) == 30
+        assert (
+            sum(
+                amount(point)
+                for point in stream.data_points
+                if point.attributes["http.response.status_class"] == "5xx"
+            )
+            == 10
+        )
+        assert len(stream.data_points) == 3
+        assert "CANARY_UNREGISTERED" not in repr(stream.data_points)
+    assert validations == 0
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected_key", "expected_value"),
+    [
+        ("route", UnreadableText("items/<item_id>"), "http.route", None),
+        ("method", UnreadableText("GET"), "http.request.method", "_OTHER"),
+        (
+            "response_mode",
+            UnreadableText("buffered"),
+            "altimeter.response_mode",
+            "unknown",
+        ),
+        ("status", 200.0, "http.response.status_class", "absent"),
+        ("route", "\ud800", "http.route", None),
+    ],
+    ids=[
+        "route-subclass",
+        "method-subclass",
+        "mode-subclass",
+        "float-status",
+        "surrogate",
+    ],
+)
+def test_warm_admission_still_validates_each_dynamic_value(
+    recording, field, value, expected_key, expected_value
+) -> None:
+    recorder, reader, _ = recording
+    _record(recorder)
+    UnreadableText.accesses.clear()
+    for _ in range(5):
+        _record(recorder, **{field: value})
+        _record(recorder)
+    assert UnreadableText.accesses == []
+    for name, stream in _data(reader).items():
+        assert len(stream.data_points) == 2
+        assert (
+            sum(
+                point.value if name == "altimeter.http.server.requests" else point.count
+                for point in stream.data_points
+            )
+            == 11
+        )
+        changed = [
+            point
+            for point in stream.data_points
+            if point.attributes.get(expected_key) == expected_value
+        ]
+        assert len(changed) == 1
+        assert (
+            changed[0].value
+            if name == "altimeter.http.server.requests"
+            else changed[0].count
+        ) == 5

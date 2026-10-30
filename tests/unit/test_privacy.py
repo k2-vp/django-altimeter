@@ -1222,3 +1222,74 @@ def test_http_numeric_details_are_server_span_only_and_error_event_is_fixed():
     )
     assert record.body.string_value == "request.completed"
     assert not any(item.key in {key.key for key in keys} for item in record.attributes)
+
+
+def _profile_configuration_validation(action):
+    """Observe real validation calls without replacing the policy predicate."""
+    import sys
+
+    calls = 0
+
+    def observe(frame, event, argument):
+        nonlocal calls
+        if event == "call" and frame.f_code is is_valid_configuration.__code__:
+            calls += 1
+
+    previous = sys.getprofile()
+    try:
+        sys.setprofile(observe)
+        result = action()
+    finally:
+        sys.setprofile(previous)
+    return result, calls
+
+
+@pytest.mark.parametrize("span_count", [1, 128])
+def test_trace_projection_validates_configuration_once_per_batch(span_count):
+    request = trace_request()
+    spans = request.resource_spans[0].scope_spans[0].spans
+    for _ in range(span_count - 1):
+        spans.add().CopyFrom(spans[0])
+    result, calls = _profile_configuration_validation(
+        lambda: project_traces(request, policy=POLICY)
+    )
+    projected = result.resource_spans[0].scope_spans[0].spans
+    assert len(projected) == span_count
+    assert {span.name for span in projected} == {"SELECT"}
+    assert all(
+        any(
+            item.key == "http.route" and item.value.string_value == "/items/{id}"
+            for item in span.attributes
+        )
+        for span in projected
+    )
+    assert CANARY.encode() not in result.SerializeToString()
+    assert calls == 1
+
+
+@pytest.mark.parametrize(
+    ("projector", "make"),
+    [(project_logs, log_request), (project_metrics, metric_request)],
+)
+def test_other_projections_validate_configuration_once_per_batch(projector, make):
+    result, calls = _profile_configuration_validation(
+        lambda: projector(make(), policy=POLICY)
+    )
+    assert result.ByteSize() > 0
+    assert CANARY.encode() not in result.SerializeToString()
+    assert calls == 1
+
+
+def test_public_name_normalization_keeps_validating_each_call():
+    for limits, expected in (
+        (DEFAULT_LIMITS, "SELECT"),
+        (replace(DEFAULT_LIMITS, max_batch_size=0), "SPAN"),
+        (DEFAULT_LIMITS, "SELECT"),
+    ):
+        result, calls = _profile_configuration_validation(
+            lambda limits=limits: normalize_span_name(
+                f"SELECT '{CANARY}'", policy=POLICY, limits=limits
+            )
+        )
+        assert result == expected
+        assert calls == 1

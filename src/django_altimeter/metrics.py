@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Mapping
 from dataclasses import replace
 from math import isfinite
 from threading import Lock
+from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 from opentelemetry.metrics import MeterProvider
@@ -17,7 +19,7 @@ from django_altimeter.privacy import (
     HTTP_REQUEST_DURATION_BUCKETS,
     PrivacyLimits,
     PrivacyPolicy,
-    is_allowed_attribute,
+    _is_allowed_attribute,
     is_valid_configuration,
 )
 
@@ -50,6 +52,7 @@ _OUTCOMES = frozenset({"completed", "aborted"})
 _RESPONSE_MODES = frozenset({"buffered", "streaming", "unknown"})
 _SERIES_LIMIT = 2000
 _OVERFLOW_PER_SURFACE = 2 * 6 * 3
+type _Dimensions = tuple[str, str, str, str, str, str | None]
 
 
 def request_metric_policy(policy: PrivacyPolicy) -> PrivacyPolicy:
@@ -127,7 +130,8 @@ class RequestMetrics:
         self._surfaces = surfaces
         self._pid = os.getpid()
         self._capacity = _SERIES_LIMIT - _OVERFLOW_PER_SURFACE * len(surfaces)
-        self._admitted: set[tuple[tuple[str, str | bool], ...]] = set()
+        self._admitted: dict[_Dimensions, Mapping[str, str | bool]] = {}
+        self._overflow: dict[tuple[str, str, str, str], Mapping[str, str | bool]] = {}
         self._lock = Lock()
         self._reported: set[str] = set()
         meter = meter_provider.get_meter(REQUEST_SCOPE)
@@ -150,6 +154,44 @@ class RequestMetrics:
             logging.getLogger("django_altimeter.metrics").warning("%s", code)
         except Exception:
             pass  # A broken application logging handler cannot affect requests.
+
+    def _admit(
+        self, dimensions: _Dimensions
+    ) -> tuple[Mapping[str, str | bool] | None, bool]:
+        with self._lock:
+            admitted = self._admitted.get(dimensions)
+            if admitted is not None:
+                return admitted, False
+            surface, status_class, outcome, mode, method, route = dimensions
+            attributes: dict[str, str | bool] = {
+                "altimeter.surface": surface,
+                "http.response.status_class": status_class,
+                "altimeter.http.outcome": outcome,
+                "altimeter.response_mode": mode,
+                "http.request.method": method,
+            }
+            if route is not None:
+                attributes["http.route"] = route
+            if len(attributes) > self._limits.max_attributes or not all(
+                _is_allowed_attribute(key, value, self._policy, self._limits)
+                for key, value in attributes.items()
+            ):
+                return None, False
+            if len(self._admitted) < self._capacity:
+                admitted = MappingProxyType(attributes)
+                self._admitted[dimensions] = admitted
+                return admitted, False
+            # Never cache a rejected detailed key. Only the reserved, bounded
+            # coarse partition may grow once detailed admission is exhausted.
+            coarse = dimensions[:4]
+            overflow = self._overflow.get(coarse)
+            if overflow is None:
+                del attributes["http.request.method"]
+                attributes.pop("http.route", None)
+                attributes["altimeter.overflow"] = True
+                overflow = MappingProxyType(attributes)
+                self._overflow[coarse] = overflow
+            return overflow, True
 
     def record(
         self,
@@ -180,46 +222,37 @@ class RequestMetrics:
             ):
                 self._report("metrics.invalid_observation")
                 return
-            attributes: dict[str, str | bool] = {
-                "altimeter.surface": surface,
-                "http.response.status_class": f"{status // 100}xx"
+            status_class = (
+                f"{status // 100}xx"
                 if type(status) is int and 100 <= status <= 599
-                else "absent",
-                "altimeter.http.outcome": outcome,
-                "altimeter.response_mode": response_mode
+                else "absent"
+            )
+            mode = (
+                response_mode
                 if type(response_mode) is str
                 and len(response_mode) <= 9
                 and response_mode in _RESPONSE_MODES
-                else "unknown",
-                "http.request.method": method
+                else "unknown"
+            )
+            method = (
+                method
                 if type(method) is str and len(method) <= 7 and method in _METHODS
-                else "_OTHER",
-            }
-            if is_allowed_attribute(
-                "http.route", route, policy=self._policy, limits=self._limits
-            ):
-                assert type(route) is str
-                attributes["http.route"] = route
-            if len(attributes) > self._limits.max_attributes or not all(
-                is_allowed_attribute(
-                    key, value, policy=self._policy, limits=self._limits
+                else "_OTHER"
+            )
+            route = (
+                route
+                if _is_allowed_attribute(
+                    "http.route", route, self._policy, self._limits
                 )
-                for key, value in attributes.items()
-            ):
+                else None
+            )
+            attributes, overflow = self._admit(
+                (surface, status_class, outcome, mode, method, route)
+            )
+            if attributes is None:
                 self._report("metrics.invalid_observation")
                 return
-            key = tuple(attributes.items())
-            overflow = False
-            with self._lock:
-                if key not in self._admitted:
-                    if len(self._admitted) < self._capacity:
-                        self._admitted.add(key)
-                    else:
-                        overflow = True
             if overflow:
-                del attributes["http.request.method"]
-                attributes.pop("http.route", None)
-                attributes["altimeter.overflow"] = True
                 self._report("metrics.overflow")
             self._counter.add(1, attributes)
             self._duration.record(duration, attributes)

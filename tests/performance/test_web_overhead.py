@@ -23,12 +23,14 @@ RSS. A macOS host run reads ps RSS in KiB; the required image gate uses Linux
 /proc. HTTP 503/Retry-After:0 responses remain in force through teardown.
 """
 
+import importlib.metadata
 import json
 import math
 import os
 import platform
 import statistics
 import subprocess
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -53,6 +55,20 @@ RUN_ORDER = (
     ("enabled", "failing_export", "disabled"),
     ("failing_export", "disabled", "enabled"),
 )
+_VERSIONS = r"""
+import importlib.metadata
+import json
+
+names = (
+    "Django",
+    "django-ninja",
+    "uvicorn",
+    "opentelemetry-sdk",
+    "requests",
+    "urllib3",
+)
+print(json.dumps({name: importlib.metadata.version(name) for name in names}))
+"""
 
 
 def _rss(pid: int) -> int:
@@ -300,35 +316,13 @@ def _report_and_validate_run(result):
 def _server_versions(python: Path) -> dict[str, str]:
     """Read installed distributions from the interpreter serving requests."""
     result = subprocess.run(
-        [
-            str(python),
-            "-I",
-            "-m",
-            "pip",
-            "list",
-            "--format=json",
-            "--disable-pip-version-check",
-        ],
+        [str(python), "-I", "-c", _VERSIONS],
         check=True,
         stdout=subprocess.PIPE,
         text=True,
-        timeout=10,
+        timeout=60,
     )
-    installed = {
-        package["name"].lower(): package["version"]
-        for package in json.loads(result.stdout)
-    }
-    return {
-        name: installed[name.lower()]
-        for name in (
-            "Django",
-            "django-ninja",
-            "uvicorn",
-            "opentelemetry-sdk",
-            "requests",
-            "urllib3",
-        )
-    }
+    return json.loads(result.stdout)
 
 
 def test_native_web_overhead_and_failure_plateau(tmp_path):
@@ -483,3 +477,17 @@ def test_harness_rejects_truncated_rss_windows():
         assert not coverage["complete"]
         assert not coverage["bracketed"]
         assert 59 in coverage["missing_one_second_intervals"]
+
+
+def test_harness_reports_versions_from_given_interpreter():
+    names = (
+        "Django",
+        "django-ninja",
+        "uvicorn",
+        "opentelemetry-sdk",
+        "requests",
+        "urllib3",
+    )
+    assert _server_versions(Path(sys.executable)) == {
+        name: importlib.metadata.version(name) for name in names
+    }

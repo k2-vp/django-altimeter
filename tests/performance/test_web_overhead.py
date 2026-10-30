@@ -58,16 +58,9 @@ RUN_ORDER = (
 _VERSIONS = r"""
 import importlib.metadata
 import json
+import sys
 
-names = (
-    "Django",
-    "django-ninja",
-    "uvicorn",
-    "opentelemetry-sdk",
-    "requests",
-    "urllib3",
-)
-print(json.dumps({name: importlib.metadata.version(name) for name in names}))
+print(json.dumps({name: importlib.metadata.version(name) for name in sys.argv[1:]}))
 """
 
 
@@ -313,10 +306,20 @@ def _report_and_validate_run(result):
         assert result["otlp_requests"] < FAILURE_RESPONSES
 
 
-def _server_versions(python: Path) -> dict[str, str]:
+def _server_versions(
+    python: Path,
+    names: tuple[str, ...] = (
+        "Django",
+        "django-ninja",
+        "uvicorn",
+        "opentelemetry-sdk",
+        "requests",
+        "urllib3",
+    ),
+) -> dict[str, str]:
     """Read installed distributions from the interpreter serving requests."""
     result = subprocess.run(
-        [str(python), "-I", "-c", _VERSIONS],
+        [str(python), "-I", "-c", _VERSIONS, *names],
         check=True,
         stdout=subprocess.PIPE,
         text=True,
@@ -481,14 +484,7 @@ def test_harness_rejects_truncated_rss_windows():
 
 
 def test_harness_reports_versions_from_given_interpreter():
-    names = (
-        "Django",
-        "django-ninja",
-        "uvicorn",
-        "opentelemetry-sdk",
-        "requests",
-        "urllib3",
-    )
-    assert _server_versions(Path(sys.executable)) == {
+    names = ("Django", "pytest")
+    assert _server_versions(Path(sys.executable), names=names) == {
         name: importlib.metadata.version(name) for name in names
     }

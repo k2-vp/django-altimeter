@@ -79,11 +79,16 @@ def _query_context(
 def _cursor_factory(
     base: type[Any], runtime: ProcessRuntime, *, asynchronous: bool
 ) -> type[Any]:
-    # One native subclass per connection factory, including custom row/cursor
-    # factories. No global class cache retains application connection types.
+    # Reused factories and subclasses already execute through this runtime's
+    # wrapper. Preserve them instead of adding another observation layer.
+    if getattr(base, "_altimeter_cursor_runtime", None) is runtime:
+        return base
+    # No global class cache retains application connection types.
     if asynchronous:
 
         class AsyncCursor(base):  # type: ignore[misc]
+            _altimeter_cursor_runtime = runtime
+
             async def execute(self, *args: Any, **kwargs: Any) -> Any:
                 with _query_context(runtime, args, kwargs):
                     return await super().execute(*args, **kwargs)
@@ -95,6 +100,8 @@ def _cursor_factory(
         return AsyncCursor
 
     class Cursor(base):  # type: ignore[misc]
+        _altimeter_cursor_runtime = runtime
+
         def execute(self, *args: Any, **kwargs: Any) -> Any:
             with _query_context(runtime, args, kwargs):
                 return super().execute(*args, **kwargs)

@@ -587,6 +587,85 @@ print("WORK_RESULT " + json.dumps({"codes": result.codes, "answer": answer}))
         (span,) = _spans(otlp_receiver)
         assert span.kind == 1 and span.name == "SPAN"
 
+    @pytest.mark.parametrize("asynchronous", [False, True])
+    @pytest.mark.parametrize("inherited", [False, True])
+    @pytest.mark.parametrize("method", ["execute", "executemany"])
+    def test_reused_cursor_factory_executes_and_exports_once(
+        self, asynchronous, inherited, method, otlp_receiver, database_url
+    ):
+        run = _run(
+            otlp_receiver,
+            database_url,
+            f"""
+            with psycopg.connect(DSN) as admin:
+                admin.execute("CREATE SEQUENCE factory_calls")
+            query = ("SELECT nextval('factory_calls'), "
+                     "'SQL_CANARY_literal'::text, %s::text")
+            def reuse(factory):
+                if {inherited!r}:
+                    class ApplicationCursor(factory):
+                        application_marker = True
+                    return ApplicationCursor
+                return factory
+            assert setup(config).ok
+            async def execute_async(connection):
+                async with connection.cursor() as cursor:
+                    if {method!r} == "execute":
+                        await cursor.execute(query, (CANARY,))
+                    else:
+                        await cursor.executemany(query, [(CANARY,)], returning=True)
+                    return await cursor.fetchone()
+            async def asynchronous():
+                async with await psycopg.AsyncConnection.connect(DSN) as first:
+                    rows = [await execute_async(first)]
+                    factory = reuse(first.cursor_factory)
+                    async with await psycopg.AsyncConnection.connect(
+                        DSN, cursor_factory=factory,
+                    ) as second:
+                        rows.append(await execute_async(second))
+                    return rows
+            def execute_sync(connection):
+                with connection.cursor() as cursor:
+                    if {method!r} == "execute":
+                        cursor.execute(query, (CANARY,))
+                    else:
+                        cursor.executemany(query, [(CANARY,)], returning=True)
+                    return cursor.fetchone()
+            with span("driver.parent"):
+                if {asynchronous!r}:
+                    rows = asyncio.run(asynchronous())
+                else:
+                    with psycopg.connect(DSN) as first:
+                        rows = [execute_sync(first)]
+                        factory = reuse(first.cursor_factory)
+                        with psycopg.connect(DSN, cursor_factory=factory) as second:
+                            rows.append(execute_sync(second))
+            assert shutdown().completed
+            print(json.dumps({{"rows": rows}}))
+            """,
+        )
+        assert run.result == {
+            "rows": [
+                [1, "SQL_CANARY_literal", CANARY],
+                [2, "SQL_CANARY_literal", CANARY],
+            ],
+        }
+        (parent,) = [item for item in run.spans if item.name == "driver.parent"]
+        children = [item for item in run.spans if item.kind == 3]
+        assert len(run.spans) == 3
+        assert len(children) == 2
+        assert all(item.name == "SELECT" for item in children)
+        assert all(item.parent_span_id == parent.span_id for item in children)
+        assert all(item.trace_id == parent.trace_id for item in children)
+        assert all(
+            _attributes(item)
+            == {
+                "db.system.name": "postgresql",
+                "db.operation.name": "SELECT",
+            }
+            for item in children
+        )
+
 
 @pytest.fixture(scope="module")
 def work_wheel(tmp_path_factory):

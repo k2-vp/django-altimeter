@@ -874,6 +874,92 @@ print('WORK_RESULT ' + json.dumps({'codes': sorted(result.codes)}))
                 for request in otlp_receiver.requests
             )
 
+    @pytest.mark.parametrize("mode", ["disabled", "invalid", "enabled"])
+    @pytest.mark.parametrize("carrier_kind", ["native", "plain", "subclass"])
+    def test_custom_adapter_and_response_keep_original_header_carrier(
+        self, otlp_receiver, mode, carrier_kind
+    ):
+        with HTTPReceiver() as internal:
+            result = _run(
+                otlp_receiver,
+                internal,
+                """
+                import requests
+                from requests.structures import CaseInsensitiveDict
+                class ApplicationHeaders(CaseInsensitiveDict):
+                    def application_value(self):
+                        return self['x-application']
+                class InspectingAdapter(requests.adapters.HTTPAdapter):
+                    def add_headers(self, request, **kwargs):
+                        super().add_headers(request, **kwargs)
+                        if os.environ['MODE'] == 'enabled':
+                            from django_altimeter.context import get_correlation
+                            current = get_correlation()
+                            assert current is not None
+                            assert request.headers['traceparent'] == (
+                                f'00-{current.trace_id}-{current.span_id}-01')
+                    def send(self, request, **kwargs):
+                        before = request.headers
+                        response = super().send(request, **kwargs)
+                        if os.environ['CARRIER_KIND'] != 'plain':
+                            self.observed = dict(request.headers.lower_items())
+                        else:
+                            self.observed = dict(request.headers)
+                        assert request.headers is before
+                        assert response.request.headers is before
+                        return response
+                with requests.Session() as client:
+                    client.trust_env = False
+                    adapter = InspectingAdapter()
+                    client.mount('http://', adapter)
+                    request = requests.Request('GET', os.environ['INTERNAL_ORIGIN'],
+                        headers={'x-application': 'OUTBOUND_CANARY_secret'}).prepare()
+                    if os.environ['CARRIER_KIND'] == 'plain':
+                        request.headers = dict(request.headers)
+                    elif os.environ['CARRIER_KIND'] == 'subclass':
+                        request.headers = ApplicationHeaders(request.headers)
+                    original = request.headers
+                    with span('outbound.parent'):
+                        with client.send(request, timeout=2) as response:
+                            assert response.request is request
+                            assert response.request.headers is original
+                            assert type(response.request.headers) is type(original)
+                            assert adapter.observed['x-application'] == \
+                                'OUTBOUND_CANARY_secret'
+                            if os.environ['CARRIER_KIND'] != 'plain':
+                                assert dict(response.request.headers.lower_items())[ \
+                                    'x-application'] == 'OUTBOUND_CANARY_secret'
+                            if os.environ['CARRIER_KIND'] == 'subclass':
+                                assert response.request.headers.application_value() == \
+                                    'OUTBOUND_CANARY_secret'
+                            body = response.text
+                shutdown()
+                print(json.dumps({'body': body, 'business': original['x-application']}))
+                """,
+                bootstrap=_IMPORTS.replace(
+                    "assert setup(config).ok",
+                    "config = replace(config, "
+                    "enabled=os.environ['MODE'] != 'disabled', "
+                    "export_timeout=-1 if os.environ['MODE'] == 'invalid' else 0.5)\n"
+                    "setup(config)",
+                ),
+                MODE=mode,
+                CARRIER_KIND=carrier_kind,
+            )
+            assert result == {"body": "safe-response", "business": CANARY}
+            assert len(internal.requests) == 1
+            sent = dict(internal.requests[0].headers)
+            assert sent["x-application"] == CANARY
+            if mode == "enabled":
+                children = [item for item in _spans(otlp_receiver) if item.kind == 3]
+                assert len(children) == 1
+                assert all(
+                    CANARY.encode() not in request.message.SerializeToString()
+                    for request in otlp_receiver.requests
+                )
+            else:
+                assert not otlp_receiver.requests
+
 
 @pytest.fixture(scope="module")
 def client_wheel(tmp_path_factory):

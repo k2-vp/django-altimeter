@@ -9,7 +9,6 @@ from __future__ import annotations
 import logging
 import os
 import sys
-from collections.abc import Iterator, MutableMapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import wraps
@@ -24,7 +23,7 @@ from django_altimeter.headers import OUTBOUND_CONTEXT_HEADERS, outgoing_headers
 from django_altimeter.privacy import is_allowed_attribute
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
 
     from django_altimeter.runtime import ProcessRuntime
 
@@ -101,76 +100,35 @@ def _context_header_name(key: object) -> str | None:
     return name if name in OUTBOUND_CONTEXT_HEADERS else None
 
 
-class _RequestHeaders(MutableMapping[Any, Any]):
-    """A bounded-storage Requests carrier; only the native sender reads values.
-
-    Filtering keys while the sender iterates preserves arbitrarily large business
-    maps without a full copy or repeated scans to delete batches of mixed-case
-    matches. Redirect copies still use the ordinary Requests mapping protocol.
-    """
-
-    def __init__(self, source: Any, generated: dict[str, str]) -> None:
-        self._source: Any = (
-            source._source if type(source) is _RequestHeaders else source
-        )
-        self._generated = generated
-
-    def __iter__(self) -> Iterator[Any]:
-        for key in self._source:
-            if _context_header_name(key) is None:
-                yield key
-        yield from self._generated
-
-    def __len__(self) -> int:
-        return sum(1 for _ in self)
-
-    def __getitem__(self, key: Any) -> Any:
-        name = _context_header_name(key)
-        if name is not None:
-            return self._generated[name]
-        return self._source[key]
-
-    def __setitem__(self, key: Any, value: Any) -> None:
-        # Application changes to business fields remain visible. Propagation
-        # fields never replace the owned context selected for this send.
-        self._source[key] = value
-
-    def __delitem__(self, key: Any) -> None:
-        name = _context_header_name(key)
-        if name is not None:
-            del self._generated[name]
-        else:
-            del self._source[key]
-
-    def copy(self) -> MutableMapping[Any, Any]:
-        # Preserve Requests' case-insensitive redirect operations (in particular
-        # stripping Authorization and body headers), not merely the wire keys.
-        from requests.structures import CaseInsensitiveDict
-
-        return CaseInsensitiveDict(self.items())
-
-
 def _apply_headers(
     carrier: Any, url: object, runtime: ProcessRuntime, tracing: bool
-) -> Any:
+) -> None:
     generated = outgoing_headers(
         url,
         internal_origins=runtime.config.internal_origins,
         correlation=get_correlation() if tracing else None,
         owned_tracing=tracing,
     )
+    requests_structures = sys.modules.get("requests.structures")
     httpx = sys.modules.get("httpx")
-    if httpx is not None and isinstance(carrier, httpx.Headers):
-        # HTTPX's native carrier is case-insensitive and its transport needs raw
-        # header pairs. Deletion, unlike pop(), never fetches a removed value.
-        for name in OUTBOUND_CONTEXT_HEADERS:
-            try:
-                del carrier[name]
-            except KeyError:
-                pass
-        carrier.update(generated)
-        return carrier
-    return _RequestHeaders(carrier, generated)
+    case_insensitive = (
+        requests_structures is not None
+        and isinstance(carrier, requests_structures.CaseInsensitiveDict)
+    ) or (httpx is not None and isinstance(carrier, httpx.Headers))
+    # Keep the application's carrier object and all its native mapping methods.
+    # Generic mappings require inspecting every key; retain only matching keys,
+    # never business keys or values, before deleting outside the iteration.
+    keys = (
+        OUTBOUND_CONTEXT_HEADERS
+        if case_insensitive
+        else [key for key in carrier if _context_header_name(key) is not None]
+    )
+    for key in keys:
+        try:
+            del carrier[key]
+        except KeyError:
+            pass
+    carrier.update(generated)
 
 
 def _http_status(span: Span, status: object) -> None:
@@ -185,7 +143,7 @@ def _http_status(span: Span, status: object) -> None:
 
 @contextmanager
 def _http_span(
-    runtime: ProcessRuntime, method: object, url: object, request: Any
+    runtime: ProcessRuntime, method: object, url: object, carrier: Any
 ) -> Iterator[Span | None]:
     try:
         tracing = not _suppressed(runtime, url)
@@ -195,7 +153,7 @@ def _http_span(
         tracing, name = False, "_OTHER"
     if not tracing:
         try:
-            request.headers = _apply_headers(request.headers, url, runtime, False)
+            _apply_headers(carrier, url, runtime, False)
         except Exception:
             _diagnostic("client.headers_failed")
         yield None
@@ -204,7 +162,7 @@ def _http_span(
         "HTTP" if name == "_OTHER" else name, attributes={"http.request.method": name}
     ) as current:
         try:
-            request.headers = _apply_headers(request.headers, url, runtime, True)
+            _apply_headers(carrier, url, runtime, True)
         except Exception:
             _diagnostic("client.headers_failed")
         yield current
@@ -235,7 +193,9 @@ def _install_requests() -> None:
         runtime = _owned_runtime("requests")
         if runtime is None:
             return original_send(self, request, *args, **kwargs)
-        with _http_span(runtime, request.method, request.url, request) as current:
+        with _http_span(
+            runtime, request.method, request.url, request.headers
+        ) as current:
             response = original_send(self, request, *args, **kwargs)
             if current is not None:
                 _http_status(current, response.status_code)
@@ -259,7 +219,9 @@ def _install_httpx() -> None:
         runtime = _owned_runtime("httpx")
         if runtime is None:
             return original_sync(self, request)
-        with _http_span(runtime, request.method, str(request.url), request) as current:
+        with _http_span(
+            runtime, request.method, str(request.url), request.headers
+        ) as current:
             response = original_sync(self, request)
             if current is not None:
                 _http_status(current, response.status_code)
@@ -270,7 +232,9 @@ def _install_httpx() -> None:
         runtime = _owned_runtime("httpx")
         if runtime is None:
             return await original_async(self, request)
-        with _http_span(runtime, request.method, str(request.url), request) as current:
+        with _http_span(
+            runtime, request.method, str(request.url), request.headers
+        ) as current:
             response = await original_async(self, request)
             if current is not None:
                 _http_status(current, response.status_code)

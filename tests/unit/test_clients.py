@@ -48,14 +48,16 @@ def test_unknown_command_never_inspects_arguments(value):
     assert _redis_operation(("GET", Hostile())) == "GET"
 
 
-def test_request_header_view_keeps_bounded_storage_and_never_reads_values():
+def test_request_header_sanitizing_keeps_bounded_storage_and_never_reads_values():
     result = subprocess.run(
         [
             sys.executable,
             "-c",
             """
 import tracemalloc
-from django_altimeter.clients import _RequestHeaders
+from django_altimeter.clients import _apply_headers
+from django_altimeter.conf import Config
+from django_altimeter.runtime import ProcessRuntime
 class KeysOnly(dict):
     def __getitem__(self, key):
         raise AssertionError('Header policy must not read application values')
@@ -65,13 +67,18 @@ class KeysOnly(dict):
         raise AssertionError('Header policy must scan keys only')
 source = KeysOnly({f'X-Business-{index}': object() for index in range(50000)})
 source.update({'TraceParent': object(), b'Baggage': object(), 'X-Tenant-Id': object()})
+runtime = ProcessRuntime(Config())
+original = source
 tracemalloc.start()
-headers = source
-for _ in range(2000):
-    headers = _RequestHeaders(headers, {})
-assert sum(1 for _ in headers) == 50000
+for _ in range(2):
+    assert _apply_headers(source, 'https://external.example', runtime, False) is None
+assert source is original
+assert type(source) is KeysOnly
+assert sum(1 for _ in source) == 50000
 _, peak = tracemalloc.get_traced_memory()
 assert peak < 65536, peak
+assert {'TraceParent', b'Baggage', 'X-Tenant-Id'}.isdisjoint(source)
+assert all(f'X-Business-{index}' in source for index in range(50000))
 """,
         ],
         capture_output=True,
@@ -83,8 +90,15 @@ assert peak < 65536, peak
 
 
 @pytest.mark.parametrize("bytes_names", [False, True])
-def test_request_header_view_preserves_business_edits_and_redirect_copy(bytes_names):
-    from django_altimeter.clients import _RequestHeaders
+@pytest.mark.parametrize("mapping_kind", ["dict", "user_dict"])
+def test_request_header_sanitizing_preserves_business_edits_and_copy(
+    bytes_names, mapping_kind
+):
+    from collections import UserDict
+
+    from django_altimeter.clients import _apply_headers
+    from django_altimeter.conf import Config
+    from django_altimeter.runtime import ProcessRuntime
 
     parent_key = b"TraceParent" if bytes_names else "TraceParent"
     identity_key = b"X-Tenant-Id" if bytes_names else "X-Tenant-Id"
@@ -101,18 +115,25 @@ def test_request_header_view_preserves_business_edits_and_redirect_copy(bytes_na
             "X-Application": "original",
         }
     )
-    headers = _RequestHeaders(source, {"traceparent": "owned"})
-    assert headers[parent_key] == "owned"
+    if mapping_kind == "user_dict":
+        headers = UserDict()
+        headers.data = source
+    else:
+        headers = source
+    original = headers
+    runtime = ProcessRuntime(Config())
+    _apply_headers(headers, "https://external.example", runtime, False)
+    assert headers is original
+    assert type(headers) is type(original)
+    assert parent_key not in headers
     assert identity_key not in headers
     headers["X-Application"] = "changed"
     headers["X-Extra"] = "kept"
-    assert headers.copy() == {
-        "X-Application": "changed",
-        "X-Extra": "kept",
-        "traceparent": "owned",
-    }
+    assert headers.copy() == {"X-Application": "changed", "X-Extra": "kept"}
     del headers["X-Extra"]
     assert "X-Extra" not in source
     assert source["X-Application"] == "changed"
-    renewed = _RequestHeaders(headers, {})
-    assert renewed.copy() == {"X-Application": "changed"}
+    headers[parent_key] = Hostile()
+    headers[identity_key] = Hostile()
+    _apply_headers(headers, "https://external.example", runtime, False)
+    assert headers.copy() == {"X-Application": "changed"}

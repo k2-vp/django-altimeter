@@ -25,7 +25,7 @@ class WheelEnvironment:
     sha256: str
 
 
-def install_wheel(workspace: Path) -> WheelEnvironment:
+def install_wheel(workspace: Path, *, extras: tuple[str, ...] = ()) -> WheelEnvironment:
     workspace.mkdir(parents=True, exist_ok=True)
     wheels = list((ROOT / "dist").glob("django_altimeter-*.whl"))
     assert len(wheels) == 1, "Run uv build before the real-server tests"
@@ -40,7 +40,7 @@ def install_wheel(workspace: Path) -> WheelEnvironment:
             "pip",
             "install",
             "--disable-pip-version-check",
-            str(wheel),
+            f"{wheel}[{','.join(extras)}]" if extras else str(wheel),
             "django-ninja==1.6.2",
             "uvicorn==0.46.0",
             *[

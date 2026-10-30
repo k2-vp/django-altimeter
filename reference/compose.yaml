@@ -1,8 +1,38 @@
 # Give every run a unique project name with `docker compose -p <name>`.
 # The receiver runs inside pytest on an ephemeral loopback port; no published ports.
 services:
+  postgres:
+    profiles: [asgi, wsgi]
+    image: postgres:17.6-alpine
+    environment:
+      # Test-only trust authentication on the unexposed Compose network.
+      POSTGRES_HOST_AUTH_METHOD: trust
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U postgres"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    profiles: [asgi, wsgi]
+    image: redis:7.4.0-alpine
+    command: [redis-server, --save, "", --appendonly, "no"]
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
   verify-asgi:
     profiles: [asgi]
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    environment:
+      ALTIMETER_TEST_POSTGRES_DSN: "host=postgres port=5432 dbname=postgres user=postgres"
+      ALTIMETER_TEST_REDIS_URL: "redis://redis:6379/0"
     build:
       context: ..
       dockerfile: reference/Dockerfile
@@ -16,6 +46,12 @@ services:
 
   verify-wsgi:
     profiles: [wsgi]
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    environment:
+      ALTIMETER_TEST_POSTGRES_DSN: "host=postgres port=5432 dbname=postgres user=postgres"
+      ALTIMETER_TEST_REDIS_URL: "redis://redis:6379/0"
     build:
       context: ..
       dockerfile: reference/Dockerfile

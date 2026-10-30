@@ -41,6 +41,10 @@ def create_application():
             if message["type"] == "lifespan.startup":
                 started = monotonic()
                 result = setup(role="web")
+                if os.environ.get("REFERENCE_REQUEST_WORK") == "1":
+                    from django_altimeter.logging import install_logging
+
+                    install_logging(routes=("reference.work",))
                 _lifecycle("startup", started, result)
                 await send({"type": "lifespan.startup.complete"})
             elif message["type"] == "lifespan.shutdown":

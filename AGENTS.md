@@ -44,6 +44,10 @@ once `pyproject.toml` exists:
   (use `--profile wsgi` and `verify-wsgi` for the Python 3.12 gunicorn/RQ shape)
 - Wall-clock performance acceptance, only in the local ASGI image after `uv build`:
   `docker compose -p <unique> -f reference/compose.yaml --profile asgi run --build --rm verify-asgi python -m pytest -m performance tests/performance/test_web_overhead.py`
+- Request-work reference checks, after `uv build`, with isolated Compose services:
+  `docker compose -p <unique-asgi-work-name> -f reference/compose.yaml --profile asgi run --build --rm verify-asgi python -m pytest tests/integration/test_reference_work.py`
+  and standalone Python 3.12 checks:
+  `docker compose -p <unique-wsgi-work-name> -f reference/compose.yaml --profile wsgi run --build --rm verify-wsgi python -m pytest tests/integration/test_reference_work.py::TestStandaloneReferenceWork tests/integration/test_reference_work.py::test_request_work_extras_install_pinned_clients`
 - Browser tests: `cd tests/browser && bun run test:unit <spec>` or `bun run test:e2e <spec>`
 
 Default test runs, including CI, deselect the `performance` marker. Explicit

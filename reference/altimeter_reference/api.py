@@ -123,3 +123,8 @@ for series_index in range(100):
 
 
 urlpatterns = [path("health/", health), path("api/", api.urls)]
+
+if os.environ.get("REFERENCE_REQUEST_WORK") == "1":
+    from altimeter_reference.work_api import api as work_api
+
+    urlpatterns.append(path("work/", work_api.urls))

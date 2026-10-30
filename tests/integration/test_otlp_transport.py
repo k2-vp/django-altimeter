@@ -1433,3 +1433,218 @@ def test_retry_projection_hit_still_checks_request_boundary(
         _assert_projection_released(session)
     finally:
         exporter.shutdown()
+
+
+def _projection_entry(scope):
+    # The tuple branch exercises the original retention bug before the fix.
+    if type(scope) is tuple:
+        return scope[0] if scope else None
+    return None if scope is None else scope.batch
+
+
+def _assert_copied_projection_empty(scope):
+    assert scope is not None  # The copy must have captured the active invocation.
+    assert _projection_entry(scope) is None
+    assert scope.active is False
+
+
+@pytest.mark.parametrize("signal", SIGNALS)
+@pytest.mark.parametrize("result_kind", ["success", "http_failure", "protocol_failure"])
+def test_retry_projection_copied_contexts_release_bytes(
+    signal, result_kind, otlp_receiver
+):
+    import asyncio
+    import logging
+    from contextvars import copy_context
+    from weakref import ref
+
+    from django_altimeter.exporting import _DIAGNOSTIC_LOGGER
+
+    exporter, session = _counted_exporter(signal, otlp_receiver)
+    loop = asyncio.new_event_loop()
+    direct_contexts = []
+    callback_contexts = []
+    entries = []
+    captured = []
+
+    def observe_callback():
+        callback_contexts.append(copy_context())
+
+    class Capture(logging.Handler):
+        def emit(self, record):
+            if direct_contexts:
+                return
+            direct_contexts.append(copy_context())
+            entry = _projection_entry(session._projection_scope.get())
+            entries.append(ref(entry))
+            captured.append(
+                (
+                    CANARY.encode() in entry.source,
+                    bool(entry.payload),
+                    CANARY.encode() not in entry.payload,
+                )
+            )
+            loop.call_soon_threadsafe(observe_callback)
+
+    handler = Capture()
+    _DIAGNOSTIC_LOGGER.addHandler(handler)
+    if result_kind == "protocol_failure":
+        otlp_receiver.queue_response(body=b"\xff")
+        expected_requests = 1
+    else:
+        failures = 1 if result_kind == "success" else 6
+        for _ in range(failures):
+            otlp_receiver.queue_response(status=503, headers={"Retry-After": "0"})
+        expected_requests = 2 if result_kind == "success" else 6
+    try:
+        result = exporter.export(_payload(signal))
+        assert result.name == ("SUCCESS" if result_kind == "success" else "FAILURE")
+        assert len(otlp_receiver.requests) == expected_requests
+        assert session.projection_calls == 1
+        assert captured == [(True, True, True)]
+        assert len(direct_contexts) == 1
+        assert session._projection_scope.get() is None
+        loop.run_until_complete(asyncio.sleep(0))
+        assert len(callback_contexts) == 1
+        contexts = direct_contexts + callback_contexts
+        scopes = [context.get(session._projection_scope) for context in contexts]
+        assert scopes[0] is scopes[1]
+        for scope in scopes:
+            _assert_copied_projection_empty(scope)
+        assert all(entry() is None for entry in entries)  # No gc.collect needed.
+
+        # Reusing a stale copied context cannot hit or repopulate its closed cache.
+        wire = _wire_message(signal).SerializeToString()
+        for context in contexts:
+            for _ in range(2):
+                response = context.run(_post, session, wire)
+                try:
+                    assert response.status_code == 200
+                finally:
+                    response.close()
+                _assert_copied_projection_empty(context.get(session._projection_scope))
+        assert session.projection_calls == 5
+        assert len(otlp_receiver.requests) == expected_requests + 4
+        assert all(
+            len(_records(request.message, signal)) == 1
+            and CANARY.encode() not in request.message.SerializeToString()
+            for request in otlp_receiver.requests
+        )
+    finally:
+        _DIAGNOSTIC_LOGGER.removeHandler(handler)
+        handler.close()
+        exporter.shutdown()
+        loop.close()
+    for context in contexts:
+        _assert_copied_projection_empty(context.get(session._projection_scope))
+    assert all(entry() is None for entry in entries)
+
+
+@pytest.mark.parametrize("signal", SIGNALS)
+def test_retry_projection_nested_invocations_keep_independent_scopes(
+    signal, otlp_receiver
+):
+    from contextvars import copy_context
+
+    scopes = []
+    inner_results = []
+    nested = False
+    payload = _payload(signal)
+
+    class NestedSession(_CountingProjectionSession):
+        def _response(self, *args):
+            nonlocal nested
+            response = super()._response(*args)
+            scopes.append(copy_context().get(self._projection_scope))
+            if not nested:
+                nested = True
+                outer_scope = self._projection_scope.get()
+                inner_results.append(inner.export(payload).name)
+                assert self._projection_scope.get() is outer_scope
+                assert _projection_entry(outer_scope) is not None
+            return response
+
+    session = NestedSession(signal, otlp_receiver.url(signal), policy=POLICY)
+    factory = {
+        "traces": create_span_exporter,
+        "logs": create_log_exporter,
+        "metrics": create_metric_exporter,
+    }[signal]
+    outer, inner = factory(session, timeout=2), factory(session, timeout=2)
+    for status in (503, 503, 200, 200):
+        otlp_receiver.queue_response(status=status, headers={"Retry-After": "0"})
+    try:
+        assert outer.export(payload).name == "SUCCESS"
+        assert inner_results == ["SUCCESS"]
+        assert session.projection_calls == 2
+        assert len(otlp_receiver.requests) == 4
+        assert scopes[0] is scopes[3]
+        assert scopes[1] is scopes[2]
+        assert scopes[0] is not scopes[1]
+        assert session._projection_scope.get() is None
+        for scope in scopes:
+            _assert_copied_projection_empty(scope)
+        wire = [
+            request.message.SerializeToString() for request in otlp_receiver.requests
+        ]
+        assert len(set(wire)) == 1
+        assert all(CANARY.encode() not in body for body in wire)
+    finally:
+        outer.shutdown()
+        inner.shutdown()
+
+
+@pytest.mark.parametrize("signal", SIGNALS)
+def test_retry_projection_concurrent_invocations_keep_independent_scopes(
+    signal, otlp_receiver
+):
+    from concurrent.futures import ThreadPoolExecutor
+    from contextvars import copy_context
+    from threading import Barrier, Lock
+
+    rendezvous = Barrier(2)
+    scopes = []
+    project_lock = Lock()
+
+    class ConcurrentSession(_CountingProjectionSession):
+        def _project(self, data):
+            with project_lock:
+                return super()._project(data)
+
+        def _response(self, *args):
+            response = super()._response(*args)
+            if response.status_code == 503:
+                scopes.append(copy_context().get(self._projection_scope))
+                rendezvous.wait(timeout=1)
+            return response
+
+    session = ConcurrentSession(signal, otlp_receiver.url(signal), policy=POLICY)
+    factory = {
+        "traces": create_span_exporter,
+        "logs": create_log_exporter,
+        "metrics": create_metric_exporter,
+    }[signal]
+    exporters = [factory(session, timeout=2) for _ in range(2)]
+    payload = _payload(signal)
+    for _ in range(2):
+        otlp_receiver.queue_response(status=503, headers={"Retry-After": "0"})
+    try:
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            results = list(
+                workers.map(lambda exporter: exporter.export(payload), exporters)
+            )
+        assert [result.name for result in results] == ["SUCCESS", "SUCCESS"]
+        assert session.projection_calls == 2
+        assert len(otlp_receiver.requests) == 4
+        assert len(scopes) == 2 and scopes[0] is not scopes[1]
+        assert session._projection_scope.get() is None
+        for scope in scopes:
+            _assert_copied_projection_empty(scope)
+        assert all(
+            len(_records(request.message, signal)) == 1
+            and CANARY.encode() not in request.message.SerializeToString()
+            for request in otlp_receiver.requests
+        )
+    finally:
+        for exporter in exporters:
+            exporter.shutdown()

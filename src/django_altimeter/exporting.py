@@ -644,6 +644,21 @@ class _ProjectedBatch:
     limits: PrivacyLimits
 
 
+class _ProjectionScope:
+    """One invocation's cache, explicitly emptied in every copied context."""
+
+    def __init__(self) -> None:
+        self.batch: _ProjectedBatch | None = None
+        self.active = True
+        # Copied contexts may run on another thread while the export finishes.
+        self.lock = Lock()
+
+    def close(self) -> None:
+        with self.lock:
+            self.active = False
+            self.batch = None
+
+
 class SanitizingSession(requests.Session):
     """One signal and endpoint, projected bytes, bounded truthful OTLP responses.
 
@@ -689,10 +704,10 @@ class SanitizingSession(requests.Session):
         self._failures: ContextVar[tuple[ReferenceType[Exception], ...]] = ContextVar(
             "altimeter_export_failures", default=()
         )
-        # None outside a native export; an active invocation holds zero or one
-        # successful immutable projection. Contexts isolate concurrent exports.
-        self._projection_scope: ContextVar[tuple[_ProjectedBatch, ...] | None] = (
-            ContextVar("altimeter_export_projection", default=None)
+        # Native exports own independent holders; copied contexts share the
+        # holder so final cleanup also removes their retained input/output.
+        self._projection_scope: ContextVar[_ProjectionScope | None] = ContextVar(
+            "altimeter_export_projection", default=None
         )
 
     @property
@@ -754,24 +769,26 @@ class SanitizingSession(requests.Session):
     def _project_for_attempt(self, data: bytes) -> tuple[bytes, int, int]:
         signal, policy, limits = self.signal, self.policy, self.limits
         scope = self._projection_scope.get()
-        if scope:
-            cached = scope[0]
-            if (
-                cached.signal == signal
-                and cached.policy is policy
-                and cached.limits is limits
-                and cached.source == data
-            ):
-                return cached.payload, cached.count, cached.dropped
         if scope is not None:
-            # A different batch replaces the only entry. Failed projections
-            # leave no retained input or output and can never become a hit.
-            self._projection_scope.set(())
+            with scope.lock:
+                cached = scope.batch
+                if scope.active and cached is not None:
+                    if (
+                        cached.signal == signal
+                        and cached.policy is policy
+                        and cached.limits is limits
+                        and cached.source == data
+                    ):
+                        return cached.payload, cached.count, cached.dropped
+                    # A different batch replaces the only entry. A failed
+                    # projection must leave neither input nor output cached.
+                    scope.batch = None
+                cached = None
         projected, count, dropped = self._project(data)
         if scope is not None:
-            self._projection_scope.set(
-                (
-                    _ProjectedBatch(
+            with scope.lock:
+                if scope.active:
+                    scope.batch = _ProjectedBatch(
                         data,
                         projected,
                         count,
@@ -779,9 +796,7 @@ class SanitizingSession(requests.Session):
                         signal,
                         policy,
                         limits,
-                    ),
-                )
-            )
+                    )
         return projected, count, dropped
 
     def _project(self, data: bytes) -> tuple[bytes, int, int]:
@@ -991,10 +1006,12 @@ def create_span_exporter(
             caller_exception = exception()
             session._outcome = ExportOutcome()
             failures_token = session._failures.set(())
-            projection_token = session._projection_scope.set(())
+            projection_scope = _ProjectionScope()
+            projection_token = session._projection_scope.set(projection_scope)
             try:
                 return super().export(spans)
             finally:
+                projection_scope.close()
                 session._projection_scope.reset(projection_token)
                 session._clear_failure_frames(caller_exception)
                 session._failures.reset(failures_token)
@@ -1029,10 +1046,12 @@ def create_log_exporter(
             caller_exception = exception()
             session._outcome = ExportOutcome()
             failures_token = session._failures.set(())
-            projection_token = session._projection_scope.set(())
+            projection_scope = _ProjectionScope()
+            projection_token = session._projection_scope.set(projection_scope)
             try:
                 return super().export(batch)
             finally:
+                projection_scope.close()
                 session._projection_scope.reset(projection_token)
                 session._clear_failure_frames(caller_exception)
                 session._failures.reset(failures_token)
@@ -1123,7 +1142,8 @@ def create_metric_exporter(
                 return MetricExportResult.FAILURE
             token = session._deadline.set(deadline)
             failures_token = session._failures.set(())
-            projection_token = session._projection_scope.set(())
+            projection_scope = _ProjectionScope()
+            projection_token = session._projection_scope.set(projection_scope)
             original = self._native_timeout()
             supported = self._timeout_supported and original is not None
             patched = False
@@ -1142,6 +1162,7 @@ def create_metric_exporter(
                 session._outcome = ExportOutcome("export.failed")
                 return MetricExportResult.FAILURE
             finally:
+                projection_scope.close()
                 if patched:
                     self._client._timeout = cast(float, original)
                 if not supported:

@@ -686,6 +686,194 @@ print('WORK_RESULT ' + json.dumps({'codes': sorted(result.codes)}))
                 for request in otlp_receiver.requests
             )
 
+    @pytest.mark.parametrize("plain", [False, True])
+    @pytest.mark.parametrize("approved", [False, True])
+    @pytest.mark.parametrize("business_count", [0, 1024])
+    def test_mixed_case_prepared_headers_cannot_escape_origin_policy(
+        self, otlp_receiver, plain, approved, business_count, monkeypatch
+    ):
+        import http.client
+
+        from django_altimeter.headers import OUTBOUND_CONTEXT_HEADERS
+
+        if business_count:
+            # Allow the real test server to accept this deliberately large map.
+            monkeypatch.setattr(http.client, "_MAXHEADERS", business_count + 64)
+
+        with HTTPReceiver() as internal, HTTPReceiver() as external:
+            result = _run(
+                otlp_receiver,
+                internal,
+                """
+                import requests
+                headers = {
+                    'TraceParent': '00-' + '1'*32 + '-' + '2'*16 + '-01',
+                    'tRaCePaReNt': '00-' + '3'*32 + '-' + '4'*16 + '-01',
+                    'TraceState': 'private=OUTBOUND_CANARY_secret',
+                    'Baggage': 'private=OUTBOUND_CANARY_secret',
+                    'X-Altimeter-Trace-Id': 'OUTBOUND_CANARY_secret',
+                    'X-Altimeter-Trace-Sampled': '1',
+                    'PosthogDistinctId': 'OUTBOUND_CANARY_secret',
+                    'Altimeter.Tenant_Id': 'OUTBOUND_CANARY_secret',
+                    'SessionId': 'OUTBOUND_CANARY_secret',
+                    'X-Posthog-Distinct-Id': 'OUTBOUND_CANARY_secret',
+                    'X-Tenant-Id': 'OUTBOUND_CANARY_secret',
+                    'X-Session-Id': 'OUTBOUND_CANARY_secret',
+                    'X-Application': 'kept',
+                    'Authorization': 'Bearer OUTBOUND_CANARY_secret',
+                }
+                headers.update({f'X-Business-{index}': f'value-{index}'
+                    for index in range(int(os.environ['BUSINESS_COUNT']))})
+                request = requests.Request(
+                    'GET', os.environ['TARGET_ORIGIN'], headers=headers).prepare()
+                if os.environ['PLAIN'] == '1':
+                    request.headers = dict(headers)
+                with span('outbound.parent'):
+                    with requests.Session() as client:
+                        client.trust_env = False
+                        with client.send(request, timeout=2) as response:
+                            body = response.text
+                assert shutdown().completed
+                print(json.dumps({'body':body}))
+                """,
+                PLAIN="1" if plain else "0",
+                BUSINESS_COUNT=str(business_count),
+                TARGET_ORIGIN=internal.origin if approved else external.origin,
+            )
+            assert result == {"body": "safe-response"}
+            captured = internal.requests if approved else external.requests
+            assert len(captured) == 1
+            sent = {key.lower(): value for key, value in captured[0].headers}
+            assert sent["x-application"] == "kept"
+            assert sent["authorization"] == f"Bearer {CANARY}"
+            assert all(
+                sent[f"x-business-{index}"] == f"value-{index}"
+                for index in range(business_count)
+            )
+            assert OUTBOUND_CONTEXT_HEADERS.intersection(sent) == (
+                {"traceparent"} if approved else set()
+            )
+            children = [item for item in _spans(otlp_receiver) if item.kind == 3]
+            assert len(children) == 1
+            if approved:
+                assert sent["traceparent"] == (
+                    f"00-{children[0].trace_id.hex()}-{children[0].span_id.hex()}-01"
+                )
+            assert all(
+                CANARY.encode() not in request.message.SerializeToString()
+                for request in otlp_receiver.requests
+            )
+
+    @pytest.mark.parametrize("cross_origin", [False, True])
+    def test_header_projection_keeps_native_redirect_authorization_rules(
+        self, otlp_receiver, cross_origin
+    ):
+        with HTTPReceiver() as internal, HTTPReceiver() as external:
+            destination = external if cross_origin else internal
+            internal.respond(
+                status=302, headers={"Location": destination.origin + "/next"}
+            )
+            result = _run(
+                otlp_receiver,
+                internal,
+                """
+                import requests
+                with span('outbound.parent'):
+                    response = requests.get(os.environ['INTERNAL_ORIGIN'], headers={
+                        'authorization': 'Bearer OUTBOUND_CANARY_secret',
+                        'x-application': 'kept',
+                    }, timeout=2)
+                assert shutdown().completed
+                print(json.dumps({'body':response.text}))
+                """,
+            )
+            assert result == {"body": "safe-response"}
+            first = {key.lower(): value for key, value in internal.requests[0].headers}
+            last = {
+                key.lower(): value for key, value in destination.requests[-1].headers
+            }
+            assert first["authorization"] == f"Bearer {CANARY}"
+            assert first["x-application"] == last["x-application"] == "kept"
+            if cross_origin:
+                assert "authorization" not in last
+                assert "traceparent" not in last
+            else:
+                assert last["authorization"] == first["authorization"]
+                assert "traceparent" in last
+            assert len([item for item in _spans(otlp_receiver) if item.kind == 3]) == 2
+            assert all(
+                CANARY.encode() not in request.message.SerializeToString()
+                for request in otlp_receiver.requests
+            )
+
+    @pytest.mark.parametrize("copy_mode", ["task", "copy_context"])
+    def test_redis_deferred_context_exports_after_originating_operation_finishes(
+        self, otlp_receiver, copy_mode
+    ):
+        from support.reference_work import isolated_services
+
+        with isolated_services() as services, HTTPReceiver() as internal:
+            result = _run(
+                otlp_receiver,
+                internal,
+                """
+                from contextvars import copy_context
+                import redis.asyncio
+                async def exercise():
+                    client = redis.asyncio.Redis.from_url(os.environ['REDIS_URL'])
+                    key = os.environ['KEY_PREFIX'] + 'deferred'
+                    value = b'OUTBOUND_CANARY_secret'
+                    gate = asyncio.Event()
+                    pending = []
+                    contexts = []
+                    try:
+                        await client.set(key, value, ex=30)
+                        assert setup(config).ok
+                        async def deferred_get():
+                            await gate.wait()
+                            return await client.get(key)
+                        def ping_response(response, **options):
+                            if os.environ['COPY_MODE'] == 'task':
+                                pending.append(asyncio.create_task(deferred_get()))
+                            else:
+                                contexts.append(copy_context())
+                            return response == b'PONG'
+                        client.set_response_callback('PING', ping_response)
+                        with span('outbound.parent'):
+                            assert await client.ping()
+                            if contexts:
+                                pending.append(contexts[0].run(
+                                    asyncio.create_task, deferred_get()))
+                            gate.set()
+                            deferred = await pending[0]
+                            ordinary = await client.get(key)
+                        assert shutdown().completed
+                        return deferred == ordinary == value
+                    finally:
+                        await client.delete(key)
+                        await client.aclose()
+                print(json.dumps({'same_values':asyncio.run(exercise())}))
+                """,
+                clients="redis",
+                bootstrap=_IMPORTS.replace("assert setup(config).ok", ""),
+                REDIS_URL=services.redis_url,
+                KEY_PREFIX=services.redis_key_prefix,
+                COPY_MODE=copy_mode,
+            )
+            assert result == {"same_values": True}
+            spans = _spans(otlp_receiver)
+            children = [item for item in spans if item.kind == 3]
+            assert len(children) == 3
+            assert sorted(
+                _attributes(item)["db.operation.name"] for item in children
+            ) == ["GET", "GET", "PING"]
+            parent = next(item for item in spans if item.name == "outbound.parent")
+            assert all(item.trace_id == parent.trace_id for item in children)
+            assert all(
+                CANARY.encode() not in request.message.SerializeToString()
+                for request in otlp_receiver.requests
+            )
+
 
 @pytest.fixture(scope="module")
 def client_wheel(tmp_path_factory):

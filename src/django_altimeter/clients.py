@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+from collections.abc import Iterator, MutableMapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import wraps
@@ -23,7 +24,7 @@ from django_altimeter.headers import OUTBOUND_CONTEXT_HEADERS, outgoing_headers
 from django_altimeter.privacy import is_allowed_attribute
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable
 
     from django_altimeter.runtime import ProcessRuntime
 
@@ -31,7 +32,18 @@ _INSTALL_LOCK = Lock()
 _EXPORT_REQUEST: ContextVar[bool] = ContextVar(
     "altimeter_export_request", default=False
 )
-_REDIS_ACTIVE: ContextVar[bool] = ContextVar("altimeter_redis_active", default=False)
+
+
+class _RedisOperation:
+    """One operation's lifetime, shared by every copied task/thread context."""
+
+    def __init__(self) -> None:
+        self.active = True
+
+
+_REDIS_ACTIVE: ContextVar[_RedisOperation | None] = ContextVar(
+    "altimeter_redis_active", default=None
+)
 
 
 def _diagnostic(code: str) -> None:
@@ -72,21 +84,93 @@ def _method(value: object) -> str:
     return "_OTHER"
 
 
+_MAX_CONTEXT_HEADER_NAME = max(map(len, OUTBOUND_CONTEXT_HEADERS))
+
+
+def _context_header_name(key: object) -> str | None:
+    # Never normalize a large name or invoke a string subclass's accessors.
+    if isinstance(key, str) and str.__len__(key) <= _MAX_CONTEXT_HEADER_NAME:
+        name = str.lower(key)
+    elif isinstance(key, bytes) and bytes.__len__(key) <= _MAX_CONTEXT_HEADER_NAME:
+        try:
+            name = bytes.lower(key).decode("ascii")
+        except UnicodeDecodeError:
+            return None
+    else:
+        return None
+    return name if name in OUTBOUND_CONTEXT_HEADERS else None
+
+
+class _RequestHeaders(MutableMapping[Any, Any]):
+    """A bounded-storage Requests carrier; only the native sender reads values.
+
+    Filtering keys while the sender iterates preserves arbitrarily large business
+    maps without a full copy or repeated scans to delete batches of mixed-case
+    matches. Redirect copies still use the ordinary Requests mapping protocol.
+    """
+
+    def __init__(self, source: Any, generated: dict[str, str]) -> None:
+        self._source: Any = (
+            source._source if type(source) is _RequestHeaders else source
+        )
+        self._generated = generated
+
+    def __iter__(self) -> Iterator[Any]:
+        for key in self._source:
+            if _context_header_name(key) is None:
+                yield key
+        yield from self._generated
+
+    def __len__(self) -> int:
+        return sum(1 for _ in self)
+
+    def __getitem__(self, key: Any) -> Any:
+        name = _context_header_name(key)
+        if name is not None:
+            return self._generated[name]
+        return self._source[key]
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        # Application changes to business fields remain visible. Propagation
+        # fields never replace the owned context selected for this send.
+        self._source[key] = value
+
+    def __delitem__(self, key: Any) -> None:
+        name = _context_header_name(key)
+        if name is not None:
+            del self._generated[name]
+        else:
+            del self._source[key]
+
+    def copy(self) -> MutableMapping[Any, Any]:
+        # Preserve Requests' case-insensitive redirect operations (in particular
+        # stripping Authorization and body headers), not merely the wire keys.
+        from requests.structures import CaseInsensitiveDict
+
+        return CaseInsensitiveDict(self.items())
+
+
 def _apply_headers(
     carrier: Any, url: object, runtime: ProcessRuntime, tracing: bool
-) -> None:
-    # Native client carriers implement case-insensitive deletion. Touch only our
-    # fixed propagation keys; leave application auth, bodies and other values alone.
-    for name in OUTBOUND_CONTEXT_HEADERS:
-        carrier.pop(name, None)
-    carrier.update(
-        outgoing_headers(
-            url,
-            internal_origins=runtime.config.internal_origins,
-            correlation=get_correlation() if tracing else None,
-            owned_tracing=tracing,
-        )
+) -> Any:
+    generated = outgoing_headers(
+        url,
+        internal_origins=runtime.config.internal_origins,
+        correlation=get_correlation() if tracing else None,
+        owned_tracing=tracing,
     )
+    httpx = sys.modules.get("httpx")
+    if httpx is not None and isinstance(carrier, httpx.Headers):
+        # HTTPX's native carrier is case-insensitive and its transport needs raw
+        # header pairs. Deletion, unlike pop(), never fetches a removed value.
+        for name in OUTBOUND_CONTEXT_HEADERS:
+            try:
+                del carrier[name]
+            except KeyError:
+                pass
+        carrier.update(generated)
+        return carrier
+    return _RequestHeaders(carrier, generated)
 
 
 def _http_status(span: Span, status: object) -> None:
@@ -101,7 +185,7 @@ def _http_status(span: Span, status: object) -> None:
 
 @contextmanager
 def _http_span(
-    runtime: ProcessRuntime, method: object, url: object, carrier: Any
+    runtime: ProcessRuntime, method: object, url: object, request: Any
 ) -> Iterator[Span | None]:
     try:
         tracing = not _suppressed(runtime, url)
@@ -111,7 +195,7 @@ def _http_span(
         tracing, name = False, "_OTHER"
     if not tracing:
         try:
-            _apply_headers(carrier, url, runtime, False)
+            request.headers = _apply_headers(request.headers, url, runtime, False)
         except Exception:
             _diagnostic("client.headers_failed")
         yield None
@@ -120,7 +204,7 @@ def _http_span(
         "HTTP" if name == "_OTHER" else name, attributes={"http.request.method": name}
     ) as current:
         try:
-            _apply_headers(carrier, url, runtime, True)
+            request.headers = _apply_headers(request.headers, url, runtime, True)
         except Exception:
             _diagnostic("client.headers_failed")
         yield current
@@ -151,9 +235,7 @@ def _install_requests() -> None:
         runtime = _owned_runtime("requests")
         if runtime is None:
             return original_send(self, request, *args, **kwargs)
-        with _http_span(
-            runtime, request.method, request.url, request.headers
-        ) as current:
+        with _http_span(runtime, request.method, request.url, request) as current:
             response = original_send(self, request, *args, **kwargs)
             if current is not None:
                 _http_status(current, response.status_code)
@@ -177,9 +259,7 @@ def _install_httpx() -> None:
         runtime = _owned_runtime("httpx")
         if runtime is None:
             return original_sync(self, request)
-        with _http_span(
-            runtime, request.method, str(request.url), request.headers
-        ) as current:
+        with _http_span(runtime, request.method, str(request.url), request) as current:
             response = original_sync(self, request)
             if current is not None:
                 _http_status(current, response.status_code)
@@ -190,9 +270,7 @@ def _install_httpx() -> None:
         runtime = _owned_runtime("httpx")
         if runtime is None:
             return await original_async(self, request)
-        with _http_span(
-            runtime, request.method, str(request.url), request.headers
-        ) as current:
+        with _http_span(runtime, request.method, str(request.url), request) as current:
             response = await original_async(self, request)
             if current is not None:
                 _http_status(current, response.status_code)
@@ -220,8 +298,11 @@ def _redis_operation(args: tuple[Any, ...]) -> str:
 def _redis_span(operation: str) -> Iterator[None]:
     runtime = _owned_runtime("redis")
     try:
+        enclosing = _REDIS_ACTIVE.get()
         tracing = (
-            runtime is not None and not _REDIS_ACTIVE.get() and not _suppressed(runtime)
+            runtime is not None
+            and (enclosing is None or not enclosing.active)
+            and not _suppressed(runtime)
         )
     except Exception:
         _diagnostic("client.prepare_failed")
@@ -229,13 +310,17 @@ def _redis_span(operation: str) -> Iterator[None]:
     if not tracing:
         yield
         return
-    token = _REDIS_ACTIVE.set(True)
+    operation_scope = _RedisOperation()
+    token = _REDIS_ACTIVE.set(operation_scope)
     try:
         with client_span(
             "DB", attributes={"db.system.name": "redis", "db.operation.name": operation}
         ):
             yield
     finally:
+        # Resetting only this context's token leaves copies suppressed forever.
+        # Deactivate the shared holder first, so all copies can start new work.
+        operation_scope.active = False
         _REDIS_ACTIVE.reset(token)
 
 

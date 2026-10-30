@@ -37,6 +37,15 @@ if `dictConfig` replaces handlers, reattach with the same routes afterward.
 Changing the declared routes requires a new process. Installation changes none
 of the application's logger settings.
 
+Every selected route must already reach an application handler, either directly
+or through propagation. Handler-free routes that rely on logging.lastResort
+are unsupported: installation returns logging.no_effective_handler and
+attaches nothing to any selected route. This preserves ordinary and root logger
+fallback output, as well as module-level logging's automatic basicConfig().
+Configure Django/Celery logging before attaching Altimeter. A NullHandler
+counts as an existing handler because Python also treats it as suppressing
+lastResort; handler levels and filters do not change this rule.
+
 For Celery, call the same attachment function after the application's logging
 setup hook and after explicit runtime setup in the serving worker process.
 Altimeter does not install a Celery hook or take over its stdout configuration.

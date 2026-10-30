@@ -120,7 +120,12 @@ class _SafeLoggingHandler(logging.Handler):
         attributes = fields.get("attributes")
         if type(message) is dict and len(message) <= limits.max_children:
             attributes = message
-            message = message.get("event")
+            for key, value in message.items():
+                if type(key) is str and key == "event":
+                    message = value
+                    break
+            else:
+                return
         if not _text(message, limits.max_string_bytes):
             return
 
@@ -200,13 +205,32 @@ def _route_loggers(routes: tuple[str, ...]) -> tuple[logging.Logger, ...] | None
     return loggers
 
 
+def _has_effective_handler(logger: logging.Logger) -> bool:
+    # Match callHandlers: even a NullHandler or a filtered handler prevents
+    # lastResort. Our export handler must never be what suppresses that fallback.
+    current = logger
+    for _ in range(_MAX_ROUTES):
+        if len(current.handlers) > _MAX_HANDLERS:
+            return False
+        if any(
+            type(handler) is not _SafeLoggingHandler for handler in current.handlers
+        ):
+            return True
+        if not current.propagate or current.parent is None:
+            return False
+        current = current.parent
+    return False
+
+
 def install_logging(*, routes: tuple[str, ...]) -> LoggingSetupResult:
     """Attach one handler after logging configuration and explicit runtime setup.
 
     Routes name stdlib loggers (``""`` means root). Explicitly include desired
     nonpropagating loggers. Routes must not propagate into one another. Repeating
     the same installation is harmless; changing its routes requires a new process.
-    No logging levels, propagation flags, formatters or stdout handlers are changed.
+    Each route must already reach a non-Altimeter handler; lastResort-only
+    routes are unsupported. No logging levels, propagation flags, formatters or
+    stdout handlers are changed.
     """
     from django_altimeter.runtime import get_process_runtime
 
@@ -226,6 +250,8 @@ def install_logging(*, routes: tuple[str, ...]) -> LoggingSetupResult:
             type(existing) is not _SafeLoggingHandler or existing.routes != routes
         ):
             return LoggingSetupResult(codes=("logging.routes_changed",))
+        if not all(_has_effective_handler(logger) for logger in loggers):
+            return LoggingSetupResult(codes=("logging.no_effective_handler",))
         handler = existing or _SafeLoggingHandler(runtime, routes)
         for logger in loggers:
             logger.addHandler(handler)

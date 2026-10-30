@@ -375,7 +375,8 @@ class TestStandaloneLogging:
             parent = logging.getLogger('app')
             child = logging.getLogger('app.child')
             parent.setLevel(logging.INFO)
-            parent.propagate = False
+            parent.propagate = True
+            logging.getLogger().addHandler(logging.NullHandler())
             before = (tuple(parent.handlers), tuple(child.handlers))
             invalid = install_logging(routes=('app', 'app.child'))
             assert not invalid.ok and invalid.codes == ('logging.invalid_routes',)
@@ -437,6 +438,7 @@ class TestStandaloneLogging:
             app = logging.getLogger('app')
             app.setLevel(logging.INFO)
             app.propagate = False
+            app.addHandler(logging.NullHandler())
             install(('app',))
             calls = []
             class Hostile:
@@ -522,6 +524,7 @@ class TestStandaloneLogging:
             app = logging.getLogger('app')
             app.setLevel(logging.INFO)
             app.propagate = False
+            app.addHandler(logging.NullHandler())
             install(('app',))
             foreign = TracerProvider(shutdown_on_exit=False)
             with foreign.get_tracer('foreign').start_as_current_span('secret'):
@@ -552,6 +555,7 @@ class TestStandaloneLogging:
             app = logging.getLogger('app')
             app.setLevel(logging.INFO)
             app.propagate = False
+            app.addHandler(logging.NullHandler())
             install(('app',))
             app.info('work.done', extra={'attributes': {
                 'trace_id': 'cafe' * 8, 'span_id': 'babe' * 4,
@@ -567,6 +571,128 @@ class TestStandaloneLogging:
         assert {a.key: a.value.int_value for a in records[0][2].attributes} == {
             "http.response.status_code": 200
         }
+
+    @pytest.mark.parametrize("mode", ["ordinary", "propagating", "root", "module"])
+    def test_handler_free_routes_preserve_fallback_output(self, otlp_receiver, mode):
+        result = _run(
+            otlp_receiver,
+            f"mode = {mode!r}\n"
+            + textwrap.dedent("""
+            from contextlib import redirect_stderr
+            from django_altimeter.logging import install_logging
+            from django_altimeter.runtime import get_process_runtime
+            configure()
+            root = logging.getLogger()
+            root.handlers.clear()
+            root.setLevel(logging.WARNING)
+            app = logging.getLogger('app')
+            app.handlers.clear()
+            app.setLevel(logging.WARNING)
+            app.propagate = mode == 'propagating'
+            route = app if mode in ('ordinary', 'propagating') else root
+            routes = ('app',) if route is app else ('',)
+            emit = logging.warning if mode == 'module' else route.warning
+            stream = io.StringIO()
+            with redirect_stderr(stream):
+                emit(CANARY)
+                emit('work.done')
+            before = stream.getvalue()
+            # Module-level warning() installs basicConfig's handler on first use.
+            # Restore the original empty topology before the Altimeter attempt.
+            for handler in tuple(root.handlers):
+                root.removeHandler(handler)
+                handler.close()
+            stream.seek(0)
+            stream.truncate(0)
+            with redirect_stderr(stream):
+                result = install_logging(routes=routes)
+                attached = tuple(route.handlers)
+                emit(CANARY)
+                emit('work.done')
+            after = stream.getvalue()
+            assert after == before, (before, after)
+            assert not result.ok
+            assert result.codes == ('logging.no_effective_handler',)
+            assert attached == ()
+            assert get_process_runtime().log_handler is None
+            positive = logging.getLogger('app.solo')
+            positive.setLevel(logging.WARNING)
+            positive.propagate = False
+            output = io.StringIO()
+            positive.addHandler(output_handler(output))
+            install(('app.solo',))
+            positive.warning('work.done')
+            assert shutdown().completed
+            print(json.dumps({'before': before, 'after': after,
+                              'positive': output.getvalue(), 'codes': result.codes}))
+        """),
+        )
+        prefix = "WARNING:root:" if mode == "module" else ""
+        assert result["before"] == f"{prefix}{CANARY}\n{prefix}work.done\n"
+        assert result["after"] == result["before"]
+        assert result["positive"] == "app.solo|WARNING|work.done\n"
+        assert result["codes"] == ["logging.no_effective_handler"]
+        records = _logs(otlp_receiver)
+        assert len(records) == 1
+        assert records[0][1].name == "app.solo"
+        assert records[0][2].body.string_value == "work.done"
+        _assert_private(otlp_receiver)
+
+    @pytest.mark.parametrize("key_kind", ["object", "str_subclass"])
+    def test_structured_event_never_hashes_or_compares_unknown_keys(
+        self, otlp_receiver, key_kind
+    ):
+        result = _run(
+            otlp_receiver,
+            f"key_kind = {key_kind!r}\n"
+            + textwrap.dedent("""
+            configure()
+            app = logging.getLogger('app')
+            app.setLevel(logging.INFO)
+            app.propagate = False
+            app.addHandler(logging.NullHandler())
+            install(('app',))
+            calls = []
+            armed = False
+            event_hash = hash('event')
+            class HostileKey:
+                def __hash__(self):
+                    if armed:
+                        calls.append('hash')
+                        raise AssertionError(CANARY)
+                    return event_hash
+                def __eq__(self, other):
+                    if armed:
+                        calls.append('eq')
+                        raise AssertionError(CANARY)
+                    return False
+            class HostileString(str):
+                __hash__ = HostileKey.__hash__
+                __eq__ = HostileKey.__eq__
+            key = HostileKey() if key_kind == 'object' else HostileString('event')
+            unknown = {key: CANARY}
+            mixed = {key: CANARY, 'event': 'work.done',
+                     'http.response.status_code': 201}
+            armed = True
+            app.info(unknown)
+            app.info(mixed)
+            app.info({'event': 'work.done', 'http.response.status_code': 200})
+            assert shutdown().completed
+            print(json.dumps({'calls': calls}))
+        """),
+        )
+        assert result["calls"] == []
+        records = _logs(otlp_receiver)
+        assert len(records) == 2
+        assert all(record.body.string_value == "work.done" for _, _, record in records)
+        assert [
+            {a.key: a.value.int_value for a in record.attributes}
+            for _, _, record in records
+        ] == [
+            {"http.response.status_code": 201},
+            {"http.response.status_code": 200},
+        ]
+        _assert_private(otlp_receiver)
 
 
 @pytest.fixture(scope="module")

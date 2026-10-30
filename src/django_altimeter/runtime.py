@@ -36,7 +36,7 @@ if TYPE_CHECKING:
     from opentelemetry.sdk.trace import TracerProvider
 
     from django_altimeter.conf import SignalConfig
-    from django_altimeter.exporting import SanitizingSession
+    from django_altimeter.exporting import ExportOutcome, SanitizingSession
     from django_altimeter.headers import ResponseHeaderPolicy
     from django_altimeter.metrics import RequestMetrics
 
@@ -75,9 +75,9 @@ def _process_session(
     class ProcessSession(SanitizingSession):
         """Apply writer ownership and the shared exit budget before native HTTP."""
 
-        def _export_completed(self) -> None:
-            runtime._record_shutdown_export(self.outcome.code)
-            super()._export_completed()
+        def _export_completed(self, outcome: ExportOutcome | None = None) -> None:
+            runtime._record_shutdown_export((outcome or self.outcome).code)
+            super()._export_completed(outcome)
 
         def request(
             self, method: str, url: str | bytes, *args: Any, **kwargs: Any

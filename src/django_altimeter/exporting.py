@@ -507,6 +507,25 @@ class ExportOutcome:
     local_dropped_records: int = 0
 
 
+_OUTCOME_PRIORITY = {
+    "export.not_sent": 0,
+    "export.empty": 0,
+    "export.accepted": 0,
+    "export.warning": 1,
+    "export.partial": 2,
+}
+
+
+def _worst_outcome(
+    previous: ExportOutcome | None, latest: ExportOutcome
+) -> ExportOutcome:
+    if previous is None or _OUTCOME_PRIORITY.get(
+        latest.code, 3
+    ) >= _OUTCOME_PRIORITY.get(previous.code, 3):
+        return latest
+    return previous
+
+
 class ExportProtocolError(Exception):
     """Fixed local/protocol code. The native HTTP client must not retry this."""
 
@@ -645,18 +664,27 @@ class _ProjectedBatch:
 
 
 class _ProjectionScope:
-    """One invocation's cache, explicitly emptied in every copied context."""
+    """Bounded native-export state, explicitly emptied in every copied context."""
 
     def __init__(self) -> None:
         self.batch: _ProjectedBatch | None = None
+        self.terminal_outcome: ExportOutcome | None = None
         self.active = True
         # Copied contexts may run on another thread while the export finishes.
         self.lock = Lock()
 
-    def close(self) -> None:
+    def record_terminal(self, outcome: ExportOutcome) -> None:
         with self.lock:
+            if self.active:
+                self.terminal_outcome = _worst_outcome(self.terminal_outcome, outcome)
+
+    def close(self) -> ExportOutcome | None:
+        with self.lock:
+            outcome = self.terminal_outcome
             self.active = False
             self.batch = None
+            self.terminal_outcome = None
+            return outcome
 
 
 class SanitizingSession(requests.Session):
@@ -744,8 +772,8 @@ class SanitizingSession(requests.Session):
         except Exception:
             self._outcome = replace(self._outcome, code="export.failed")
 
-    def _export_completed(self) -> None:
-        """Finish one native export, after its own retry loop has returned."""
+    def _export_completed(self, outcome: ExportOutcome | None = None) -> None:
+        """Finish native export with its worst terminal batch, after retries."""
         self._emit_diagnostic()
 
     def _emit_diagnostic(self) -> None:
@@ -880,7 +908,12 @@ class SanitizingSession(requests.Session):
                 code = "export.partial"
             elif warning:
                 code = "export.warning"
-            self._outcome = ExportOutcome(code, count - rejected, rejected, dropped)
+            outcome = ExportOutcome(code, count - rejected, rejected, dropped)
+            self._outcome = outcome
+            if self.signal == "metrics" and (scope := self._projection_scope.get()):
+                # A validated 200 ends this batch. HTTP failures can still retry;
+                # their final outcome is considered when native export finishes.
+                scope.record_terminal(outcome)
             self._emit_diagnostic()
             return _safe_response(200)
         finally:
@@ -1162,7 +1195,7 @@ def create_metric_exporter(
                 session._outcome = ExportOutcome("export.failed")
                 return MetricExportResult.FAILURE
             finally:
-                projection_scope.close()
+                terminal_outcome = projection_scope.close()
                 if patched:
                     self._client._timeout = cast(float, original)
                 if not supported:
@@ -1173,7 +1206,8 @@ def create_metric_exporter(
                 session._clear_failure_frames(caller_exception)
                 session._failures.reset(failures_token)
                 session._deadline.reset(token)
+                completed_outcome = _worst_outcome(terminal_outcome, session.outcome)
                 self._export_lock.release()
-                session._export_completed()
+                session._export_completed(completed_outcome)
 
     return _DeadlineMetricExporter()

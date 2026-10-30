@@ -387,3 +387,272 @@ def test_oversized_cache_policy_still_removes_stale_ids_and_wildcard_timing():
     assert (b"timing-allow-origin", b"*") not in result
     assert next(value for key, value in result if key == b"cache-control") is cache
     assert (b"x-altimeter-trace-id", b"stale-request") in original
+
+
+# Frozen pre-optimization reference: keep its repeated scans independent of the
+# implementation so the optimization cannot silently change wire bytes/order.
+def _original_header_values(headers, name):
+    if type(headers) not in {list, tuple} or len(headers) > 128:
+        return None
+    values = []
+    for pair in headers:
+        if type(pair) not in {list, tuple} or len(pair) != 2:
+            return None
+        key, value = pair
+        if type(key) is not bytes or len(key) > 128 or type(value) is not bytes:
+            return None
+        if key.lower() == name:
+            if len(value) > 8192:
+                return None
+            values.append(value)
+    return tuple(values)
+
+
+def _original_response_headers(
+    headers, *, request_headers, frontend_origins, correlation, owned_tracing
+):
+    import re
+
+    if _original_header_values(headers, None) is None:
+        return headers
+    result = [
+        (key, value)
+        for key, value in headers
+        if key.lower() not in {b"x-altimeter-trace-id", b"x-altimeter-trace-sampled"}
+    ]
+    if (
+        type(frontend_origins) is frozenset
+        and 0 < len(frontend_origins) <= 128
+        and all(type(item) is str and len(item) <= 2048 for item in frontend_origins)
+    ):
+        result = [
+            (key, value)
+            for key, value in result
+            if key.lower() != b"timing-allow-origin"
+        ]
+        vary = _original_header_values(result, b"vary")
+        if vary is not None and sum(map(len, vary)) <= 8192:
+            tokens = {
+                token.strip().lower() for value in vary for token in value.split(b",")
+            }
+            if b"origin" not in tokens and b"*" not in tokens:
+                result = [
+                    (key, value) for key, value in result if key.lower() != b"vary"
+                ] + [(b"vary", b", ".join((*vary, b"Origin")))]
+            origins = _original_header_values(request_headers, b"origin")
+            if origins is not None and len(origins) == 1:
+                origin = origins[0]
+                if (
+                    len(origin) <= 2048
+                    and origin not in {b"*", b"null"}
+                    and all(33 <= byte <= 126 for byte in origin)
+                    and origin.decode("ascii") in frontend_origins
+                ):
+                    result.append((b"timing-allow-origin", origin))
+    valid_correlation = (
+        type(correlation) is Correlation
+        and type(correlation.trace_id) is str
+        and len(correlation.trace_id) == 32
+        and re.fullmatch("[0-9a-f]{32}", correlation.trace_id) is not None
+        and correlation.trace_id != "0" * 32
+        and type(correlation.span_id) is str
+        and len(correlation.span_id) == 16
+        and re.fullmatch("[0-9a-f]{16}", correlation.span_id) is not None
+        and correlation.span_id != "0" * 16
+        and type(correlation.trace_flags) is int
+        and 0 <= correlation.trace_flags <= 255
+    )
+    if owned_tracing is True and valid_correlation:
+        values = _original_header_values(result, b"cache-control")
+        private = False
+        if (
+            values is not None
+            and sum(map(len, values)) <= 8192
+            and not any(
+                b'"' in value
+                or b"\\" in value
+                or any(byte < 32 or byte > 126 for byte in value)
+                for value in values
+            )
+        ):
+            directives = {
+                part.strip().lower() for value in values for part in value.split(b",")
+            }
+            names = {part.partition(b"=")[0].strip() for part in directives}
+            private = bool(directives & {b"private", b"no-store"}) and not bool(
+                names & {b"public", b"s-maxage"}
+            )
+        if private:
+            result.extend(
+                [
+                    (b"x-altimeter-trace-id", correlation.trace_id.encode("ascii")),
+                    (
+                        b"x-altimeter-trace-sampled",
+                        b"1" if correlation.trace_flags & 1 else b"0",
+                    ),
+                ]
+            )
+    return result
+
+
+_EQUIVALENCE_RESPONSES = [
+    [],
+    [(b"cache-control", b"private, no-store")],
+    [(b"Cache-Control", b"private"), (b"cache-control", b"public, max-age=60")],
+    [(b"cache-control", b"private, s-maxage =60")],
+    [(b"cache-control", b'private="Set-Cookie"')],
+    [(b"cache-control", b"private, extension=\\value")],
+    [(b"cache-control", b"private\t")],
+    [(b"cache-control", b"private\x7f")],
+    [(b"cache-control", b"no-store"), (b"cache-control", b"\xff")],
+    [(b"vary", b"Cookie"), (b"Vary", b"Accept-Encoding")],
+    [(b"vary", b"Cookie, oRiGiN"), (b"Vary", b"Accept-Encoding")],
+    [(b"Vary", b"*"), (b"vary", b"Cookie")],
+    [(b"vary", b"x" * 8192)],
+    [(b"vary", b"x" * 8193)],
+    [(b"vary", b"x" * 4096), (b"Vary", b"y" * 4097)],
+    [(b"cache-control", b"private," + b"x" * 8184)],
+    [(b"cache-control", b"private," + b"x" * 8185)],
+    [(b"cache-control", b"private"), (b"Cache-Control", b"x" * 8186)],
+    [(b"other", b"x" * 1_000_000), (b"cache-control", b"private")],
+    [(b"x" * 128, b"ok"), (b"cache-control", b"private")],
+    [(b"x" * 129, b"ok"), (b"cache-control", b"private")],
+    [(HostileBytes(b"cache-control"), b"private")],
+    [(b"cache-control", HostileBytes(b"private"))],
+    [(b"cache-control", b"private"), (b"broken",)],
+    [[b"cache-control", b"private"], [b"set-cookie", b"a=1"]],
+    ((b"cache-control", b"private"), (b"set-cookie", b"a=1")),
+    [(b"other", b"value")] * 129,
+    *[
+        [(b"cache-control", b"private")] + [(b"other", b"value")] * count
+        for count in (125, 126, 127)
+    ],
+    [
+        (b"Vary", b"Cookie"),
+        (b"cache-control", b"Private, No-Store"),
+        (b"Timing-Allow-Origin", b"*"),
+        (b"set-cookie", b"a=1"),
+        (b"set-cookie", b"b=2"),
+        (b"X-Altimeter-Trace-Id", b"stale-id"),
+        (b"X-Altimeter-Trace-Sampled", b"1"),
+    ],
+]
+_EQUIVALENCE_REQUESTS = [
+    [],
+    [(b"origin", ORIGIN.encode())],
+    [(b"Origin", b"https://other.example")],
+    [(b"origin", ORIGIN.encode()), (b"Origin", ORIGIN.encode())],
+    [(b"origin", b"*")],
+    [(b"origin", b"null")],
+    [(b"origin", b"")],
+    [(b"origin", b"https://frontend.example\n")],
+    [(b"origin", b"\xff")],
+    [(b"origin", b"x" * 2048)],
+    [(b"origin", b"x" * 2049)],
+    [(b"origin", b"x" * 8193)],
+    [(HostileBytes(b"origin"), ORIGIN.encode())],
+    [(b"origin", ORIGIN.encode()), (b"bad",)],
+    [(b"origin", ORIGIN.encode())] * 129,
+    HostileContainer(),
+]
+_EQUIVALENCE_CONFIGURATIONS = [
+    frozenset(),
+    frozenset({ORIGIN}),
+    frozenset({ORIGIN, "https://other.example"}),
+    frozenset({ORIGIN, "*", "null", "", "https://frontend.example\n", "\u00e9"}),
+    frozenset({"x" * 2048}),
+    frozenset({ORIGIN, "x" * 2049}),
+    frozenset({ORIGIN, 1}),
+    {ORIGIN},
+    frozenset(f"https://frontend{i}.example" for i in range(129)),
+    HostileContainer(),
+]
+
+
+@pytest.mark.parametrize("frontend_origins", _EQUIVALENCE_CONFIGURATIONS)
+@pytest.mark.parametrize("original", _EQUIVALENCE_RESPONSES)
+def test_response_policy_matches_original_bytes_across_case_matrix(
+    original, frontend_origins
+):
+    from django_altimeter import headers
+
+    # The legacy API remains covered as well as the once-prepared runtime API.
+    policy = headers.prepare_response_header_policy(frontend_origins)
+    for request_headers in _EQUIVALENCE_REQUESTS:
+        for owned, correlation in (
+            (False, None),
+            (True, CORRELATION),
+            (True, Correlation(CORRELATION.trace_id, CORRELATION.span_id, 0)),
+            (True, Correlation("0" * 32, CORRELATION.span_id, 1)),
+            (True, Correlation(CORRELATION.trace_id, CORRELATION.span_id, True)),
+            (1, CORRELATION),
+        ):
+            keywords = {
+                "request_headers": request_headers,
+                "frontend_origins": frontend_origins,
+                "correlation": correlation,
+                "owned_tracing": owned,
+            }
+            expected = _original_response_headers(original, **keywords)
+            assert headers.response_headers(original, **keywords) == expected
+            keywords.pop("frontend_origins")
+            assert (
+                headers.response_headers(original, policy=policy, **keywords)
+                == expected
+            )
+
+
+def test_prepared_policy_is_frozen_and_does_not_reuse_dynamic_header_facts():
+    from dataclasses import FrozenInstanceError
+
+    from django_altimeter.headers import prepare_response_header_policy
+
+    policy = prepare_response_header_policy(frozenset({ORIGIN}))
+    with pytest.raises(FrozenInstanceError):
+        policy.timing_enabled = False
+    with pytest.raises(FrozenInstanceError):
+        policy.allowed_origins = frozenset({b"*"})
+    original = [(b"cache-control", b"private")]
+    request = [(b"origin", ORIGIN.encode())]
+    keywords = dict(
+        request_headers=request,
+        policy=policy,
+        correlation=CORRELATION,
+        owned_tracing=True,
+    )
+    positive = response_headers(original, **keywords)
+    assert (b"timing-allow-origin", ORIGIN.encode()) in positive
+    assert (b"x-altimeter-trace-id", CORRELATION.trace_id.encode()) in positive
+    original[0] = (b"cache-control", b"private, public")
+    request[0] = (b"origin", ORIGIN.encode() + b"\r\nsecret")
+    assert response_headers(original, **keywords) == [
+        (b"cache-control", b"private, public"),
+        (b"vary", b"Origin"),
+    ]
+    original[0] = (b"cache-control", b"private")
+    request[0] = (b"origin", ORIGIN.encode())
+    keywords["correlation"] = Correlation("A" * 32, CORRELATION.span_id, 1)
+    assert response_headers(original, **keywords) == [
+        (b"cache-control", b"private"),
+        (b"vary", b"Origin"),
+        (b"timing-allow-origin", ORIGIN.encode()),
+    ]
+
+
+def test_prepared_configuration_does_not_call_user_accessors():
+    from django_altimeter.headers import prepare_response_header_policy
+
+    class HostileOrigin(str):
+        def __len__(self):
+            raise AssertionError("user len called")
+
+        def isascii(self):
+            raise AssertionError("user isascii called")
+
+        def encode(self, *args, **kwargs):
+            raise AssertionError("user encode called")
+
+    for origins in (HostileContainer(), frozenset({HostileOrigin(ORIGIN)})):
+        policy = prepare_response_header_policy(origins)
+        assert not policy.timing_enabled
+        assert policy.allowed_origins == frozenset()

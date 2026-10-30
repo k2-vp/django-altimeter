@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from argparse import ArgumentParser, ArgumentTypeError
 from dataclasses import asdict, dataclass, replace
@@ -18,6 +19,7 @@ from django_altimeter.checks import LocalDiagnostics, diagnose_local
 from django_altimeter.conf import Config
 
 _SIGNALS = ("traces", "logs", "metrics")
+_DISPLAY_MAX_CHARS = 128
 
 
 @dataclass(frozen=True)
@@ -48,6 +50,12 @@ def _service(config: Config | None) -> dict[str, str]:
     # Only bounded identifiers are useful display values. Never display an
     # endpoint, a credential-shaped identifier or configured header material.
     secrets: set[str] = set()
+    # Direct secret inputs may stay outside Config, including read-back keys.
+    # Longer secrets cannot occur inside a bounded display identifier.
+    for name in ("ALTIMETER_READBACK_API_KEY", "ALTIMETER_POSTHOG_TOKEN"):
+        secret = os.environ.get(name, "")
+        if 0 < len(secret) <= _DISPLAY_MAX_CHARS:
+            secrets.add(secret)
     for signal in (config.traces, config.logs, config.metrics):
         for _, value in signal.headers:
             secrets.add(value)
@@ -63,7 +71,7 @@ def _service(config: Config | None) -> dict[str, str]:
         if (
             not value
             or (
-                len(value) <= 128
+                len(value) <= _DISPLAY_MAX_CHARS
                 and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", value)
                 and not any(secret and secret in value for secret in secrets)
                 and not any(token in value.lower() for token in ("phc_", "phx_"))

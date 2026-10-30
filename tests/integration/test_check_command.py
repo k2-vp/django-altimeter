@@ -759,3 +759,83 @@ def test_cli_observer_detects_real_thread_socket_and_exporter(
     assert result.returncode == 0, result.stdout + result.stderr
     assert observed["threads"] and observed["exporters"]
     assert "socket.__new__" in observed["sockets"]
+
+
+@pytest.mark.parametrize(
+    "secret_name", ["ALTIMETER_READBACK_API_KEY", "ALTIMETER_POSTHOG_TOKEN"]
+)
+@pytest.mark.parametrize("json_output", [True, False])
+@pytest.mark.parametrize(
+    ("metadata_name", "display_name"),
+    [
+        ("SERVICE_NAME", "name"),
+        ("RELEASE", "release"),
+        ("DEPLOYMENT_ENVIRONMENT", "environment"),
+    ],
+)
+@pytest.mark.parametrize("embedded", [False, True])
+def test_out_of_band_secret_is_redacted_from_metadata(
+    wheel_python,
+    tmp_path,
+    secret_name,
+    json_output,
+    metadata_name,
+    display_name,
+    embedded,
+) -> None:
+    secret = "opaque-out-of-band-secret-canary"
+    value = f"prefix.{secret}.suffix" if embedded else secret
+    environment = {
+        **_enabled_environment(),
+        secret_name: secret,
+        "ALTIMETER_READBACK_PROJECT_ID": "42",
+        f"ALTIMETER_{metadata_name}": value,
+    }
+    result, observed, _ = _invoke(
+        wheel_python, tmp_path, environment=environment, json_output=json_output
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    _assert_inert(observed)
+    assert secret not in result.stdout + result.stderr
+    if json_output:
+        status = _status(result)
+        assert status["configured"] is True and status["ok"] is True
+        assert status["service"][display_name] == "[redacted]"
+    else:
+        assert f"service.{display_name}=[redacted]" in result.stdout.splitlines()
+
+
+@pytest.mark.parametrize(
+    "secret_name", ["ALTIMETER_READBACK_API_KEY", "ALTIMETER_POSTHOG_TOKEN"]
+)
+@pytest.mark.parametrize("json_output", [True, False])
+def test_out_of_band_secret_keeps_normal_metadata_visible(
+    wheel_python, tmp_path, secret_name, json_output
+) -> None:
+    secret = "opaque-out-of-band-secret-canary"
+    result, observed, _ = _invoke(
+        wheel_python,
+        tmp_path,
+        environment={
+            **_enabled_environment(),
+            secret_name: secret,
+            "ALTIMETER_READBACK_PROJECT_ID": "42",
+        },
+        json_output=json_output,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    _assert_inert(observed)
+    assert secret not in result.stdout + result.stderr
+    expected = {
+        "name": "command-test",
+        "environment": "test",
+        "release": "test-release",
+        "role": "web",
+    }
+    if json_output:
+        status = _status(result)
+        assert status["configured"] is True and status["ok"] is True
+        assert status["service"] == expected
+    else:
+        for name, value in expected.items():
+            assert f"service.{name}={value}" in result.stdout.splitlines()

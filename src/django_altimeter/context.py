@@ -9,7 +9,7 @@ from math import isfinite
 from typing import TypeGuard
 
 from opentelemetry import trace
-from opentelemetry.trace import Span, SpanContext, Status, StatusCode
+from opentelemetry.trace import Span, SpanContext, SpanKind, Status, StatusCode
 
 from django_altimeter.privacy import PrivacyLimits, is_allowed_attribute
 
@@ -145,16 +145,29 @@ def get_correlation() -> Correlation | None:
         return None
 
 
-@contextmanager
 def span(
     name: str, *, attributes: Mapping[str, object] | None = None
-) -> Iterator[Span]:
+) -> AbstractContextManager[Span]:
     """Create a registered native span, usable with `with` in sync/async code.
 
     Only exact builtin dictionaries and bounded scalar entries reach the SDK.
     Unknown names and unowned tracing yield INVALID_SPAN without changing the
     caller's existing context. Exceptions from the body always propagate.
     """
+    return _span(name, attributes, SpanKind.INTERNAL)
+
+
+def client_span(
+    name: str, *, attributes: Mapping[str, object] | None = None
+) -> AbstractContextManager[Span]:
+    """Use the same bounded native lifecycle for concrete driver/client calls."""
+    return _span(name, attributes, SpanKind.CLIENT)
+
+
+@contextmanager
+def _span(
+    name: str, attributes: Mapping[str, object] | None, kind: SpanKind
+) -> Iterator[Span]:
     manager: AbstractContextManager[Span] | None = None
     current: Span = trace.INVALID_SPAN
     marker: Token[Span | None] | None = None
@@ -173,6 +186,7 @@ def span(
             ).start_as_current_span(
                 name,
                 attributes=safe,
+                kind=kind,
                 record_exception=False,
                 set_status_on_exception=False,
             )

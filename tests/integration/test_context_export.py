@@ -635,3 +635,49 @@ def test_provider_identity_guard_fails_closed_if_sdk_attribute_is_absent(
     spans = _spans(otlp_receiver)
     assert len(spans) == 1
     assert spans[0].trace_id.hex() == result["trace_id"]
+
+
+def test_client_boundary_keeps_parent_and_application_exception(otlp_receiver):
+    result = _run(
+        otlp_receiver,
+        """
+        import django_altimeter.context as helpers
+        # Baseline uses the existing INTERNAL helper: wrong kind must fail on wire.
+        client = getattr(helpers, 'client_span', helpers.span)
+        assert 'traces' in configure().enabled_signals
+        failure = ValueError(CANARY)
+        with span('work.execute'):
+            parent = get_correlation()
+            try:
+                with client('work.child', attributes={
+                    'http.response.status_code': 200, 'password': CANARY,
+                    'http.route': HostileSequence(),
+                }):
+                    child = get_correlation()
+                    assert child.trace_id == parent.trace_id
+                    raise failure
+            except ValueError as caught:
+                assert caught is failure
+            else:
+                raise AssertionError('application exception was swallowed')
+            assert get_correlation() == parent
+        assert get_correlation() is None
+        assert HostileSequence.calls == []
+        assert shutdown().completed
+        print(json.dumps({'parent': parent.span_id, 'child': child.span_id}))
+    """,
+    )
+    spans = _spans(otlp_receiver)
+    assert len(spans) == 2
+    parent = next(span for span in spans if span.span_id.hex() == result["parent"])
+    child = next(span for span in spans if span.span_id.hex() == result["child"])
+    assert parent.kind == 1
+    assert child.kind == 3
+    assert child.parent_span_id == parent.span_id
+    assert child.status.code == 2
+    assert not child.events and not child.status.message
+    assert _attributes(child) == {"http.response.status_code": 200}
+    assert all(
+        CANARY.encode() not in request.message.SerializeToString()
+        for request in otlp_receiver.requests
+    )

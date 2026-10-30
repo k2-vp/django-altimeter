@@ -23,7 +23,6 @@ RSS. A macOS host run reads ps RSS in KiB; the required image gate uses Linux
 /proc. HTTP 503/Retry-After:0 responses remain in force through teardown.
 """
 
-import importlib.metadata
 import json
 import math
 import os
@@ -298,6 +297,40 @@ def _report_and_validate_run(result):
         assert result["otlp_requests"] < FAILURE_RESPONSES
 
 
+def _server_versions(python: Path) -> dict[str, str]:
+    """Read installed distributions from the interpreter serving requests."""
+    result = subprocess.run(
+        [
+            str(python),
+            "-I",
+            "-m",
+            "pip",
+            "list",
+            "--format=json",
+            "--disable-pip-version-check",
+        ],
+        check=True,
+        stdout=subprocess.PIPE,
+        text=True,
+        timeout=10,
+    )
+    installed = {
+        package["name"].lower(): package["version"]
+        for package in json.loads(result.stdout)
+    }
+    return {
+        name: installed[name.lower()]
+        for name in (
+            "Django",
+            "django-ninja",
+            "uvicorn",
+            "opentelemetry-sdk",
+            "requests",
+            "urllib3",
+        )
+    }
+
+
 def test_native_web_overhead_and_failure_plateau(tmp_path):
     wheel = install_wheel(tmp_path / "wheel")
     print(
@@ -308,17 +341,7 @@ def test_native_web_overhead_and_failure_plateau(tmp_path):
                 "platform": platform.platform(),
                 "python": platform.python_version(),
                 "cpu_count": os.cpu_count(),
-                "versions": {
-                    name: importlib.metadata.version(name)
-                    for name in (
-                        "Django",
-                        "django-ninja",
-                        "uvicorn",
-                        "opentelemetry-sdk",
-                        "requests",
-                        "urllib3",
-                    )
-                },
+                "versions": _server_versions(wheel.python),
             }
         ),
         flush=True,

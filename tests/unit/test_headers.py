@@ -656,3 +656,68 @@ def test_prepared_configuration_does_not_call_user_accessors():
         policy = prepare_response_header_policy(origins)
         assert not policy.timing_enabled
         assert policy.allowed_origins == frozenset()
+
+
+@pytest.mark.parametrize(
+    "origin",
+    ["http://internal.example", "https://internal.example:8443", "http://[::1]:8080"],
+)
+def test_internal_origins_accept_declared_http_and_https(origin):
+    from django_altimeter.headers import normalize_internal_origin
+
+    assert normalize_internal_origin(origin) is not None
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "http://user@internal.example",
+        "http://internal.example/",
+        "https://internal.example/path",
+        "https://internal.example?",
+        "https://internal.example#",
+        "http://*.example",
+        "ftp://internal.example",
+        "http://internal.example:0",
+    ],
+)
+def test_internal_origins_reject_non_origin_components(origin):
+    from django_altimeter.headers import normalize_internal_origin
+
+    assert normalize_internal_origin(origin) is None
+
+
+@pytest.mark.parametrize(
+    "url,approved",
+    [
+        ("http://internal.example/safe?CANARY=1", True),
+        ("http://internal.example:80/safe", True),
+        ("https://internal.example/safe", False),
+        ("http://internal.example:81/safe", False),
+        ("http://internal.example.attacker/safe", False),
+        ("http://user@internal.example/safe", False),
+        ("http://internal.example\\@attacker/safe", False),
+    ],
+)
+def test_outbound_headers_are_local_valid_context_for_exact_origin(url, approved):
+    from django_altimeter.headers import outgoing_headers
+
+    correlation = Correlation("1" * 32, "2" * 16, 1)
+    result = outgoing_headers(
+        url,
+        internal_origins=frozenset({"http://internal.example"}),
+        correlation=correlation,
+        owned_tracing=True,
+    )
+    assert result == (
+        {"traceparent": "00-" + "1" * 32 + "-" + "2" * 16 + "-01"} if approved else {}
+    )
+    assert (
+        outgoing_headers(
+            url,
+            internal_origins=frozenset({"http://internal.example"}),
+            correlation=correlation,
+            owned_tracing=1,
+        )
+        == {}
+    )

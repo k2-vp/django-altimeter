@@ -6,13 +6,15 @@ ARG PYTHON_VERSION
 ARG DJANGO_VERSION=6.0.9
 ARG REQUESTS_VERSION=2.33.1
 ARG URLLIB3_VERSION=2.6.3
+ARG ASGI_DEPENDENCIES=0
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     ALTIMETER_REFERENCE_PYTHON=${PYTHON_VERSION} \
     ALTIMETER_REFERENCE_DJANGO=${DJANGO_VERSION} \
     ALTIMETER_REFERENCE_REQUESTS=${REQUESTS_VERSION} \
-    ALTIMETER_REFERENCE_URLLIB3=${URLLIB3_VERSION}
+    ALTIMETER_REFERENCE_URLLIB3=${URLLIB3_VERSION} \
+    ALTIMETER_REFERENCE_ASGI=${ASGI_DEPENDENCIES}
 
 WORKDIR /verify
 COPY dist/*.whl dist/*.tar.gz /verify/dist/
@@ -36,6 +38,8 @@ subprocess.run(
         'opentelemetry-exporter-otlp-proto-http==1.45.1',
         'pytest==9.2.0',
         'pytest-django==4.14.0',
+        *(['django-ninja==1.6.2', 'uvicorn==0.46.0']
+          if os.environ['ALTIMETER_REFERENCE_ASGI'] == '1' else []),
         str(wheels[0]),
     ],
     check=True,

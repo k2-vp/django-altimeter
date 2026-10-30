@@ -6,7 +6,8 @@ export.
 
 The current development release provides explicit runtime setup and shutdown,
 safe application spans, correlation, trusted identity enrichment, and on-demand
-configuration and delivery checks. Automatic HTTP and queue instrumentation are
+configuration and delivery checks. Native ASGI request instrumentation supports
+Django and Ninja with explicit worker startup. WSGI and queue instrumentation are
 not included yet. Telemetry is disabled by default.
 
 ## Install
@@ -154,8 +155,8 @@ correlation or identity. Every exporting worker has a fresh UUID
 
 Keep setup and shutdown in the application's explicit startup and cleanup
 hooks. **Gunicorn preload is unsupported.** Initialize after forking; a child
-that inherits initialized providers disables the affected signals. Automatic
-HTTP instrumentation and server lifecycle adapters are not included.
+that inherits initialized providers disables the affected signals.
+WSGI and queue lifecycle adapters are not included.
 
 Use one shutdown call at worker exit, outside request and task bodies:
 
@@ -179,6 +180,146 @@ To disable telemetry, set the environment value and restart the workers:
 ```sh
 export ALTIMETER_ENABLED=false
 ```
+
+## ASGI requests
+
+Install the ASGI server and API dependencies used by the reference application:
+
+```sh
+uv pip install 'uvicorn==0.46.0' 'django-ninja==1.6.2'
+```
+
+Add `django_altimeter.django.RequestMetadataMiddleware` near the outside of
+Django's middleware list, before middleware that may return an early response.
+It reads the resolved route template and response metadata. It does not read
+`request.user`, authenticate, consume a body, or create a second request span.
+Allow only static resolver templates in your Django settings:
+
+```python
+MIDDLEWARE = [
+    "django_altimeter.django.RequestMetadataMiddleware",
+    # Your existing middleware follows.
+]
+ALTIMETER = {
+    "ATTRIBUTE_VALUES": frozenset({("http.route", "api/items/<item_id>")}),
+    "EXCLUDED_ROUTES": frozenset({"/health/"}),
+    "FRONTEND_ORIGINS": frozenset({"https://frontend.example"}),
+}
+```
+
+Use the exact `resolver_match.route` spelling; Ninja's source path
+`/items/{item_id}` resolves to `api/items/<item_id>` under this URL prefix.
+Unknown or unapproved routes omit `http.route`; raw paths, object IDs and query
+strings never replace it. `EXCLUDED_ROUTES` contains **exact static request
+paths**, checked at entry before creating any span or metric. It accepts no
+route templates, wildcards, or regular expressions.
+
+Create Django before setup, then initialize telemetry in each serving worker's
+lifespan. The native wrapper looks up the owned runtime per request, so it can
+be constructed before lifespan startup. For a Django-only ASGI application:
+
+```python
+# your_project/asgi.py; DJANGO_SETTINGS_MODULE must name your Django settings.
+from django.core.asgi import get_asgi_application
+
+from django_altimeter import setup, shutdown
+from django_altimeter.asgi import instrument
+
+
+def create_application():
+    http_application = instrument(get_asgi_application())
+
+    async def application(scope, receive, send):
+        if scope["type"] != "lifespan":
+            return await http_application(scope, receive, send)
+        while True:
+            message = await receive()
+            if message["type"] == "lifespan.startup":
+                setup(role="web")
+                await send({"type": "lifespan.startup.complete"})
+            elif message["type"] == "lifespan.shutdown":
+                shutdown(timeout=2.0)
+                await send({"type": "lifespan.shutdown.complete"})
+                return
+
+    return application
+```
+
+With the resource identity and endpoints above configured, start two workers:
+
+```sh
+export DJANGO_SETTINGS_MODULE=your_project.settings
+export ALTIMETER_INTEGRATIONS=asgi,django
+export ALTIMETER_LOGS_ENABLED=false
+uvicorn your_project.asgi:create_application --factory --workers 2 --lifespan on
+```
+
+Uvicorn spawns workers; each calls setup and receives its own
+`service.instance.id`. The supervisor does not initialize or export telemetry.
+Normal SIGTERM triggers worker lifespan shutdown and the shared two-second
+drain; an immediate kill can lose queued records. To run the included reference
+application from this checkout, substitute
+`DJANGO_SETTINGS_MODULE=altimeter_reference.web_settings` and run:
+
+```sh
+uvicorn altimeter_reference.asgi:create_application --app-dir reference --factory --workers 2 --lifespan on
+```
+
+For an application that already owns a lifespan, add setup and shutdown to that
+existing lifespan instead of replacing it. Wrap each selected HTTP branch once;
+a separate MCP HTTP branch uses `instrument(mcp_app, surface="mcp")`. Rewrapping
+an Altimeter wrapper returns the same wrapper. Non-HTTP scopes, including
+websockets and lifespan, pass through without HTTP observations. Do not also
+install `DjangoInstrumentor` or generic OTel ASGI instrumentation on that branch.
+
+The boundary owns one SERVER span, one request counter increment and one duration
+observation per eligible request when the corresponding signal is owned. Trace
+sampling affects spans, not request totals or histogram counts. Duration is
+monotonic application entry through the final successful body/trailer send, or
+an observed abort. It includes streamed production and send backpressure, and
+ends at that send even if application cleanup returns later. It does not measure
+client receipt. Response-ready time and
+`altimeter.http.server.concurrent_at_start` are span fields, not metric dimensions.
+The concurrency count includes sampled and unsampled eligible requests in the
+same process and wrapped branch. Aborts keep an already-sent HTTP status; an
+abort before response start has no status.
+
+| Instrument | Unit | Dimensions |
+| --- | --- | --- |
+| `altimeter.http.server.requests` | `{request}` | Method, approved route when available, status class, completed/aborted outcome, surface, buffered/streaming/unknown response mode |
+| `http.server.request.duration` | `s` | The same bounded dimensions |
+
+Both instruments use delta temporality. Sum request deltas across workers and
+divide by elapsed seconds for requests per second. Compute the 5xx fraction from
+completed 5xx requests divided by all completed requests; count aborts separately.
+Merge histogram buckets before computing a percentile, rather than averaging
+worker percentiles. Missing status uses the fixed class `absent`; unknown methods
+use `_OTHER`. The explicit duration buckets, in seconds, are:
+
+```text
+0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1,
+2.5, 5, 7.5, 10, 15, 30, 45, 60, 120
+```
+
+Admission limits each instrument to 2,000 attribute sets for the process lifetime,
+including 72 reserved overflow combinations across the two supported surfaces.
+Overflow drops route and method, marks `altimeter.overflow=true`, and preserves
+outcome, status class, surface and response mode so denominators remain useful.
+Native Views filter dimensions before aggregation. Exemplar collection is off.
+
+Incoming W3C parents are accepted only when both deployment configuration enables
+`ALTIMETER_TRUST_REMOTE_PARENT=true` and the trusted network branch explicitly
+uses `instrument(..., trusted_ingress=True)`. A request header cannot grant that
+trust; public requests cannot force parent-based sampling. Baggage and tracestate
+are not propagated by this boundary.
+
+Owned tracing may add `X-Altimeter-Trace-Id` and `X-Altimeter-Trace-Sampled` only
+when the response explicitly uses unqualified `Cache-Control: private` or
+`no-store`. Public/shared-cache responses omit per-request correlation; existing
+cache directives are never relaxed. For configured frontend origins,
+`Timing-Allow-Origin` echoes only an exact approved origin and `Vary: Origin`
+merges with existing fields. This does not grant application CORS access; retain
+your own CORS and authentication policy.
 
 ## Check configuration and delivery
 
@@ -394,11 +535,12 @@ while native trace/span IDs can remain. The identity resolver may supply only
 are confined to span/log records; resources, metrics, exemplars, events, and
 links exclude them. Session identifiers are excluded. `span(attributes=...)`
 cannot supply identity fields; use a trusted resolver through `enrich()`.
-Default policy includes no application log bodies or metric instruments. Wire projection does not implement metric
-Views or limit series retained before aggregation. Runtime-owned metric Views
-select exact scope/instrument pairs, drop all attributes before aggregation,
-and disable exemplars. This keeps one series per registered instrument; route,
-status, and other metric dimensions are not available yet.
+Default policy includes no application log bodies or application-defined metric
+instruments. Wire projection does not implement Views or limit retained series.
+The runtime registers the native HTTP request pair with the bounded Views and
+admission described above. Other registered scope/instrument pairs drop all
+attributes before aggregation, retaining one series per instrument. Unregistered
+instruments are dropped and exemplars are disabled.
 
 `django_altimeter.exporting` supplies `BoundedSpanProcessor` and the
 `bounded_log_processor()` construction function. Each resulting processor owns
@@ -435,12 +577,16 @@ SDK admission accepts scalar attributes and rejects nested containers without
 walking them. Structured log reconstruction is a separate projection path.
 Projection also bounds groups, scopes, and records/points using the 128-entry
 batch ceiling, and metric buckets/quantiles/exemplars using the 16-child ceiling.
+The native HTTP duration histogram has one narrow exception: its exact 19
+boundaries and 20 bucket counts above are permitted. Native metric export splits
+large collections into requests of at most 128 points before projection.
 The retained-record estimate and protobuf output limit do not measure Python
 heap usage or peak transient memory. Each span/log signal can retain up to
-512 queued records plus a batch of 128 in flight. Runtime metric Views keep one
-aggregate series per registered instrument and drop dimensions even for rejected
-instruments. Python objects, encoding buffers, and allocator behavior also
-contribute to RSS; these payload ceilings are not a total process memory limit.
+512 queued records plus a batch of 128 in flight. HTTP metrics retain at most
+2,000 series per instrument; other registered instruments retain one series,
+and unregistered instruments are dropped before aggregation. Python objects,
+encoding buffers, and allocator behavior also contribute to RSS; these payload
+ceilings are not a total process memory limit.
 Transport enforces `max_batch_bytes` before parsing and after projection, and
 `max_response_bytes` while streaming. Response reads retain at most 64 KiB plus
 one byte used to detect overflow.
@@ -567,7 +713,8 @@ docker compose -p <unique-asgi-runtime-name> -f reference/compose.yaml --profile
 docker compose -p <unique-wsgi-runtime-name> -f reference/compose.yaml --profile wsgi run --build --rm verify-wsgi python -m pytest tests/integration/test_django_boundary.py tests/integration/test_runtime_process.py
 ```
 
-The ASGI image pins Requests 2.33.1 / urllib3 2.6.3; the WSGI image pins
+The ASGI image also pins Ninja 1.6.2 and uvicorn 0.46.0. It uses
+Requests 2.33.1 / urllib3 2.6.3; the WSGI image pins
 Requests 2.32.3 / urllib3 1.26.20. Both exercise the same transport contract.
 
 The images install the built wheel, copy both distribution artifacts and tests,
@@ -576,8 +723,8 @@ source checkout or editable installation. The image and its nested clean venv
 both use the declared Python/Django profile. The Django boundary tests use the
 small reference settings and health callable in fresh subprocesses, including
 migrations and shell commands. Tests cover packaging, explicit runtime ownership,
-Django startup, and local OTLP behavior. Server and worker workloads are not
-covered yet.
+Django startup, local OTLP behavior, and real uvicorn/Ninja request and worker
+lifecycles. WSGI server and queue worker workloads are not covered yet.
 
 The function-scoped `otlp_receiver` fixture listens on an ephemeral loopback
 port. `.endpoint` gives the base URL and `.url("traces")`, `.url("logs")`, or
@@ -611,3 +758,22 @@ uv run pytest tests/integration/test_readback_flow.py -m live
 Without the required operator credentials, the live test is skipped, never
 passed. Successful local tests do not verify PostHog ingestion or deployed
 application behavior.
+
+Verify ASGI request handling, multiprocess startup and the predeclared overhead
+workload with the installed wheel:
+
+```sh
+uv build
+docker compose -p <unique-asgi-web-name> -f reference/compose.yaml --profile asgi run --build --rm verify-asgi python -m pytest tests/unit/test_metrics.py tests/integration/test_asgi.py tests/integration/test_uvicorn_server.py tests/performance/test_web_overhead.py -s
+```
+
+The performance test uses one worker, four persistent connections and a static
+1 KiB response. Each fresh process warms 200 requests, settles for one second,
+then runs for ten seconds; three balanced repetitions cover disabled, enabled
+and failing-export modes, each requiring at least 1,000 completed requests.
+It pools individual latencies for each mode and gates p95 increase against
+`max(2 ms, 5% of disabled p95)`. Output includes the wheel hash, versions,
+throughput, RSS, errors, aborts and sample counts. A separate 60-second failure
+run samples Linux resident pages and checks the fixed plateau thresholds in
+the test. These measurements describe that workload and machine, not production
+latency or arbitrary-lifetime memory use.

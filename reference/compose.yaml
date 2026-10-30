@@ -8,6 +8,7 @@ services:
       dockerfile: reference/Dockerfile
       args:
         PYTHON_VERSION: "3.13"
+        ASGI_DEPENDENCIES: "1"
         DJANGO_VERSION: "6.0.9"
         # Locked transport versions of the supported ASGI deployment shape.
         REQUESTS_VERSION: "2.33.1"

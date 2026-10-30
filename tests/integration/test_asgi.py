@@ -862,6 +862,75 @@ def test_only_explicit_trusted_ingress_accepts_remote_parent(
         assert b"CANARY" not in request.message.SerializeToString()
 
 
+@pytest.mark.parametrize(
+    ("trusted", "accepted_parent"),
+    [(1, False), ("false", False), (None, False), (True, True), (False, False)],
+    ids=["integer", "text", "none", "trusted", "public"],
+)
+@pytest.mark.parametrize("sample_rate", [0.0, 1.0])
+def test_private_constructor_requires_literal_true_to_trust_remote_parent(
+    otlp_receiver: OTLPReceiver,
+    trusted: object,
+    accepted_parent: bool,
+    sample_rate: float,
+) -> None:
+    result = _run(
+        otlp_receiver,
+        f"        TRUSTED={trusted!r}; RATE={sample_rate!r}\n"
+        + """
+        from opentelemetry import baggage
+        from django_altimeter.asgi import _InstrumentedASGI, instrument
+        configure(sample_rate=RATE, trust_remote_parent=True)
+        seen = {}
+        async def app(scope, receive, send):
+            current = trace.get_current_span().get_span_context()
+            seen.update(trace_id=trace.format_trace_id(current.trace_id),
+                        sampled=bool(current.trace_flags.sampled),
+                        baggage=dict(baggage.get_all()),
+                        tracestate=current.trace_state.to_header())
+            await send({'type': 'http.response.start', 'status': 200, 'headers': []})
+            await send({'type': 'http.response.body', 'body': b'safe'})
+        async def receive():
+            return {'type': 'http.request', 'body': b''}
+        async def send(message):
+            pass
+        incoming = [
+            (b'traceparent', b'00-' + b'1'*32 + b'-' + b'2'*16 + b'-01'),
+            (b'tracestate', b'CANARY=PRIVATE'),
+            (b'baggage', b'CANARY=PRIVATE'),
+            (b'x-internal', b'true'),
+        ]
+        wrapper = _InstrumentedASGI(app, 'django', TRUSTED)
+        assert instrument(wrapper) is wrapper
+        asyncio.run(wrapper({**SCOPE, 'headers': incoming}, receive, send))
+        assert wrapper._active == 0
+        assert shutdown().completed
+        print(json.dumps(seen))
+        """,
+    )
+    sampled = accepted_parent or sample_rate == 1.0
+    spans = _spans(otlp_receiver)
+    assert len(spans) == int(sampled)
+    if sampled:
+        span = spans[0]
+        assert span.name == "GET"
+        assert span.kind == 2
+        assert (span.trace_id.hex() == "1" * 32) == accepted_parent
+        assert span.parent_span_id == (
+            bytes.fromhex("2" * 16) if accepted_parent else b""
+        )
+        assert span.trace_id.hex() == result["trace_id"]
+        assert _attributes(span)["http.response.status_code"] == 200
+    assert (result["trace_id"] == "1" * 32) == accepted_parent
+    assert result["sampled"] == sampled
+    assert result["baggage"] == {}
+    assert result["tracestate"] == ""
+    assert _metric_count(otlp_receiver, "altimeter.http.server.requests") == 1
+    assert _metric_count(otlp_receiver, "http.server.request.duration") == 1
+    for request in otlp_receiver.requests:
+        assert b"CANARY" not in request.message.SerializeToString()
+
+
 @pytest.fixture(scope="module")
 def asgi_wheel(tmp_path_factory):
     from support.uvicorn_server import install_wheel

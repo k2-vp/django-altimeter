@@ -177,7 +177,7 @@ class _InstrumentedASGI:
                 counted = True
             state_token = request_state.set(state)
             scope[_STATE_KEY] = state
-            if self.trusted_ingress and config.trust_remote_parent:
+            if self.trusted_ingress is True and config.trust_remote_parent is True:
                 parent = incoming_context(
                     scope.get("headers", ()),
                     trusted_ingress=True,

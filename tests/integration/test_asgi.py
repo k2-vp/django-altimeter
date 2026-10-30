@@ -1201,3 +1201,130 @@ def test_observed_disconnect_cannot_later_count_as_completed(
     assert span.status.code == 2
     assert _metric_count(otlp_receiver, "altimeter.http.server.requests") == 1
     assert _metric_count(otlp_receiver, "http.server.request.duration") == 1
+
+
+def test_owned_runtime_resolves_request_tracer_once(otlp_receiver):
+    result = _run(
+        otlp_receiver,
+        """
+        from opentelemetry.sdk.trace import TracerProvider
+        original = TracerProvider.get_tracer
+        lookups = 0
+        def counted(self, name, *args, **kwargs):
+            global lookups
+            if name == 'django_altimeter':
+                lookups += 1
+            return original(self, name, *args, **kwargs)
+        TracerProvider.get_tracer = counted
+        runtime = configure()
+        after_setup = lookups
+        async def app(scope, receive, send):
+            await send({'type': 'http.response.start', 'status': 200, 'headers': []})
+            await send({'type': 'http.response.body', 'body': b'safe'})
+        async def receive():
+            return {'type': 'http.request', 'body': b'', 'more_body': False}
+        async def send(message):
+            pass
+        from django_altimeter.asgi import instrument
+        observed = instrument(app)
+        async def requests():
+            for _ in range(3):
+                await observed(dict(SCOPE), receive, send)
+        asyncio.run(requests())
+        after_requests = lookups
+        stopped = shutdown()
+        print(json.dumps({'after_setup': after_setup, 'after_requests': after_requests,
+                         'completed': stopped.completed}))
+        """,
+    )
+    assert len(_spans(otlp_receiver)) == 3
+    assert _metric_count(otlp_receiver, "altimeter.http.server.requests") == 3
+    assert result == {"after_setup": 1, "after_requests": 1, "completed": True}
+
+
+@pytest.mark.parametrize("sample_rate", [0.0, 1.0])
+def test_nonrecording_request_spans_do_not_build_final_attributes(
+    otlp_receiver, sample_rate
+):
+    result = _run(
+        otlp_receiver,
+        """
+        from opentelemetry.trace import NonRecordingSpan
+        original = NonRecordingSpan.set_attributes
+        enrichments = 0
+        def counted(self, attributes):
+            global enrichments
+            enrichments += 1
+            return original(self, attributes)
+        NonRecordingSpan.set_attributes = counted
+        configure(sample_rate=SAMPLE_RATE)
+        async def app(scope, receive, send):
+            await send({'type': 'http.response.start', 'status': 200, 'headers': []})
+            await send({'type': 'http.response.body', 'body': b'safe'})
+        async def receive():
+            return {'type': 'http.request', 'body': b'', 'more_body': False}
+        async def send(message):
+            pass
+        from django_altimeter.asgi import instrument
+        observed = instrument(app)
+        asyncio.run(observed(dict(SCOPE), receive, send))
+        stopped = shutdown()
+        print(json.dumps({'enrichments': enrichments, 'completed': stopped.completed}))
+        """.replace("SAMPLE_RATE", str(sample_rate)),
+    )
+    assert result == {"enrichments": 0, "completed": True}
+    assert len(_spans(otlp_receiver)) == int(sample_rate)
+    assert _metric_count(otlp_receiver, "altimeter.http.server.requests") == 1
+
+
+def test_owned_runtime_prepares_header_policy_once(otlp_receiver):
+    result = _run(
+        otlp_receiver,
+        """
+        import django_altimeter.headers as header_policy
+        original = header_policy.prepare_response_header_policy
+        preparations = 0
+        def counted(origins):
+            global preparations
+            preparations += 1
+            return original(origins)
+        header_policy.prepare_response_header_policy = counted
+        configure(frontend_origins=frozenset({'https://frontend.invalid'}))
+        after_setup = preparations
+        starts = []
+        async def app(scope, receive, send):
+            await send({'type': 'http.response.start', 'status': 200,
+                        'headers': [(b'cache-control', b'private'),
+                                    (b'vary', b'Accept')]})
+            await send({'type': 'http.response.body', 'body': b'safe'})
+        async def receive():
+            return {'type': 'http.request', 'body': b'', 'more_body': False}
+        async def send(message):
+            if message['type'] == 'http.response.start':
+                starts.append({k.decode(): v.decode() for k, v in message['headers']})
+        from django_altimeter.asgi import instrument
+        observed = instrument(app)
+        async def requests():
+            for origin in (b'https://frontend.invalid', b'https://untrusted.invalid',
+                           b'https://frontend.invalid'):
+                scope = dict(SCOPE, headers=[(b'origin', origin)])
+                await observed(scope, receive, send)
+        asyncio.run(requests())
+        stopped = shutdown()
+        print(json.dumps({'after_setup': after_setup, 'after_requests': preparations,
+                         'completed': stopped.completed, 'headers': starts}))
+        """,
+    )
+    assert result["completed"] is True
+    assert len(_spans(otlp_receiver)) == 3
+    assert _metric_count(otlp_receiver, "altimeter.http.server.requests") == 3
+    headers = result["headers"]
+    assert [h.get("timing-allow-origin") for h in headers] == [
+        "https://frontend.invalid",
+        None,
+        "https://frontend.invalid",
+    ]
+    assert all(h["vary"] == "Accept, Origin" for h in headers)
+    assert len({h["x-altimeter-trace-id"] for h in headers}) == 3
+    assert all(h["x-altimeter-trace-sampled"] == "1" for h in headers)
+    assert result["after_setup"] == result["after_requests"] == 1

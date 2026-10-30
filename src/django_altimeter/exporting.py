@@ -633,6 +633,17 @@ def _read_response(response: requests.Response, ceiling: int, deadline: float) -
             timer.join()
 
 
+@dataclass(frozen=True)
+class _ProjectedBatch:
+    source: bytes
+    payload: bytes
+    count: int
+    dropped: int
+    signal: Signal
+    policy: PrivacyPolicy
+    limits: PrivacyLimits
+
+
 class SanitizingSession(requests.Session):
     """One signal and endpoint, projected bytes, bounded truthful OTLP responses.
 
@@ -677,6 +688,11 @@ class SanitizingSession(requests.Session):
         # each factory clears completed frames after its one native export call.
         self._failures: ContextVar[tuple[ReferenceType[Exception], ...]] = ContextVar(
             "altimeter_export_failures", default=()
+        )
+        # None outside a native export; an active invocation holds zero or one
+        # successful immutable projection. Contexts isolate concurrent exports.
+        self._projection_scope: ContextVar[tuple[_ProjectedBatch, ...] | None] = (
+            ContextVar("altimeter_export_projection", default=None)
         )
 
     @property
@@ -734,6 +750,39 @@ class SanitizingSession(requests.Session):
             _DIAGNOSTIC_LOGGER.warning("%s %s", code, self.signal)
         except Exception:
             pass  # Diagnostic/logging failure must not change export behavior.
+
+    def _project_for_attempt(self, data: bytes) -> tuple[bytes, int, int]:
+        signal, policy, limits = self.signal, self.policy, self.limits
+        scope = self._projection_scope.get()
+        if scope:
+            cached = scope[0]
+            if (
+                cached.signal == signal
+                and cached.policy is policy
+                and cached.limits is limits
+                and cached.source == data
+            ):
+                return cached.payload, cached.count, cached.dropped
+        if scope is not None:
+            # A different batch replaces the only entry. Failed projections
+            # leave no retained input or output and can never become a hit.
+            self._projection_scope.set(())
+        projected, count, dropped = self._project(data)
+        if scope is not None:
+            self._projection_scope.set(
+                (
+                    _ProjectedBatch(
+                        data,
+                        projected,
+                        count,
+                        dropped,
+                        signal,
+                        policy,
+                        limits,
+                    ),
+                )
+            )
+        return projected, count, dropped
 
     def _project(self, data: bytes) -> tuple[bytes, int, int]:
         source: Message
@@ -862,7 +911,7 @@ class SanitizingSession(requests.Session):
                 raise ExportProtocolError("export.request")
             if len(data) > self.limits.max_batch_bytes:
                 raise ExportProtocolError("export.batch_size")
-            projected, count, dropped = self._project(data)
+            projected, count, dropped = self._project_for_attempt(data)
             self._outcome = ExportOutcome(local_dropped_records=dropped)
             headers["Accept-Encoding"] = "identity"
 
@@ -942,9 +991,11 @@ def create_span_exporter(
             caller_exception = exception()
             session._outcome = ExportOutcome()
             failures_token = session._failures.set(())
+            projection_token = session._projection_scope.set(())
             try:
                 return super().export(spans)
             finally:
+                session._projection_scope.reset(projection_token)
                 session._clear_failure_frames(caller_exception)
                 session._failures.reset(failures_token)
                 session._export_completed()
@@ -978,9 +1029,11 @@ def create_log_exporter(
             caller_exception = exception()
             session._outcome = ExportOutcome()
             failures_token = session._failures.set(())
+            projection_token = session._projection_scope.set(())
             try:
                 return super().export(batch)
             finally:
+                session._projection_scope.reset(projection_token)
                 session._clear_failure_frames(caller_exception)
                 session._failures.reset(failures_token)
                 session._export_completed()
@@ -1070,6 +1123,7 @@ def create_metric_exporter(
                 return MetricExportResult.FAILURE
             token = session._deadline.set(deadline)
             failures_token = session._failures.set(())
+            projection_token = session._projection_scope.set(())
             original = self._native_timeout()
             supported = self._timeout_supported and original is not None
             patched = False
@@ -1094,6 +1148,7 @@ def create_metric_exporter(
                     session._outcome = replace(
                         session._outcome, code="metrics.timeout_unsupported"
                     )
+                session._projection_scope.reset(projection_token)
                 session._clear_failure_frames(caller_exception)
                 session._failures.reset(failures_token)
                 session._deadline.reset(token)

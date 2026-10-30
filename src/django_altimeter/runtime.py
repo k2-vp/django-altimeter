@@ -37,6 +37,7 @@ if TYPE_CHECKING:
 
     from django_altimeter.conf import SignalConfig
     from django_altimeter.exporting import SanitizingSession
+    from django_altimeter.headers import ResponseHeaderPolicy
     from django_altimeter.metrics import RequestMetrics
 
 
@@ -113,9 +114,11 @@ class ProcessRuntime:
         self.pid = os.getpid()
         self.instance_id = str(uuid4())
         self.tracer_provider: trace.TracerProvider = NoOpTracerProvider()
+        self.tracer: trace.Tracer = trace.NoOpTracer()
         self.logger_provider: APILoggerProvider = NoOpLoggerProvider()
         self.meter_provider: metrics.MeterProvider = NoOpMeterProvider()
         self.request_metrics: RequestMetrics | None = None
+        self.response_header_policy: ResponseHeaderPolicy | None = None
         self._trace_provider: TracerProvider | None = None
         self._log_provider: LoggerProvider | None = None
         self._metric_provider: MeterProvider | None = None
@@ -185,6 +188,7 @@ class ProcessRuntime:
         if trace.get_tracer_provider() is not provider:
             raise RuntimeError("setup.traces_race")
         self.tracer_provider = provider
+        self.tracer = provider.get_tracer("django_altimeter")
 
     def _install_logs(self) -> None:
         from opentelemetry._logs import get_logger_provider, set_logger_provider
@@ -334,8 +338,12 @@ class ProcessRuntime:
             self.result = SetupResult(codes=("setup.semconv_conflict",))
             return self.result
         _otel_compat.prepare_fork_support()
+        from django_altimeter.headers import prepare_response_header_policy
         from django_altimeter.metrics import request_metric_policy
 
+        self.response_header_policy = prepare_response_header_policy(
+            self.config.frontend_origins
+        )
         request_policy = request_metric_policy(self.config.policy)
         self._policy = replace(
             request_policy,

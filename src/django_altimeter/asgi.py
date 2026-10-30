@@ -60,6 +60,8 @@ def _finish_span(
     failed: bool,
 ) -> None:
     try:
+        if not span.is_recording():
+            return
         attributes: dict[str, str | int | float] = {
             "altimeter.http.outcome": outcome,
             "altimeter.response_mode": state.response_mode,
@@ -174,9 +176,7 @@ class _InstrumentedASGI:
                 trust_remote_parent=runtime.config.trust_remote_parent,
             )
             if owned_tracing:
-                span = runtime.tracer_provider.get_tracer(
-                    "django_altimeter"
-                ).start_span(
+                span = runtime.tracer.start_span(
                     state.method if state.method != "_OTHER" else "HTTP",
                     context=parent,
                     kind=SpanKind.SERVER,
@@ -234,7 +234,7 @@ class _InstrumentedASGI:
                         "headers": response_headers(
                             message.get("headers", []),
                             request_headers=scope.get("headers", []),
-                            frontend_origins=runtime.config.frontend_origins,
+                            policy=runtime.response_header_policy,
                             correlation=correlation,
                             owned_tracing=owned_tracing,
                         ),

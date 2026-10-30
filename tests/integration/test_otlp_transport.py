@@ -1142,3 +1142,294 @@ def test_truncated_declared_body_never_counts_as_acceptance(
         assert session.outcome.accepted_records == 1
     finally:
         exporter.shutdown()
+
+
+class _CountingProjectionSession(SanitizingSession):
+    """Observe actual projection work without replacing transport or projection."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.projection_calls = 0
+
+    def _project(self, data):
+        self.projection_calls += 1
+        return super()._project(data)
+
+
+def _counted_exporter(signal, receiver, **session_options):
+    session = _CountingProjectionSession(
+        signal, receiver.url(signal), policy=POLICY, **session_options
+    )
+    factory = {
+        "traces": create_span_exporter,
+        "logs": create_log_exporter,
+        "metrics": create_metric_exporter,
+    }[signal]
+    return factory(session, timeout=2), session
+
+
+def _assert_projection_released(session):
+    scope = getattr(session, "_projection_scope", None)
+    assert scope is None or scope.get() is None
+
+
+@pytest.mark.parametrize("signal", SIGNALS)
+def test_retry_projection_is_once_per_native_export_and_preserves_metadata(
+    signal, otlp_receiver
+):
+    exporter, session = _counted_exporter(signal, otlp_receiver)
+    payload = _mixed_payload(signal)
+    try:
+        assert exporter.export(payload).name == "SUCCESS"
+        assert session.outcome.accepted_records == 1
+        assert session.outcome.local_dropped_records == 1
+        assert session.projection_calls == 1
+        _assert_projection_released(session)
+        for _ in range(6):
+            otlp_receiver.queue_response(status=503, headers={"Retry-After": "0"})
+        assert exporter.export(payload).name == "FAILURE"
+        assert len(otlp_receiver.requests) == 7
+        assert session.outcome.code == "export.http_error"
+        assert session.outcome.local_dropped_records == 1
+        assert session.outcome.accepted_records == session.outcome.rejected_records == 0
+        assert session.projection_calls == 2
+        _assert_projection_released(session)
+        assert exporter.export(payload).name == "SUCCESS"
+        assert session.projection_calls == 3
+        assert session.outcome.accepted_records == 1
+        assert session.outcome.local_dropped_records == 1
+        _assert_projection_released(session)
+        wire = [r.message.SerializeToString() for r in otlp_receiver.requests]
+        assert len(wire) == 8 and len(set(wire)) == 1
+        assert all(CANARY.encode() not in body for body in wire)
+        assert all(
+            len(_records(r.message, signal)) == 1 for r in otlp_receiver.requests
+        )
+    finally:
+        exporter.shutdown()
+    _assert_projection_released(session)
+
+
+def test_retry_projection_replaces_single_entry_for_changed_native_metric_batches(
+    otlp_receiver,
+):
+    from dataclasses import replace
+
+    from django_altimeter.privacy import DEFAULT_LIMITS
+
+    payload = _payload("metrics")
+    group = payload.resource_metrics[0]
+    scope = group.scope_metrics[0]
+    metric = scope.metrics[0]
+    first = metric.data.data_points[0]
+    points = (first, replace(first, value=8), first)
+    metric = replace(metric, data=replace(metric.data, data_points=points))
+    payload = replace(
+        payload,
+        resource_metrics=(
+            replace(group, scope_metrics=(replace(scope, metrics=(metric,)),)),
+        ),
+    )
+    exporter, session = _counted_exporter(
+        "metrics", otlp_receiver, limits=replace(DEFAULT_LIMITS, max_batch_size=1)
+    )
+    for _ in range(3):
+        otlp_receiver.queue_response(status=503, headers={"Retry-After": "0"})
+        otlp_receiver.queue_response()
+    try:
+        assert exporter.export(payload).name == "SUCCESS"
+        assert session.projection_calls == 3
+        assert session.outcome.accepted_records == 1
+        assert session.outcome.local_dropped_records == 0
+        assert len(otlp_receiver.requests) == 6
+        records = [_records(r.message, "metrics") for r in otlp_receiver.requests]
+        assert all(len(batch) == 1 for batch in records)
+        assert [batch[0].as_int for batch in records] == [7, 7, 8, 8, 7, 7]
+        assert all(
+            CANARY.encode() not in r.message.SerializeToString()
+            for r in otlp_receiver.requests
+        )
+        _assert_projection_released(session)
+    finally:
+        exporter.shutdown()
+
+
+@pytest.mark.parametrize("signal", SIGNALS)
+def test_retry_projection_never_retains_failed_projection(signal, otlp_receiver):
+    from dataclasses import replace
+
+    payload = _mixed_payload(signal)
+    if signal == "metrics":
+        group = payload.resource_metrics[0]
+        scope = group.scope_metrics[0]
+        metric = scope.metrics[0]
+        metric = replace(
+            metric, data=replace(metric.data, data_points=metric.data.data_points[1:])
+        )
+        payload = replace(
+            payload,
+            resource_metrics=(
+                replace(group, scope_metrics=(replace(scope, metrics=(metric,)),)),
+            ),
+        )
+    else:
+        payload = payload[1:]
+    exporter, session = _counted_exporter(signal, otlp_receiver)
+    try:
+        for expected in (1, 2):
+            assert exporter.export(payload).name == "FAILURE"
+            assert session.outcome.code == "export.empty"
+            assert session.outcome.local_dropped_records == 1
+            assert session.projection_calls == expected
+            assert not otlp_receiver.requests
+            _assert_projection_released(session)
+        assert exporter.export(_payload(signal)).name == "SUCCESS"
+        assert session.projection_calls == 3
+        assert session.outcome.accepted_records == 1
+        assert len(otlp_receiver.requests) == 1
+        _assert_projection_released(session)
+    finally:
+        exporter.shutdown()
+
+
+@pytest.mark.parametrize("signal", SIGNALS)
+def test_retry_projection_scope_does_not_outlive_native_interruption(
+    signal, otlp_receiver
+):
+    interruption = KeyboardInterrupt()
+
+    class InterruptedSession(_CountingProjectionSession):
+        def _response(self, *args):
+            result = super()._response(*args)
+            if self.projection_calls == 1:
+                raise interruption
+            return result
+
+    session = InterruptedSession(signal, otlp_receiver.url(signal), policy=POLICY)
+    factory = {
+        "traces": create_span_exporter,
+        "logs": create_log_exporter,
+        "metrics": create_metric_exporter,
+    }[signal]
+    exporter = factory(session, timeout=2)
+    payload = _payload(signal)
+    try:
+        with pytest.raises(KeyboardInterrupt) as caught:
+            exporter.export(payload)
+        assert caught.value is interruption
+        assert len(otlp_receiver.requests) == 1
+        _assert_projection_released(session)
+        assert exporter.export(payload).name == "SUCCESS"
+        assert session.projection_calls == 2
+        assert len(otlp_receiver.requests) == 2
+        _assert_projection_released(session)
+    finally:
+        exporter.shutdown()
+
+
+@pytest.mark.parametrize("signal", SIGNALS)
+@pytest.mark.parametrize("changed", ["policy", "limits"])
+def test_retry_projection_does_not_reuse_under_changed_policy_or_limits(
+    signal, changed, otlp_receiver
+):
+    from dataclasses import replace
+
+    class ChangedSession(_CountingProjectionSession):
+        def _response(self, *args):
+            response = super()._response(*args)
+            if response.status_code == 503:
+                if changed == "policy":
+                    self.policy = replace(
+                        self.policy,
+                        attribute_values=self.policy.attribute_values
+                        - {("http.route", "/boards/{board_id}")},
+                    )
+                else:
+                    self.limits = replace(self.limits, max_attributes=2)
+            return response
+
+    session = ChangedSession(signal, otlp_receiver.url(signal), policy=POLICY)
+    factory = {
+        "traces": create_span_exporter,
+        "logs": create_log_exporter,
+        "metrics": create_metric_exporter,
+    }[signal]
+    exporter = factory(session, timeout=2)
+    otlp_receiver.queue_response(status=503, headers={"Retry-After": "0"})
+    try:
+        result = exporter.export(_mixed_payload(signal))
+        assert session.projection_calls == 2
+        _assert_projection_released(session)
+        assert any(
+            a.key == "http.route"
+            for a in _records(otlp_receiver.requests[0].message, signal)[0].attributes
+        )
+        if changed == "policy":
+            assert result.name == "SUCCESS"
+            assert len(otlp_receiver.requests) == 2
+            attributes = _records(otlp_receiver.requests[1].message, signal)[
+                0
+            ].attributes
+            assert all(a.key != "http.route" for a in attributes)
+            assert any(a.key == "http.response.status_code" for a in attributes)
+            assert session.outcome.accepted_records == 1
+            assert session.outcome.local_dropped_records == 1
+        else:
+            assert result.name == "FAILURE"
+            assert len(otlp_receiver.requests) == 1
+            assert session.outcome.code == "export.empty"
+            assert session.outcome.local_dropped_records == 2
+            assert session.outcome.accepted_records == 0
+    finally:
+        exporter.shutdown()
+
+
+@pytest.mark.parametrize("signal", SIGNALS)
+@pytest.mark.parametrize(
+    "changed,code",
+    [
+        ("endpoint", "export.destination"),
+        ("content_type", "export.content_type"),
+        ("encoding", "export.encoding"),
+        ("input_limit", "export.batch_size"),
+    ],
+)
+def test_retry_projection_hit_still_checks_request_boundary(
+    signal, changed, code, otlp_receiver
+):
+    from dataclasses import replace
+
+    class ChangedRequestSession(_CountingProjectionSession):
+        def request(self, method, url, *args, **kwargs):
+            if self.projection_calls:
+                if changed == "endpoint":
+                    self.endpoint += "/forbidden"
+                elif changed == "input_limit":
+                    self.limits = replace(self.limits, max_batch_bytes=1)
+                else:
+                    headers = dict(kwargs["headers"])
+                    if changed == "content_type":
+                        headers["Content-Type"] = "application/json"
+                    else:
+                        headers["Content-Encoding"] = "gzip"
+                    kwargs["headers"] = headers
+            return super().request(method, url, *args, **kwargs)
+
+    session = ChangedRequestSession(signal, otlp_receiver.url(signal), policy=POLICY)
+    factory = {
+        "traces": create_span_exporter,
+        "logs": create_log_exporter,
+        "metrics": create_metric_exporter,
+    }[signal]
+    exporter = factory(session, timeout=2)
+    otlp_receiver.queue_response(status=503, headers={"Retry-After": "0"})
+    try:
+        assert exporter.export(_payload(signal)).name == "FAILURE"
+        assert session.outcome.code == code
+        assert session.outcome.accepted_records == 0
+        assert session.projection_calls == 1
+        assert len(otlp_receiver.requests) == 1
+        assert len(_records(otlp_receiver.requests[0].message, signal)) == 1
+        _assert_projection_released(session)
+    finally:
+        exporter.shutdown()

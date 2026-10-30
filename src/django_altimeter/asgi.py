@@ -20,7 +20,11 @@ from opentelemetry.trace import Span, SpanKind, Status, StatusCode
 from django_altimeter.context import Correlation
 from django_altimeter.headers import incoming_context, response_headers, response_mode
 from django_altimeter.http import RequestState, request_state
-from django_altimeter.runtime import get_owned_trace_runtime, get_process_runtime
+from django_altimeter.runtime import (
+    _owns_trace_provider,
+    get_owned_trace_runtime,
+    get_process_runtime,
+)
 
 type Scope = dict[str, Any]
 type Message = dict[str, Any]
@@ -33,6 +37,9 @@ _METHODS = frozenset(
 )
 _STATE_KEY = "django_altimeter.request_state"
 _MISSING = object()
+# OTel Context is immutable; each attached span receives a separate derived context.
+_EMPTY_CONTEXT = context.Context()
+_ERROR_STATUS = Status(StatusCode.ERROR)
 
 
 def _diagnostic(code: str) -> None:
@@ -68,19 +75,17 @@ def _finish_span(
         }
         if state.route is not None:
             attributes["http.route"] = state.route
-        if state.status is not None:
-            attributes["http.response.status_code"] = state.status
-        if state.response_ready_at is not None:
+        status = state.status
+        if status is not None:
+            attributes["http.response.status_code"] = status
+        ready_at = state.response_ready_at
+        if ready_at is not None:
             attributes["altimeter.http.response_ready.duration"] = max(
-                0.0, min(duration, state.response_ready_at - state.started_at)
+                0.0, min(duration, ready_at - state.started_at)
             )
         span.set_attributes(attributes)
-        if (
-            failed
-            or outcome == "aborted"
-            or (state.status is not None and state.status >= 500)
-        ):
-            span.set_status(Status(StatusCode.ERROR))
+        if failed or outcome == "aborted" or (status is not None and status >= 500):
+            span.set_status(_ERROR_STATUS)
         if failed and outcome == "completed":
             # Preserve the HTTP completion and expose later application failure
             # without reading the exception or retaining its traceback/locals.
@@ -105,13 +110,13 @@ class _InstrumentedASGI:
         self._lock = Lock()
         self._active = 0
 
-    def _enter(self) -> int:
+    def _enter(self, pid: int) -> int:
         # A wrapper can be constructed before a serving child starts. An
         # inherited initialized runtime never reaches this counter.
-        if self._pid != os.getpid():
+        if self._pid != pid:
             self._lock = Lock()
             self._active = 0
-            self._pid = os.getpid()
+            self._pid = pid
         with self._lock:
             self._active += 1
             return self._active
@@ -126,7 +131,7 @@ class _InstrumentedASGI:
             return
         try:
             runtime = get_process_runtime()
-            owned_tracing = runtime is not None and get_owned_trace_runtime() is runtime
+            owned_tracing = runtime is not None and _owns_trace_provider(runtime)
             owned_metrics = (
                 runtime is not None
                 and "metrics" in runtime.result.enabled_signals
@@ -140,11 +145,13 @@ class _InstrumentedASGI:
             await self.application(scope, receive, send)
             return
 
+        config = runtime.config
         path = scope.get("path")
         if (
-            type(path) is str
-            and len(path) <= runtime.config.limits.max_string_bytes
-            and path in runtime.config.excluded_routes
+            config.excluded_routes
+            and type(path) is str
+            and len(path) <= config.limits.max_string_bytes
+            and path in config.excluded_routes
         ):
             await self.application(scope, receive, send)
             return
@@ -152,10 +159,10 @@ class _InstrumentedASGI:
         started_at = monotonic()
         start_time = time_ns()
         state = RequestState(
-            started_at, _method(scope.get("method")), self.surface, runtime.config
+            started_at, _method(scope.get("method")), self.surface, config
         )
         span: Span = trace.INVALID_SPAN
-        parent = context.Context()
+        parent = _EMPTY_CONTEXT
         state_token: Token[RequestState | None] | None = None
         trace_token: Token[context.Context] | None = None
         previous_state = scope.get(_STATE_KEY, _MISSING)
@@ -166,15 +173,16 @@ class _InstrumentedASGI:
         failed = False
         try:
             if owned_tracing:
-                state.concurrent_at_start = self._enter()
+                state.concurrent_at_start = self._enter(runtime.pid)
                 counted = True
             state_token = request_state.set(state)
             scope[_STATE_KEY] = state
-            parent = incoming_context(
-                scope.get("headers", []),
-                trusted_ingress=self.trusted_ingress,
-                trust_remote_parent=runtime.config.trust_remote_parent,
-            )
+            if self.trusted_ingress and config.trust_remote_parent:
+                parent = incoming_context(
+                    scope.get("headers", ()),
+                    trusted_ingress=True,
+                    trust_remote_parent=True,
+                )
             if owned_tracing:
                 span = runtime.tracer.start_span(
                     state.method if state.method != "_OTHER" else "HTTP",
@@ -233,7 +241,7 @@ class _InstrumentedASGI:
                         **message,
                         "headers": response_headers(
                             message.get("headers", []),
-                            request_headers=scope.get("headers", []),
+                            request_headers=scope.get("headers", ()),
                             policy=runtime.response_header_policy,
                             correlation=correlation,
                             owned_tracing=owned_tracing,

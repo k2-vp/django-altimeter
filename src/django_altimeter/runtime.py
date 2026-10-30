@@ -146,7 +146,13 @@ class ProcessRuntime:
     def _install_traces(self) -> None:
         from opentelemetry.sdk.resources import Resource
         from opentelemetry.sdk.trace import TracerProvider
-        from opentelemetry.sdk.trace.sampling import ParentBased, TraceIdRatioBased
+        from opentelemetry.sdk.trace.sampling import (
+            ALWAYS_OFF,
+            ALWAYS_ON,
+            ParentBased,
+            Sampler,
+            TraceIdRatioBased,
+        )
 
         from django_altimeter.exporting import (
             BoundedSpanProcessor,
@@ -154,7 +160,14 @@ class ProcessRuntime:
             native_span_limits,
         )
 
-        root = TraceIdRatioBased(self.config.sample_rate)
+        rate = self.config.sample_rate
+        root: Sampler
+        if rate == 1:
+            root = ALWAYS_ON
+        elif rate == 0:
+            root = ALWAYS_OFF
+        else:
+            root = TraceIdRatioBased(rate)
         sampler = (
             ParentBased(root)
             if self.config.trust_remote_parent
@@ -583,20 +596,20 @@ def shutdown(*, timeout: float = 2.0) -> ShutdownResult:
         return ShutdownResult(False, ("shutdown.failed",))
 
 
+def _owns_trace_provider(runtime: ProcessRuntime) -> bool:
+    """Check provider ownership after get_process_runtime validates the lifetime."""
+    return (
+        "traces" in runtime.result.enabled_signals
+        and trace.get_tracer_provider() is runtime.tracer_provider
+    )
+
+
 def get_owned_trace_runtime() -> ProcessRuntime | None:
-    runtime = _runtime
-    if (
-        runtime is None
-        or runtime.pid != os.getpid()
-        or not runtime._initialized.is_set()
-        or runtime._shutdown_deadline is not None
-        or "traces" not in runtime.result.enabled_signals
-    ):
-        return None
+    runtime = get_process_runtime()
     try:
-        if trace.get_tracer_provider() is runtime.tracer_provider:
-            return runtime
-        return None
+        return (
+            runtime if runtime is not None and _owns_trace_provider(runtime) else None
+        )
     except Exception:
         return None
 

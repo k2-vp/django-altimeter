@@ -1328,3 +1328,117 @@ def test_owned_runtime_prepares_header_policy_once(otlp_receiver):
     assert len({h["x-altimeter-trace-id"] for h in headers}) == 3
     assert all(h["x-altimeter-trace-sampled"] == "1" for h in headers)
     assert result["after_setup"] == result["after_requests"] == 1
+
+
+def test_real_uvicorn_server_span_has_complete_bounded_attributes(
+    otlp_receiver: OTLPReceiver, asgi_wheel, tmp_path
+) -> None:
+    from support.uvicorn_server import running_server
+
+    cases = (
+        ("/api/items/7?CANARY_QUERY=secret", 200, "api/items/<item_id>"),
+        ("/api/rejected", 403, None),
+        ("/api/error", 500, "api/error"),
+        ("/CANARY_UNMATCHED", 404, None),
+    )
+    with running_server(tmp_path, wheel=asgi_wheel, receiver=otlp_receiver) as server:
+        responses = []
+        for index, (path, _, _) in enumerate(cases, start=1):
+            responses.append(server.request(path))
+            # Receiving the body can precede the ASGI application's return.
+            # Observe its finalized span before starting the next request.
+            deadline = monotonic() + 5
+            while len(_spans(otlp_receiver)) < index and monotonic() < deadline:
+                sleep(0.005)
+            assert len(_spans(otlp_receiver)) == index
+    assert [response[0] for response in responses] == [case[1] for case in cases]
+    spans = _spans(otlp_receiver)
+    assert len(spans) == len(cases)
+    by_status = {_attributes(span)["http.response.status_code"]: span for span in spans}
+    for (_, status, route), (_, headers, _) in zip(cases, responses, strict=True):
+        span = by_status[status]
+        attributes = _attributes(span)
+        expected = {
+            "http.request.method": "GET",
+            "altimeter.surface": "django",
+            "altimeter.http.server.concurrent_at_start": 1,
+            "altimeter.http.outcome": "completed",
+            "altimeter.response_mode": "buffered",
+            "http.response.status_code": status,
+        }
+        if route is not None:
+            expected["http.route"] = route
+        ready = attributes.pop("altimeter.http.response_ready.duration")
+        duration = (span.end_time_unix_nano - span.start_time_unix_nano) / 1e9
+        assert type(ready) is float
+        assert 0 <= ready <= duration + 1e-9
+        assert attributes == expected
+        assert span.name == "GET"
+        assert span.kind == 2
+        assert span.status.code == (2 if status == 500 else 0)
+        assert not span.parent_span_id
+        assert not span.events and not span.links
+        assert span.dropped_attributes_count == 0
+        assert span.dropped_events_count == span.dropped_links_count == 0
+        if status in {200, 403}:
+            assert span.trace_id.hex() == headers["x-altimeter-trace-id"]
+            assert headers["x-altimeter-trace-sampled"] == "1"
+        else:
+            assert "x-altimeter-trace-id" not in headers
+            assert "x-altimeter-trace-sampled" not in headers
+    assert _metric_count(otlp_receiver, "altimeter.http.server.requests") == len(cases)
+    assert _metric_count(otlp_receiver, "http.server.request.duration") == len(cases)
+    for request in otlp_receiver.requests:
+        assert b"CANARY" not in request.message.SerializeToString()
+        assert b"reference-error-canary" not in request.message.SerializeToString()
+
+
+def test_native_start_hook_cannot_share_parent_context_between_requests(
+    otlp_receiver: OTLPReceiver,
+) -> None:
+    result = _run(
+        otlp_receiver,
+        """
+        from opentelemetry import context
+        from opentelemetry.sdk.trace import SpanProcessor
+        from django_altimeter.asgi import instrument
+        runtime = configure()
+        parents = []
+        mutation_blocked = []
+        application_values = []
+        class ParentObserver(SpanProcessor):
+            def on_start(self, span, parent_context=None):
+                parents.append(parent_context.get('CANARY_PARENT_CONTEXT'))
+                try:
+                    parent_context.update({'CANARY_PARENT_CONTEXT': len(parents)})
+                except ValueError:
+                    mutation_blocked.append(True)
+        runtime.tracer_provider.add_span_processor(ParentObserver())
+        async def app(scope, receive, send):
+            application_values.append(context.get_value('CANARY_PARENT_CONTEXT'))
+            await send({'type': 'http.response.start', 'status': 200, 'headers': []})
+            await send({'type': 'http.response.body', 'body': b'safe'})
+        async def receive():
+            return {'type': 'http.request', 'body': b''}
+        async def send(message):
+            pass
+        observed = instrument(app)
+        async def run():
+            for _ in range(2):
+                await observed(dict(SCOPE), receive, send)
+                assert context.get_value('CANARY_PARENT_CONTEXT') is None
+        asyncio.run(run())
+        assert shutdown().completed
+        print(json.dumps({'parents': parents, 'application': application_values,
+                          'mutation_blocked': mutation_blocked}))
+        """,
+    )
+    assert result == {
+        "parents": [None, None],
+        "application": [None, None],
+        "mutation_blocked": [True, True],
+    }
+    assert len(_spans(otlp_receiver)) == 2
+    assert _metric_count(otlp_receiver, "altimeter.http.server.requests") == 2
+    for request in otlp_receiver.requests:
+        assert b"CANARY" not in request.message.SerializeToString()

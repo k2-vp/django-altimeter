@@ -2,9 +2,12 @@
 
 import json
 import os
+import signal as process_signal
 import subprocess
 import sys
 import textwrap
+from pathlib import Path
+from time import monotonic, sleep
 
 import pytest
 from support.otlp_receiver import OTLPReceiver
@@ -671,3 +674,140 @@ def test_local_validation_uses_current_runtime_ownership_and_config(
     assert result["shutdown"] == {"completed": True, "codes": []}
     assert "CANARY" not in json.dumps(result)
     assert not otlp_receiver.requests
+
+
+def _interrupt_during_first_response(
+    receiver: OTLPReceiver,
+    command: list[str],
+    environment: dict[str, str],
+    interrupt: int,
+) -> tuple[subprocess.CompletedProcess[str], bool, float]:
+    receiver.queue_response(header_delay=1.0)
+    with subprocess.Popen(
+        command,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    ) as process:
+        try:
+            receiver.wait_for_requests(1, timeout=5)
+            started = monotonic()
+            process.send_signal(interrupt)
+            stdout, stderr = process.communicate(timeout=3)
+            elapsed = monotonic() - started
+            # The caller has been reaped; only an orphaned helper could retain
+            # this newly created process group. This works without /proc or ps.
+            try:
+                os.killpg(process.pid, 0)
+                helper_gone = False
+            except ProcessLookupError:
+                helper_gone = True
+            # Cross the delayed first response: a surviving helper could now
+            # send the queued log/metric probes after its caller has exited.
+            sleep(1.1)
+            return (
+                subprocess.CompletedProcess(
+                    command, process.returncode, stdout, stderr
+                ),
+                helper_gone,
+                elapsed,
+            )
+        finally:
+            # Also contain a broken implementation during the red/control run.
+            try:
+                os.killpg(process.pid, process_signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=3)
+
+
+def test_sigint_reaps_cli_helper_and_stops_exports_after_exit(
+    otlp_receiver: OTLPReceiver,
+) -> None:
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("ALTIMETER_", "OTEL_"))
+    }
+    environment.update(
+        PYTHONPATH=str(Path(__file__).resolve().parents[2] / "reference"),
+        DJANGO_SETTINGS_MODULE="altimeter_reference.settings",
+        ALTIMETER_ENABLED="true",
+        ALTIMETER_SERVICE_NAME="probe-test",
+        ALTIMETER_DEPLOYMENT_ENVIRONMENT="test",
+        ALTIMETER_RELEASE="v1",
+        ALTIMETER_EXPORT_TIMEOUT="2",
+    )
+    for name in ("TRACES", "LOGS", "METRICS"):
+        environment[f"ALTIMETER_{name}_COLLECTOR_ENDPOINT"] = otlp_receiver.url(
+            name.lower()
+        )
+    result, helper_gone, elapsed = _interrupt_during_first_response(
+        otlp_receiver,
+        [sys.executable, "-m", "django", "altimeter_check", "--probe", "--json"],
+        environment,
+        process_signal.SIGINT,
+    )
+    assert result.returncode == -process_signal.SIGINT, result.stdout + result.stderr
+    assert elapsed < 1.0
+    assert helper_gone, "probe helper survived its interrupted CLI parent"
+    assert len(otlp_receiver.requests) == 1
+    assert otlp_receiver.requests[0].path == "/v1/traces"
+
+
+@pytest.mark.parametrize("kind", ["keyboard", "system_exit", "custom"])
+@pytest.mark.parametrize("ignore_terminate", [False, True])
+def test_probe_reaps_helper_and_preserves_any_cancellation(
+    otlp_receiver: OTLPReceiver, kind: str, ignore_terminate: bool
+) -> None:
+    source = _IMPORTS + textwrap.dedent(
+        f"""
+        import signal
+        class Cancelled(BaseException):
+            pass
+        cancellation = {{'keyboard': KeyboardInterrupt('cancelled'),
+                        'system_exit': SystemExit(27),
+                        'custom': Cancelled('cancelled')}}[{kind!r}]
+        def cancel(signum, frame):
+            raise cancellation
+        signal.signal(signal.SIGUSR1, cancel)
+        if {ignore_terminate!r}:
+            # Ignored signal dispositions survive exec: exercise real kill
+            # escalation, with no replacement of Popen or the helper runtime.
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        try:
+            probe(configuration(export_timeout=2))
+        except BaseException as error:
+            try:
+                os.waitpid(-1, os.WNOHANG)
+                reaped = False
+            except ChildProcessError:
+                reaped = True
+            print(json.dumps({{'same_exception': error is cancellation,
+                               'reaped_before_reraise': reaped}}))
+        else:
+            raise AssertionError('cancellation was swallowed')
+        """
+    )
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("ALTIMETER_", "OTEL_"))
+    }
+    result, helper_gone, elapsed = _interrupt_during_first_response(
+        otlp_receiver,
+        [sys.executable, "-c", source],
+        {**environment, "TEST_ENDPOINT": otlp_receiver.endpoint},
+        process_signal.SIGUSR1,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout) == {
+        "same_exception": True,
+        "reaped_before_reraise": True,
+    }
+    assert elapsed < 1.0
+    assert helper_gone, "probe helper survived its cancelled caller"
+    assert len(otlp_receiver.requests) == 1
+    assert otlp_receiver.requests[0].path == "/v1/traces"

@@ -915,13 +915,26 @@ def probe(
             env=environment,
         ) as child:
             try:
-                output, _ = child.communicate(
-                    request, timeout=max(0, deadline - monotonic())
-                )
-            except subprocess.TimeoutExpired:
-                child.kill()
-                child.communicate()
-                return failure("probe.deadline")
+                try:
+                    output, _ = child.communicate(
+                        request, timeout=max(0, deadline - monotonic())
+                    )
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    child.communicate()
+                    return failure("probe.deadline")
+            except BaseException:
+                # Cancellation must stop the helper before its caller resumes
+                # or exits. Preserve the original interrupt after reaping.
+                try:
+                    child.terminate()
+                    child.wait(timeout=min(0.1, max(0, deadline - monotonic())))
+                except BaseException:
+                    # A second interrupt while waiting must still force exit.
+                    child.kill()
+                finally:
+                    child.wait()
+                raise
         if child.returncode != 0 or len(output) > _PROBE_OUTPUT_LIMIT:
             return failure("probe.failed")
         result = json.loads(output)

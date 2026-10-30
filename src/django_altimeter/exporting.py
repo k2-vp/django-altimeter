@@ -19,9 +19,12 @@ from io import BytesIO
 from math import isfinite
 from os import dup
 from socket import SHUT_RDWR, socket
+from sys import exception
 from threading import Lock, Timer
 from time import monotonic
+from traceback import clear_frames
 from typing import TYPE_CHECKING, Any, Literal, cast
+from weakref import ReferenceType, ref
 
 import requests
 from google.protobuf.message import Message
@@ -81,6 +84,7 @@ if TYPE_CHECKING:
         OTLPMetricExporter,
     )
     from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+    from opentelemetry.metrics import MeterProvider
     from opentelemetry.sdk._logs import (
         LogRecordLimits,
         LogRecordProcessor,
@@ -88,7 +92,11 @@ if TYPE_CHECKING:
         ReadWriteLogRecord,
     )
     from opentelemetry.sdk._logs.export import LogRecordExporter, LogRecordExportResult
-    from opentelemetry.sdk.metrics.export import MetricExportResult, MetricsData
+    from opentelemetry.sdk.metrics.export import (
+        AggregationTemporality,
+        MetricExportResult,
+        MetricsData,
+    )
 
 
 class _Rejected(ValueError):
@@ -357,6 +365,7 @@ class BoundedSpanProcessor(SpanProcessor):
         *,
         limits: PrivacyLimits = DEFAULT_LIMITS,
         schedule_delay_millis: float = 5000,
+        meter_provider: MeterProvider | None = None,
     ) -> None:
         _check_limits(limits)
         self._limits = limits
@@ -366,6 +375,7 @@ class BoundedSpanProcessor(SpanProcessor):
             max_queue_size=limits.max_queue_size,
             max_export_batch_size=limits.max_batch_size,
             schedule_delay_millis=schedule_delay_millis,
+            meter_provider=meter_provider,
         )
 
     def on_start(self, span: Span, parent_context: Context | None = None) -> None:
@@ -402,6 +412,7 @@ def bounded_log_processor(
     *,
     limits: PrivacyLimits = DEFAULT_LIMITS,
     schedule_delay_millis: float = 5000,
+    meter_provider: MeterProvider | None = None,
 ) -> LogRecordProcessor:
     """Construct native log admission explicitly, keeping module imports inert.
 
@@ -421,6 +432,7 @@ def bounded_log_processor(
                 max_queue_size=limits.max_queue_size,
                 max_export_batch_size=limits.max_batch_size,
                 schedule_delay_millis=schedule_delay_millis,
+                meter_provider=meter_provider,
             )
 
         def on_emit(self, log_record: ReadWriteLogRecord) -> None:
@@ -660,10 +672,50 @@ class SanitizingSession(requests.Session):
         self._deadline: ContextVar[float | None] = ContextVar(
             "altimeter_export_deadline", default=None
         )
+        # Native HTTP1.45.x returns exceptions whose traceback frames retain the
+        # completed serialized batch. Keep only weak references during export;
+        # each factory clears completed frames after its one native export call.
+        self._failures: ContextVar[tuple[ReferenceType[Exception], ...]] = ContextVar(
+            "altimeter_export_failures", default=()
+        )
 
     @property
     def outcome(self) -> ExportOutcome:
         return self._outcome
+
+    def _remember_failure(self, error: Exception) -> None:
+        try:
+            # The pinned native client makes <=6 retry iterations and at most
+            # two submissions each. No unbounded exception/traceback registry.
+            self._failures.set((*self._failures.get()[-15:], ref(error)))
+        except Exception:
+            self._outcome = replace(self._outcome, code="export.failed")
+
+    def _clear_failure_frames(self, caller_exception: BaseException | None) -> None:
+        failures = self._failures.get()
+        self._failures.set(())
+        try:
+            for failure in failures:
+                error: BaseException | None = failure()
+                # Native transport failures can chain through Requests/urllib3.
+                # The exception active at export entry predates all of them:
+                # never traverse or clear that caller-owned chain or its frames.
+                for _ in range(8):
+                    if error is None or error is caller_exception:
+                        break
+                    chained = error.__cause__ or error.__context__
+                    if error.__traceback__ is not None:
+                        clear_frames(error.__traceback__)
+                    error.__traceback__ = None
+                    error.__cause__ = None
+                    error.__context__ = None
+                    error = chained
+        except Exception:
+            self._outcome = replace(self._outcome, code="export.failed")
+
+    def _export_completed(self) -> None:
+        """Finish one native export, after its own retry loop has returned."""
+        self._emit_diagnostic()
 
     def _emit_diagnostic(self) -> None:
         # One fixed signal per session, and a closed code set bounds this map.
@@ -837,6 +889,7 @@ class SanitizingSession(requests.Session):
                 hooks={"response": response_hook},
             )
         except ExportProtocolError as error:
+            self._remember_failure(error)
             self._outcome = ExportOutcome(
                 str(error), local_dropped_records=self._outcome.local_dropped_records
             )
@@ -849,20 +902,26 @@ class SanitizingSession(requests.Session):
                     local_dropped_records=self._outcome.local_dropped_records,
                 )
                 self._emit_diagnostic()
-                raise ExportProtocolError("export.deadline") from None
+                failure = ExportProtocolError("export.deadline")
+                self._remember_failure(failure)
+                raise failure from None
             self._outcome = ExportOutcome(
                 "export.connection",
                 local_dropped_records=self._outcome.local_dropped_records,
             )
             self._emit_diagnostic()
-            raise requests.ConnectionError("export.connection") from None
+            connection_failure = requests.ConnectionError("export.connection")
+            self._remember_failure(connection_failure)
+            raise connection_failure from None
         except Exception:
             code = "export.deadline" if monotonic() >= deadline else "export.invalid"
             self._outcome = ExportOutcome(
                 code, local_dropped_records=self._outcome.local_dropped_records
             )
             self._emit_diagnostic()
-            raise ExportProtocolError(code) from None
+            failure = ExportProtocolError(code)
+            self._remember_failure(failure)
+            raise failure from None
 
 
 def create_span_exporter(
@@ -870,6 +929,7 @@ def create_span_exporter(
     *,
     timeout: float = 10.0,
     headers: Mapping[str, str] | None = None,
+    meter_provider: MeterProvider | None = None,
 ) -> OTLPSpanExporter:
     from opentelemetry.exporter.otlp.proto.http import Compression
     from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
@@ -879,10 +939,15 @@ def create_span_exporter(
 
     class _SanitizingSpanExporter(OTLPSpanExporter):
         def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
+            caller_exception = exception()
             session._outcome = ExportOutcome()
-            result = super().export(spans)
-            session._emit_diagnostic()
-            return result
+            failures_token = session._failures.set(())
+            try:
+                return super().export(spans)
+            finally:
+                session._clear_failure_frames(caller_exception)
+                session._failures.reset(failures_token)
+                session._export_completed()
 
     return _SanitizingSpanExporter(
         endpoint=session.endpoint,
@@ -891,6 +956,7 @@ def create_span_exporter(
         headers=headers,
         compression=Compression.NoCompression,
         max_request_size=session.limits.max_batch_bytes,
+        meter_provider=meter_provider,
     )
 
 
@@ -899,6 +965,7 @@ def create_log_exporter(
     *,
     timeout: float = 10.0,
     headers: Mapping[str, str] | None = None,
+    meter_provider: MeterProvider | None = None,
 ) -> OTLPLogExporter:
     from opentelemetry.exporter.otlp.proto.http import Compression
     from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
@@ -908,10 +975,15 @@ def create_log_exporter(
 
     class _SanitizingLogExporter(OTLPLogExporter):
         def export(self, batch: Sequence[ReadableLogRecord]) -> LogRecordExportResult:
+            caller_exception = exception()
             session._outcome = ExportOutcome()
-            result = super().export(batch)
-            session._emit_diagnostic()
-            return result
+            failures_token = session._failures.set(())
+            try:
+                return super().export(batch)
+            finally:
+                session._clear_failure_frames(caller_exception)
+                session._failures.reset(failures_token)
+                session._export_completed()
 
     return _SanitizingLogExporter(
         endpoint=session.endpoint,
@@ -920,6 +992,7 @@ def create_log_exporter(
         headers=headers,
         compression=Compression.NoCompression,
         max_request_size=session.limits.max_batch_bytes,
+        meter_provider=meter_provider,
     )
 
 
@@ -928,6 +1001,8 @@ def create_metric_exporter(
     *,
     timeout: float = 10.0,
     headers: Mapping[str, str] | None = None,
+    meter_provider: MeterProvider | None = None,
+    preferred_temporality: dict[type, AggregationTemporality] | None = None,
 ) -> OTLPMetricExporter:
     from opentelemetry.exporter.otlp.proto.http import Compression
     from opentelemetry.exporter.otlp.proto.http.metric_exporter import (
@@ -947,6 +1022,8 @@ def create_metric_exporter(
                 headers=headers,
                 compression=Compression.NoCompression,
                 max_request_size=session.limits.max_batch_bytes,
+                meter_provider=meter_provider,
+                preferred_temporality=preferred_temporality,
             )
             self._export_lock = Lock()
             self._timeout_supported = self._native_timeout() is not None
@@ -970,6 +1047,7 @@ def create_metric_exporter(
             timeout_millis: float | None = 10_000,
             **kwargs: Any,
         ) -> MetricExportResult:
+            caller_exception = exception()
             session._outcome = ExportOutcome()
             if (
                 timeout_millis is not None
@@ -990,6 +1068,7 @@ def create_metric_exporter(
                 session._emit_diagnostic()
                 return MetricExportResult.FAILURE
             token = session._deadline.set(deadline)
+            failures_token = session._failures.set(())
             original = self._native_timeout()
             supported = self._timeout_supported and original is not None
             patched = False
@@ -1014,8 +1093,10 @@ def create_metric_exporter(
                     session._outcome = replace(
                         session._outcome, code="metrics.timeout_unsupported"
                     )
+                session._clear_failure_frames(caller_exception)
+                session._failures.reset(failures_token)
                 session._deadline.reset(token)
                 self._export_lock.release()
-                session._emit_diagnostic()
+                session._export_completed()
 
     return _DeadlineMetricExporter()

@@ -45,4 +45,5 @@ PY
 # Only test configuration and tests accompany the installed wheel.
 COPY pyproject.toml /verify/
 COPY tests /verify/tests/
+COPY reference/altimeter_reference /verify/reference/altimeter_reference
 CMD ["python", "-m", "pytest", "tests/integration/test_wheel.py"]

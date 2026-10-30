@@ -71,4 +71,4 @@ ignore_missing_imports = true
 testpaths = ["tests"]
 pythonpath = ["tests"]
 addopts = "--strict-markers --strict-config"
-markers = ["integration: built-artifact or real-process integration checks"]
+markers = ["integration: built-artifact or real-process integration checks", "live: credential-gated live PostHog checks; skipped without credentials"]

@@ -1,7 +1,8 @@
 """Pure, bounded OTLP reconstruction. No SDK object mutation or runtime setup.
 
-String values are admitted by exact configured pairs, never by key spelling alone.
-The caller owns that static configuration; do not populate it from request data.
+Static string values are admitted by exact configured pairs. Opaque identity has
+a separate fixed rule on span/log records only. The caller owns the static
+configuration; do not populate it from request data.
 Projection is the final boundary, not a replacement for admission before batching
 or metric Views/cardinality admission before aggregation.
 """
@@ -144,6 +145,7 @@ _STRING_KEYS = frozenset(
         "error.type",
     }
 )
+_IDENTITY_KEYS = frozenset({"posthogDistinctId", "altimeter.tenant_id"})
 _STATUS_KEYS = frozenset({"http.response.status_code", "http.status_code"})
 _DURATION_KEYS = frozenset({"http.server.request.duration", "duration_ms"})
 _RECORD_KEYS = (
@@ -152,7 +154,7 @@ _RECORD_KEYS = (
     | _DURATION_KEYS
     | {"trace_id", "span_id", "altimeter.overflow"}
 )
-_RESOURCE_ATTRIBUTE_KEYS = _RESOURCE_KEYS | {"process.pid"}
+_RESOURCE_ATTRIBUTE_KEYS = _RESOURCE_KEYS | {"process.pid", "altimeter.probe"}
 _METRIC_KEYS = (
     (_STRING_KEYS - {"exception.type", "error.type"})
     | _STATUS_KEYS
@@ -197,6 +199,8 @@ def _allowed_attribute(
     if not _text(key, limits.max_key_bytes):
         return False
     if resource:
+        if key == "altimeter.probe":
+            return value is True
         if key == "process.pid":
             return type(value) is int and 0 < value <= 2**31 - 1
         return (
@@ -204,6 +208,8 @@ def _allowed_attribute(
             and _text(value, limits.max_string_bytes)
             and (key, value) in policy.attribute_values
         )
+    if key in _IDENTITY_KEYS:
+        return _text(value, min(200, limits.max_string_bytes)) and bool(value.strip())
     if key in _STATUS_KEYS:
         return type(value) is int and 100 <= value <= 599
     if key in _DURATION_KEYS:
@@ -288,6 +294,7 @@ def _attributes(
     *,
     resource: bool = False,
     metric: bool = False,
+    identity: bool = False,
 ) -> list[KeyValue]:
     maximum = limits.max_resource_attributes if resource else limits.max_attributes
     if len(source) > maximum:
@@ -297,6 +304,8 @@ def _attributes(
         if resource
         else _METRIC_KEYS
         if metric
+        else _RECORD_KEYS | _IDENTITY_KEYS
+        if identity
         else _RECORD_KEYS
     )
     result: list[KeyValue] = []
@@ -312,6 +321,8 @@ def _attributes(
         ):
             continue
         kind = item.value.WhichOneof("value")
+        if key == "altimeter.probe" and kind != "bool_value":
+            continue
         if kind not in {"string_value", "bool_value", "int_value", "double_value"}:
             continue  # Never descend into unapproved structured attributes.
         value = getattr(item.value, kind)
@@ -350,7 +361,7 @@ def _span(source: Span, policy: PrivacyPolicy, limits: PrivacyLimits) -> Span | 
         or not _text(source.name, limits.max_string_bytes)
     ):
         return None
-    attributes = _attributes(source.attributes, policy, limits)
+    attributes = _attributes(source.attributes, policy, limits, identity=True)
     name = normalize_span_name(source.name, policy=policy, limits=limits)
     if name == "SPAN" and any(
         _text(a.key, limits.max_key_bytes)
@@ -498,7 +509,7 @@ def _log(
         if source.severity_number in range(25)
         else SeverityNumber.SEVERITY_NUMBER_UNSPECIFIED,
         body=_body(source.body, policy, limits),
-        attributes=_attributes(source.attributes, policy, limits),
+        attributes=_attributes(source.attributes, policy, limits, identity=True),
         flags=source.flags & 1,
         trace_id=_id(source.trace_id, 16),
         span_id=_id(source.span_id, 8),

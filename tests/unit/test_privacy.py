@@ -1293,3 +1293,31 @@ def test_public_name_normalization_keeps_validating_each_call():
         )
         assert result == expected
         assert calls == 1
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_log_projection_preserves_empty_map_wire_presence_after_scrubbing(nested):
+    request = ExportLogsServiceRequest()
+    scope = request.resource_logs.add().scope_logs.add()
+    scope.scope.name = "django_altimeter"
+    record = scope.log_records.add()
+    body = record.body
+    if nested:
+        body = body.kvlist_value.values.add(key="context").value
+    body.kvlist_value.values.add(key="unknown").value.string_value = CANARY
+    scope.log_records.add(body=AnyValue(string_value="request.completed"))
+    before = request.SerializeToString(deterministic=True)
+
+    result = project_logs(request, policy=POLICY)
+    records = result.resource_logs[0].scope_logs[0].log_records
+    expected = AnyValue()
+    empty_map = expected
+    if nested:
+        empty_map = empty_map.kvlist_value.values.add(key="context").value
+    empty_map.kvlist_value.SetInParent()
+    assert records[0].body.SerializeToString(deterministic=True) == (
+        expected.SerializeToString(deterministic=True)
+    )
+    assert records[1].body.string_value == "request.completed"
+    assert CANARY.encode() not in result.SerializeToString()
+    assert request.SerializeToString(deterministic=True) == before

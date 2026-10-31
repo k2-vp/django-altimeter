@@ -57,6 +57,7 @@ services:
       dockerfile: reference/Dockerfile
       args:
         PYTHON_VERSION: "3.12"
+        WSGI_DEPENDENCIES: "1"
         DJANGO_VERSION: "5.2.18"
         # Locked transport versions of the supported WSGI deployment shape.
         REQUESTS_VERSION: "2.32.3"

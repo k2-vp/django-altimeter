@@ -25,7 +25,15 @@ class WheelEnvironment:
     sha256: str
 
 
-def install_wheel(workspace: Path, *, extras: tuple[str, ...] = ()) -> WheelEnvironment:
+def install_wheel(
+    workspace: Path,
+    *,
+    extras: tuple[str, ...] = (),
+    server_dependencies: tuple[str, ...] = (
+        "django-ninja==1.6.2",
+        "uvicorn==0.46.0",
+    ),
+) -> WheelEnvironment:
     workspace.mkdir(parents=True, exist_ok=True)
     wheels = list((ROOT / "dist").glob("django_altimeter-*.whl"))
     assert len(wheels) == 1, "Run uv build before the real-server tests"
@@ -41,8 +49,7 @@ def install_wheel(workspace: Path, *, extras: tuple[str, ...] = ()) -> WheelEnvi
             "install",
             "--disable-pip-version-check",
             f"{wheel}[{','.join(extras)}]" if extras else str(wheel),
-            "django-ninja==1.6.2",
-            "uvicorn==0.46.0",
+            *server_dependencies,
             *[
                 f"{name}=={importlib.metadata.version(name)}"
                 for name in (
@@ -129,9 +136,10 @@ class Server:
     port: int
     process: subprocess.Popen
     workspace: Path
+    name: str = "uvicorn"
 
-    def request(self, path: str, *, method="GET", headers=None):
-        connection = HTTPConnection("127.0.0.1", self.port, timeout=5)
+    def request(self, path: str, *, method="GET", headers=None, timeout=5):
+        connection = HTTPConnection("127.0.0.1", self.port, timeout=timeout)
         try:
             connection.request(method, path, headers=headers or {})
             response = connection.getresponse()
@@ -165,7 +173,7 @@ class Server:
                 os.killpg(self.process.pid, signal.SIGKILL)
                 self.process.wait(timeout=2)
                 raise AssertionError(
-                    f"uvicorn exceeded shutdown budget\n{self.output}"
+                    f"{self.name} exceeded shutdown budget\n{self.output}"
                 ) from None
         assert self.process.returncode in (0, -signal.SIGTERM), self.output
 

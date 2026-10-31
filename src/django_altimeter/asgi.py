@@ -15,11 +15,11 @@ from time import monotonic, time_ns
 from typing import Any
 
 from opentelemetry import context, metrics, trace
-from opentelemetry.trace import Span, SpanKind, Status, StatusCode
+from opentelemetry.trace import Span, SpanKind
 
 from django_altimeter.context import Correlation, _mark_owned_span, _reset_owned_span
 from django_altimeter.headers import incoming_context, response_headers, response_mode
-from django_altimeter.http import RequestState, request_state
+from django_altimeter.http import RequestState, finish_request, request_state
 from django_altimeter.runtime import (
     _owns_trace_provider,
     get_owned_trace_runtime,
@@ -39,7 +39,6 @@ _STATE_KEY = "django_altimeter.request_state"
 _MISSING = object()
 # OTel Context is immutable; each attached span receives a separate derived context.
 _EMPTY_CONTEXT = context.Context()
-_ERROR_STATUS = Status(StatusCode.ERROR)
 
 
 def _diagnostic(code: str) -> None:
@@ -55,48 +54,6 @@ def _method(value: object) -> str:
         if type(value) is str and len(value) <= 7 and value in _METHODS
         else "_OTHER"
     )
-
-
-def _finish_span(
-    span: Span,
-    state: RequestState,
-    *,
-    outcome: str,
-    duration: float,
-    end_time: int,
-    failed: bool,
-) -> None:
-    try:
-        if not span.is_recording():
-            return
-        attributes: dict[str, str | int | float] = {
-            "altimeter.http.outcome": outcome,
-            "altimeter.response_mode": state.response_mode,
-        }
-        if state.route is not None:
-            attributes["http.route"] = state.route
-        status = state.status
-        if status is not None:
-            attributes["http.response.status_code"] = status
-        ready_at = state.response_ready_at
-        if ready_at is not None:
-            attributes["altimeter.http.response_ready.duration"] = max(
-                0.0, min(duration, ready_at - state.started_at)
-            )
-        span.set_attributes(attributes)
-        if failed or outcome == "aborted" or (status is not None and status >= 500):
-            span.set_status(_ERROR_STATUS)
-        if failed and outcome == "completed":
-            # Preserve the HTTP completion and expose later application failure
-            # without reading the exception or retaining its traceback/locals.
-            span.add_event("exception", {"error.type": "after_response"})
-    except Exception:
-        _diagnostic("http.span_enrichment_failed")
-    finally:
-        try:
-            span.end(end_time=end_time)
-        except Exception:
-            _diagnostic("http.span_end_failed")
 
 
 class _InstrumentedASGI:
@@ -295,34 +252,19 @@ class _InstrumentedASGI:
             raise
         finally:
             try:
-                if not state.finalized:
-                    state.finalized = True
-                    finished_at = completed_at or aborted_at or monotonic()
-                    outcome = "completed" if completed_at is not None else "aborted"
-                    duration = max(0.0, finished_at - started_at)
-                    if not state.excluded and owned_metrics:
-                        try:
-                            recorder = runtime.request_metrics
-                            if recorder is not None:
-                                recorder.record(
-                                    duration,
-                                    surface=state.surface,
-                                    method=state.method,
-                                    route=state.route,
-                                    status=state.status,
-                                    outcome=outcome,
-                                    response_mode=state.response_mode,
-                                )
-                        except Exception:
-                            _diagnostic("http.metrics_failed")
-                    _finish_span(
-                        span,
-                        state,
-                        outcome=outcome,
-                        duration=duration,
-                        end_time=start_time + int(duration * 1_000_000_000),
-                        failed=failed,
-                    )
+                finished_at = completed_at or aborted_at or monotonic()
+                outcome = "completed" if completed_at is not None else "aborted"
+                duration = max(0.0, finished_at - started_at)
+                finish_request(
+                    span,
+                    state,
+                    runtime=runtime,
+                    owned_metrics=owned_metrics,
+                    outcome=outcome,
+                    duration=duration,
+                    end_time=start_time + int(duration * 1_000_000_000),
+                    failed=failed,
+                )
             finally:
                 _reset_owned_span(owned_span_token)
                 if counted:

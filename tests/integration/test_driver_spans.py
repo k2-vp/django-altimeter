@@ -712,6 +712,180 @@ def _assert_safe_wire(receiver):
     )
 
 
+@pytest.fixture(scope="module")
+def wsgi_driver_wheel(tmp_path_factory):
+    from support.gunicorn_server import install_wheel
+    from support.reference_work import WORK_EXTRAS
+
+    return install_wheel(
+        tmp_path_factory.mktemp("wsgi-driver-wheel"), extras=WORK_EXTRAS
+    )
+
+
+class TestWSGIDriverFlow:
+    @pytest.mark.parametrize("mode", ["enabled", "disabled", "invalid"])
+    def test_one_gthread_request_joins_database_clients_and_safe_log(
+        self, mode, wsgi_driver_wheel, tmp_path
+    ):
+        from support.gunicorn_server import running_server
+        from support.http_receiver import HTTPReceiver
+        from support.reference_work import isolated_services
+
+        with (
+            isolated_services() as services,
+            HTTPReceiver() as internal,
+            HTTPReceiver() as external,
+            OTLPReceiver() as receiver,
+        ):
+            internal.respond(body=b"internal-body-canary")
+            external.respond(body=b"external-body-canary")
+            environment = {
+                **services.environment(),
+                "DJANGO_SETTINGS_MODULE": "altimeter_reference.wsgi_settings",
+                "REFERENCE_INTERNAL_ORIGIN": internal.origin,
+                "REFERENCE_EXTERNAL_ORIGIN": external.origin,
+                "ALTIMETER_INTEGRATIONS": "wsgi,django,psycopg,requests,redis",
+                "ALTIMETER_LOGS_ENABLED": "true",
+                "ALTIMETER_LOGS_COLLECTOR_ENDPOINT": receiver.url("logs"),
+                "ALTIMETER_METRICS_ENABLED": "false",
+            }
+            if mode == "invalid":
+                environment["ALTIMETER_EXPORT_TIMEOUT"] = "-1"
+            with running_server(
+                tmp_path,
+                wheel=wsgi_driver_wheel,
+                receiver=receiver,
+                enabled=mode != "disabled",
+                extra_env=environment,
+                application=os.environ.get(
+                    "H2_WSGI_APPLICATION",
+                    "altimeter_reference.wsgi:application",
+                ),
+            ) as server:
+                status, _, body = server.request("/work/combined")
+                assert status == 200, body
+                result = json.loads(body)
+                assert result["database"] == "sql-value-canary"
+                assert result["redis"] == "redis-value-canary"
+                assert result["http"] == {
+                    "internal": "internal-body-canary",
+                    "external": "external-body-canary",
+                }
+                assert result["logs"]["logged"] and result["logs"]["log_count"] == 4
+            if mode == "enabled":
+                spans = _spans(receiver)
+                assert len(spans) == 8
+                (parent,) = [item for item in spans if item.kind == 2]
+                (query,) = [item for item in spans if item.name == "reference.query"]
+                (outgoing,) = [
+                    item for item in spans if item.name == "reference.outgoing"
+                ]
+                assert query.parent_span_id == outgoing.parent_span_id == parent.span_id
+                assert all(item.trace_id == parent.trace_id for item in spans)
+                clients = [item for item in spans if item.kind == 3]
+                assert len(clients) == 5
+                assert sorted(item.name for item in clients) == [
+                    "DB",
+                    "DB",
+                    "GET",
+                    "GET",
+                    "SELECT",
+                ]
+                assert sorted(
+                    _attributes(item)["db.operation.name"]
+                    for item in clients
+                    if _attributes(item).get("db.system.name") == "redis"
+                ) == ["GET", "SET"]
+                for child in clients:
+                    attributes = _attributes(child)
+                    expected_parent = (
+                        query.span_id
+                        if attributes.get("db.system.name") == "postgresql"
+                        else parent.span_id
+                        if attributes.get("db.system.name") == "redis"
+                        else outgoing.span_id
+                    )
+                    assert child.parent_span_id == expected_parent
+                records = [
+                    record
+                    for request in receiver.requests
+                    if request.path == "/v1/logs"
+                    for resource in request.message.resource_logs
+                    for scope in resource.scope_logs
+                    for record in scope.log_records
+                ]
+                assert len(records) == 1
+                assert records[0].body.string_value == "reference.work.completed"
+                assert records[0].trace_id == parent.trace_id
+                assert records[0].span_id == parent.span_id
+                assert result["logs"]["trace_id"] == parent.trace_id.hex()
+                assert result["logs"]["span_id"] == parent.span_id.hex()
+            else:
+                assert receiver.requests == ()
+                assert result["logs"]["trace_id"] is None
+                assert result["logs"]["span_id"] is None
+            assert b"canary" not in b"".join(
+                request.message.SerializeToString() for request in receiver.requests
+            )
+
+    @pytest.mark.parametrize("mode", ["enabled", "disabled", "invalid"])
+    def test_real_gthread_query_keeps_results_and_one_parent_chain(
+        self, mode, wsgi_driver_wheel, database_url, tmp_path
+    ):
+        from support.gunicorn_server import running_server
+
+        with OTLPReceiver() as receiver:
+            environment = {
+                "REFERENCE_POSTGRES_DSN": database_url,
+                "ALTIMETER_INTEGRATIONS": "wsgi,django,psycopg",
+                "ALTIMETER_METRICS_ENABLED": "false",
+            }
+            if mode == "invalid":
+                environment["ALTIMETER_EXPORT_TIMEOUT"] = "-1"
+            with running_server(
+                tmp_path,
+                wheel=wsgi_driver_wheel,
+                receiver=receiver,
+                enabled=mode != "disabled",
+                extra_env=environment,
+            ) as server:
+                status, _, body = server.request("/work/direct?private=query-canary")
+                assert status == 200, body
+                assert json.loads(body) == {
+                    "statement": "SELECT current_query(), $1::text "
+                    "/* sql-comment-canary */",
+                    "value": "sql-value-canary",
+                }
+            spans = _spans(receiver)
+            if mode == "enabled":
+                assert len(spans) == 3
+                (parent,) = [item for item in spans if item.kind == 2]
+                (query,) = [item for item in spans if item.name == "reference.query"]
+                (driver,) = [item for item in spans if item.kind == 3]
+                assert _attributes(parent)["http.route"] == "work/direct"
+                assert driver.name == "SELECT"
+                assert driver.trace_id == query.trace_id == parent.trace_id
+                assert query.parent_span_id == parent.span_id
+                assert driver.parent_span_id == query.span_id
+                assert _attributes(driver) == {
+                    "db.system.name": "postgresql",
+                    "db.operation.name": "SELECT",
+                }
+                assert (
+                    parent.start_time_unix_nano
+                    <= query.start_time_unix_nano
+                    <= driver.start_time_unix_nano
+                )
+                assert (
+                    driver.end_time_unix_nano
+                    <= query.end_time_unix_nano
+                    <= parent.end_time_unix_nano
+                )
+            else:
+                assert receiver.requests == ()
+            _assert_safe_wire(receiver)
+
+
 class TestASGIDriverFlow:
     @pytest.mark.parametrize("route", ["orm", "async-orm", "direct", "rows"])
     def test_real_request_separates_query_and_materialization_once(

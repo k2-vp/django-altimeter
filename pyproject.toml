@@ -89,5 +89,5 @@ addopts = "--strict-markers --strict-config -m 'not performance'"
 markers = [
     "integration: built-artifact or real-process integration checks",
     "live: credential-gated live PostHog checks; skipped without credentials",
-    "performance: predeclared wall-clock acceptance; run explicitly in the ASGI verification image",
+    "performance: predeclared wall-clock acceptance; run explicitly in the matching ASGI or WSGI verification image",
 ]

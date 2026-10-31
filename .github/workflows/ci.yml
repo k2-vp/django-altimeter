@@ -58,6 +58,10 @@ jobs:
   reference-images:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [asgi, wsgi]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -67,23 +71,13 @@ jobs:
           python-version: "3.13"
           enable-cache: false
       - run: uv build
-      - name: Verify ASGI image
+      - name: Verify ${{ matrix.profile }} image
         run: >-
-          docker compose -p altimeter-ci-asgi-${{ github.run_id }}
-          -f reference/compose.yaml --profile asgi run --build --rm
-          verify-asgi python -m pytest -q tests
-      - name: Clean up ASGI services
+          docker compose -p altimeter-ci-${{ matrix.profile }}-${{ github.run_id }}
+          -f reference/compose.yaml --profile ${{ matrix.profile }} run --build --rm
+          verify-${{ matrix.profile }} python -m pytest -q tests
+      - name: Clean up ${{ matrix.profile }} services
         if: always()
         run: >-
-          docker compose -p altimeter-ci-asgi-${{ github.run_id }}
-          -f reference/compose.yaml --profile asgi down --remove-orphans
-      - name: Verify WSGI image
-        run: >-
-          docker compose -p altimeter-ci-wsgi-${{ github.run_id }}
-          -f reference/compose.yaml --profile wsgi run --build --rm
-          verify-wsgi python -m pytest -q tests
-      - name: Clean up WSGI services
-        if: always()
-        run: >-
-          docker compose -p altimeter-ci-wsgi-${{ github.run_id }}
-          -f reference/compose.yaml --profile wsgi down --remove-orphans
+          docker compose -p altimeter-ci-${{ matrix.profile }}-${{ github.run_id }}
+          -f reference/compose.yaml --profile ${{ matrix.profile }} down --remove-orphans

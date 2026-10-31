@@ -767,3 +767,287 @@ class TestASGILogFlow:
             assert {a.key: a.value.string_value for a in resource.attributes}[
                 "service.name"
             ] == "reference-web"
+
+
+@pytest.fixture(scope="module")
+def wsgi_logging_wheel(tmp_path_factory):
+    from support.gunicorn_server import install_wheel
+    from support.reference_work import WORK_EXTRAS
+
+    return install_wheel(
+        tmp_path_factory.mktemp("wsgi-logging-wheel"), extras=WORK_EXTRAS
+    )
+
+
+def _wsgi_log_environment(receiver, **changes):
+    return {
+        "REFERENCE_REQUEST_WORK": "1",
+        "ALTIMETER_LOGS_ENABLED": "true",
+        "ALTIMETER_LOGS_COLLECTOR_ENDPOINT": receiver.url("logs"),
+        **changes,
+    }
+
+
+def _wire_attributes(values):
+    return {
+        value.key: getattr(value.value, value.value.WhichOneof("value"))
+        for value in values
+    }
+
+
+class TestWSGILogFlow:
+    @pytest.mark.parametrize("sample_rate", ["1", "0.1", "0"])
+    @pytest.mark.parametrize("threads", [1, 4])
+    def test_request_logs_and_identity_stay_in_their_gthread_context(
+        self, wsgi_logging_wheel, tmp_path, sample_rate, threads
+    ):
+        from collections import Counter
+        from concurrent.futures import ThreadPoolExecutor
+
+        from support.gunicorn_server import running_server
+        from support.otlp_receiver import OTLPReceiver
+
+        identities = ["alpha", "none", "beta", "none"] * 6
+        canaries = (
+            "forged-identity-canary",
+            "forged-tenant-canary",
+            "forged-session-canary",
+            "cookie-session-canary",
+            "log-free-text-canary",
+            "log-json-canary",
+            "log-nested-canary",
+            "log-error-canary",
+            "log-exception-canary",
+        )
+        with OTLPReceiver() as receiver:
+            with running_server(
+                tmp_path,
+                wheel=wsgi_logging_wheel,
+                receiver=receiver,
+                workers=1,
+                threads=threads,
+                extra_env=_wsgi_log_environment(
+                    receiver, ALTIMETER_SAMPLE_RATE=sample_rate
+                ),
+            ) as server:
+
+                def request(identity):
+                    status, _, body = server.request(
+                        f"/work/logs?identity={identity}&delay=0.05",
+                        headers={
+                            "posthogDistinctId": canaries[0],
+                            "altimeter.tenant_id": canaries[1],
+                            "sessionId": canaries[2],
+                            "Cookie": f"sessionid={canaries[3]}",
+                        },
+                    )
+                    assert status == 200, body
+                    result = json.loads(body)
+                    assert result["logged"] and result["log_count"] == 4
+                    if threads == 1:
+                        status, _, health_body = server.request("/health/")
+                        assert status == 200
+                        health = json.loads(health_body)
+                        assert health["pid"] == result["pid"]
+                        assert health["thread_id"] == result["thread_id"]
+                        assert health["trace_id"] is None
+                        assert health["span_id"] is None
+                    return identity, result
+
+                with ThreadPoolExecutor(max_workers=threads) as clients:
+                    results = list(clients.map(request, identities))
+            records = _logs(receiver)
+            assert len(records) == len(identities)
+            by_trace = {
+                result["trace_id"]: (identity, result) for identity, result in results
+            }
+            assert len(by_trace) == len(identities)
+            assert None not in by_trace
+            expected_correlations = Counter(
+                (result["trace_id"], result["span_id"], result["trace_flags"] & 1)
+                for _, result in results
+            )
+            observed_correlations = Counter(
+                (record.trace_id.hex(), record.span_id.hex(), record.flags & 1)
+                for _, _, record in records
+            )
+            assert observed_correlations == expected_correlations
+            assert len({result["pid"] for _, result in results}) == 1
+            thread_ids = {result["thread_id"] for _, result in results}
+            if threads == 1:
+                assert len(thread_ids) == 1
+            else:
+                assert 2 <= len(thread_ids) <= threads
+            assert server.output.count("reference.work.completed") == len(identities)
+            for resource, scope, record in records:
+                identity, expected = by_trace[record.trace_id.hex()]
+                assert record.span_id.hex() == expected["span_id"]
+                assert record.flags & 1 == expected["trace_flags"] & 1
+                assert record.body.string_value == "reference.work.completed"
+                assert scope.name == "reference.work"
+                assert record.severity_number == 9
+                resource_attributes = _wire_attributes(resource.attributes)
+                assert resource_attributes["service.name"] == "reference-web"
+                assert "posthogDistinctId" not in resource_attributes
+                assert "altimeter.tenant_id" not in resource_attributes
+                attributes = _wire_attributes(record.attributes)
+                for key, prefix in (
+                    ("posthogDistinctId", "person"),
+                    ("altimeter.tenant_id", "tenant"),
+                ):
+                    expected_identity = (
+                        f"{prefix}-{identity}" if identity != "none" else None
+                    )
+                    assert attributes.get(key) in (None, expected_identity)
+            spans = [
+                span
+                for request in receiver.requests
+                if request.path == "/v1/traces"
+                for group in request.message.resource_spans
+                for scope in group.scope_spans
+                for span in scope.spans
+            ]
+            assert len(spans) == sum(
+                bool(result["trace_flags"] & 1) for _, result in results
+            )
+            assert all(span.kind == 2 for span in spans)
+            assert len({span.trace_id for span in spans}) == len(spans)
+            for span in spans:
+                identity, result = by_trace[span.trace_id.hex()]
+                assert span.span_id.hex() == result["span_id"]
+                attributes = _wire_attributes(span.attributes)
+                assert attributes["http.route"] == "work/logs"
+                assert attributes.get("posthogDistinctId") == (
+                    f"person-{identity}" if identity != "none" else None
+                )
+                assert attributes.get("altimeter.tenant_id") == (
+                    f"tenant-{identity}" if identity != "none" else None
+                )
+            if sample_rate == "1":
+                assert len(spans) == len(identities)
+            elif sample_rate == "0":
+                assert spans == []
+            else:
+                assert len(spans) < len(identities)
+            for request in receiver.requests:
+                payload = request.message.SerializeToString()
+                assert all(canary.encode() not in payload for canary in canaries)
+                if request.path == "/v1/metrics":
+                    for forbidden in (
+                        b"person-alpha",
+                        b"person-beta",
+                        b"tenant-alpha",
+                        b"tenant-beta",
+                    ):
+                        assert forbidden not in payload
+
+    def test_disabled_and_invalid_keep_the_same_application_log_output(
+        self, wsgi_logging_wheel, tmp_path
+    ):
+        from support.gunicorn_server import running_server
+        from support.otlp_receiver import OTLPReceiver
+
+        outputs = {}
+        for mode in ("disabled", "invalid", "enabled"):
+            with OTLPReceiver() as receiver:
+                with running_server(
+                    tmp_path / mode,
+                    wheel=wsgi_logging_wheel,
+                    receiver=receiver,
+                    enabled=mode != "disabled",
+                    threads=1,
+                    extra_env=_wsgi_log_environment(
+                        receiver,
+                        ALTIMETER_SAMPLE_RATE="invalid" if mode == "invalid" else "1",
+                    ),
+                ) as server:
+                    status, _, body = server.request("/work/logs?identity=none")
+                    assert status == 200, body
+                    result = json.loads(body)
+                    assert result["logged"] and result["log_count"] == 4
+                start = server.output.index(
+                    "INFO|reference.work|reference.work.completed"
+                )
+                end = server.output.index("ValueError: log-exception-canary", start)
+                outputs[mode] = server.output[
+                    start : end + len("ValueError: log-exception-canary")
+                ]
+                if mode == "enabled":
+                    records = _logs(receiver)
+                    assert len(records) == 1
+                    assert records[0][2].trace_id.hex() == result["trace_id"]
+                    assert records[0][2].span_id.hex() == result["span_id"]
+                else:
+                    assert result["trace_id"] is None and result["span_id"] is None
+                    assert receiver.requests == ()
+        assert outputs["enabled"] == outputs["disabled"] == outputs["invalid"]
+
+    @pytest.mark.parametrize("sample_rate", ["1", "0.1", "0"])
+    def test_stream_iteration_logs_keep_correlation_then_release_context(
+        self, wsgi_logging_wheel, tmp_path, sample_rate
+    ):
+        from support.gunicorn_server import running_server
+        from support.otlp_receiver import OTLPReceiver
+
+        with OTLPReceiver() as receiver:
+            with running_server(
+                tmp_path,
+                wheel=wsgi_logging_wheel,
+                receiver=receiver,
+                threads=1,
+                extra_env=_wsgi_log_environment(
+                    receiver, ALTIMETER_SAMPLE_RATE=sample_rate
+                ),
+            ) as server:
+                status, headers, body = server.request("/work/log-stream")
+                assert status == 200
+                headers = {key.lower(): value for key, value in headers.items()}
+                responses = [json.loads(line) for line in body.splitlines()]
+                assert len(responses) == 2
+                for response in responses:
+                    assert response["logged"] and response["log_count"] == 4
+                    assert response["trace_id"] == headers["x-altimeter-trace-id"]
+                    assert response["span_id"]
+                assert responses[0]["span_id"] == responses[1]["span_id"]
+                status, _, health_body = server.request("/health/")
+                assert status == 200
+                health = json.loads(health_body)
+                assert health["trace_id"] is None and health["span_id"] is None
+            records = _logs(receiver)
+            assert len(records) == 2
+            assert server.output.count("reference.work.completed") == 2
+            for _, scope, record in records:
+                assert scope.name == "reference.work"
+                assert record.body.string_value == "reference.work.completed"
+                assert record.trace_id.hex() == responses[0]["trace_id"]
+                assert record.span_id.hex() == responses[0]["span_id"]
+                assert record.flags & 1 == int(headers["x-altimeter-trace-sampled"])
+            spans = [
+                span
+                for request in receiver.requests
+                if request.path == "/v1/traces"
+                for group in request.message.resource_spans
+                for scope in group.scope_spans
+                for span in scope.spans
+            ]
+            assert len(spans) == int(headers["x-altimeter-trace-sampled"])
+            if sample_rate == "1":
+                assert len(spans) == 1
+            elif sample_rate == "0":
+                assert spans == []
+            for span in spans:
+                assert span.kind == 2
+                assert span.trace_id == records[0][2].trace_id
+                assert span.span_id == records[0][2].span_id
+                attributes = _wire_attributes(span.attributes)
+                assert attributes["http.route"] == "work/log-stream"
+                assert attributes["altimeter.response_mode"] == "streaming"
+            for request in receiver.requests:
+                for canary in (
+                    b"log-free-text-canary",
+                    b"log-json-canary",
+                    b"log-nested-canary",
+                    b"log-error-canary",
+                    b"log-exception-canary",
+                ):
+                    assert canary not in request.message.SerializeToString()

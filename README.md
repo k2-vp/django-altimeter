@@ -962,6 +962,15 @@ detached response retains only status, a fixed safe reason, and valid bounded
 `Retry-After`; original server prose, request credentials, and cookies are
 discarded.
 
+The factories send only their validated `headers=` values and fixed protocol
+headers. They do not merge extra `OTEL_EXPORTER_OTLP_HEADERS` or signal-specific
+header values from the environment. Ambient OTLP `CERTIFICATE`,
+`CLIENT_CERTIFICATE` and `CLIENT_KEY` settings are ignored: TLS peer verification
+stays enabled and no client certificate is loaded. Runtime configuration can
+still select supported standard `OTEL_*` header variables when no `ALTIMETER_*`
+override is set; those values pass configuration validation before reaching
+the factory.
+
 Read the frozen `session.outcome` for the latest attempt or local no-send result.
 Its `accepted_records`, `rejected_records`, and `local_dropped_records` count
 spans, log records, or metric data points. They are separate, noncumulative

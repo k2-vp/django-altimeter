@@ -137,15 +137,16 @@ class _Response:
         owned_token: Token[Span | None] | None = None
         try:
             state_token = request_state.set(self.state)
-            application_context = self._application_context
-            owned_span = self._application_owned_span
-            if application_context is None:
-                application_context = trace.set_span_in_context(
-                    self._span, self._parent
-                )
-                owned_span = self._span if self._owned_tracing else None
-            trace_token = context.attach(application_context)
-            owned_token = _OWNED_SPAN.set(owned_span)
+            if self._owned_tracing:
+                application_context = self._application_context
+                owned_span = self._application_owned_span
+                if application_context is None:
+                    application_context = trace.set_span_in_context(
+                        self._span, self._parent
+                    )
+                    owned_span = self._span
+                trace_token = context.attach(application_context)
+                owned_token = _OWNED_SPAN.set(owned_span)
         except Exception:
             _diagnostic("http.context_failed")
         try:

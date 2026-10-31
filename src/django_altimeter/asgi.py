@@ -145,9 +145,10 @@ class _InstrumentedASGI:
         try:
             # Even when a native start hook fails, do not disclose or adopt an
             # unrelated caller span as this request's SERVER observation.
-            trace_token = context.attach(trace.set_span_in_context(span, parent))
-            if owned_tracing and span is not trace.INVALID_SPAN:
-                owned_span_token = _mark_owned_span(span)
+            if owned_tracing:
+                trace_token = context.attach(trace.set_span_in_context(span, parent))
+                if span is not trace.INVALID_SPAN:
+                    owned_span_token = _mark_owned_span(span)
         except Exception:
             _diagnostic("http.context_failed")
 

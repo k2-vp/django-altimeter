@@ -57,15 +57,19 @@ def test_invalid_budget_is_rejected_before_network(timeout: object) -> None:
         {"signals": ("traces", "traces")},
         {"signals": ("CANARY_UNKNOWN_SIGNAL",)},
         {"signals": ["traces"]},
-        {"started_at": datetime.now()},
-        {"started_at": datetime.now(UTC) + timedelta(seconds=10)},
-        {"started_at": datetime.now(UTC) - timedelta(minutes=6)},
-        {"started_at": datetime.now(UTC) - timedelta(seconds=61)},
-        {"finished_at": datetime.now(UTC) + timedelta(minutes=2)},
+        {"started_at": datetime.now},
+        {"started_at": lambda: datetime.now(UTC) + timedelta(seconds=10)},
+        {"started_at": lambda: datetime.now(UTC) - timedelta(minutes=6)},
+        {"started_at": lambda: datetime.now(UTC) - timedelta(seconds=61)},
+        {"finished_at": lambda: datetime.now(UTC) + timedelta(minutes=2)},
     ],
 )
 def test_invalid_identity_signal_or_window_is_bounded_and_safe(changes: dict) -> None:
-    result = _request(**changes)
+    # Build time-dependent values when this case runs, not during collection.
+    resolved_changes = {
+        key: value() if callable(value) else value for key, value in changes.items()
+    }
+    result = _request(**resolved_changes)
     assert result.codes == ("readback.invalid_request",)
     assert not result.ok
     assert "CANARY" not in repr(result)

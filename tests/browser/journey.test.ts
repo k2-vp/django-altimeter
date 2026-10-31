@@ -502,3 +502,29 @@ describe('closed output and fail-open telemetry boundaries', () => {
     expect(events[0]?.properties.requests).toHaveLength(1);
   });
 });
+
+describe('public finish accepts only the readiness input', () => {
+  it.each(['https://example.test/?token=' + CANARY, 0, 'navigation'])(
+    'ignores an extra callback argument %s', (extra) => {
+      const { attempt, events } = navigation();
+      selected(attempt);
+      Reflect.apply(attempt.finish, undefined, [{ outcome: 'success' }, extra]);
+      expect(events).toHaveLength(1);
+      expect(events[0]?.event).toBe('board_ready');
+      expect(events[0]?.properties).toMatchObject({ outcome: 'success', cancel_reason: null });
+      expect(JSON.stringify(events)).not.toContain(CANARY);
+      const control = navigation();
+      control.attempt.cancel('navigation');
+      expect(control.events).toHaveLength(1);
+      expect(control.events[0]?.properties).toMatchObject({ outcome: 'cancelled', cancel_reason: 'navigation' });
+    },
+  );
+
+  it('can be used directly as a forEach callback without interpreting its index', () => {
+    const { attempt, events } = navigation();
+    [{ outcome: 'success' as const }].forEach(attempt.finish);
+    expect(events).toHaveLength(1);
+    expect(events[0]?.event).toBe('board_ready');
+    expect(events[0]?.properties).toMatchObject({ outcome: 'success', cancel_reason: null });
+  });
+});

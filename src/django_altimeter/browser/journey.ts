@@ -245,6 +245,7 @@ function createAttempt(config: Configuration): JourneyAttempt {
   }
   function finish(input: JourneyFinish, cancellation: CancellationReason | null = null): void {
     if (finishing || !permitted()) return;
+    if (cancellation !== null && !member(cancellation, ['navigation', 'superseded', 'aborted'] as const)) { discard(); return; }
     const outcome = cancellation === null ? field(input, 'outcome') : 'cancelled';
     if (!member(outcome, ['success', 'failure', 'cancelled'] as const)) { discard(); return; }
     finishing = true;
@@ -356,7 +357,7 @@ function createAttempt(config: Configuration): JourneyAttempt {
     isSelected(role: RequestRole, requestKey: RequestKey): boolean {
       return permitted() && selections.get(role)?.key === requestKey;
     },
-    finish,
+    finish(input: JourneyFinish): void { finish(input); },
     cancel(reason: CancellationReason): void {
       if (!member(reason, ['navigation', 'superseded', 'aborted'] as const)) { discard(); return; }
       finish({ outcome: 'failure' }, reason);

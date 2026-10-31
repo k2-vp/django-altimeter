@@ -335,6 +335,28 @@ describe('timing fills and one observer lifecycle', () => {
     expect(events).toEqual([]);
   });
 
+  it.each([false, true])('final permission discard=%s is respected after terminal cleanup', (invalidate) => {
+    let terminalCleanup = false;
+    let discardedInsidePermission = false;
+    const { attempt, events } = navigation({
+      canCapture() {
+        if (terminalCleanup && invalidate) {
+          attempt.discard();
+          discardedInsidePermission = true;
+        }
+        return true;
+      },
+    });
+    selected(attempt);
+    attempt.attachTiming({
+      flush() {}, retire() {}, disconnect() { terminalCleanup = true; },
+    });
+    attempt.finish({ outcome: 'success' });
+    expect(terminalCleanup).toBe(true);
+    expect(discardedInsidePermission).toBe(invalidate);
+    expect(events).toHaveLength(invalidate ? 0 : 1);
+  });
+
   it('revocation during a queued timing drain wins over terminal capture', () => {
     const controller = new AbortController();
     const { attempt, events } = navigation({ signal: controller.signal });

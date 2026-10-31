@@ -269,7 +269,9 @@ function createAttempt(config: Configuration): JourneyAttempt {
     const event = `${config.screen}_${suffix}` as JourneyEventName;
     stop();
     try {
-      if (discarded || config.canCapture() !== true || !lifecycleActive(config.signal)) return;
+      if (config.canCapture() !== true || !lifecycleActive(config.signal)) return;
+      // Permission callbacks can synchronously discard this attempt.
+      if (discarded) return;
       const result = config.capture(event, properties);
       if (result instanceof Promise) void result.catch(() => {});
     } catch { /* Best-effort capture is terminal even when the existing client fails. */ }

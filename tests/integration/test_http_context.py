@@ -187,3 +187,290 @@ def test_metrics_only_preserves_foreign_parent_and_baggage(
     assert len(children) == len(result["seen"])
     assert all(span.parent_span_id.hex() == result["parent_span"] for span in children)
     assert _count(otlp_receiver) == 1
+
+
+@pytest.mark.parametrize("protocol", ["asgi", "wsgi"])
+@pytest.mark.parametrize("fail", [False, True])
+def test_excluded_requests_do_not_export_orphan_children(
+    otlp_receiver: OTLPReceiver, protocol: str, fail: bool
+) -> None:
+    result = _run(
+        otlp_receiver,
+        f"        PROTOCOL, FAIL = {protocol!r}, {fail!r}\n"
+        + """
+        from django_altimeter import asgi, wsgi
+        from django_altimeter.context import client_span, span
+        from django_altimeter.http import request_state
+        configure(excluded_routes=frozenset({'/health/'}))
+        seen, bodies, headers = [], [], []
+        failure = ValueError('CANARY_FAILURE')
+        def observe(path, stage):
+            with client_span(
+                'SELECT', attributes={'db.statement': 'CANARY_SQL'}
+            ) as child:
+                seen.append([path, stage, child.is_recording(),
+                             request_state.get() is None])
+        def outside():
+            assert request_state.get() is None
+            assert get_correlation() is None
+            assert not trace.get_current_span().get_span_context().is_valid
+        async def async_app(scope, receive, send):
+            path = scope['path']
+            observe(path, 'app')
+            await send({'type': 'http.response.start', 'status': 200,
+                        'headers': [(b'cache-control', b'private')]})
+            with span('SPAN'):
+                observe(path, 'first')
+                await send({'type': 'http.response.body', 'body': b'first',
+                            'more_body': True})
+                await asyncio.sleep(0)
+                observe(path, 'last')
+                if FAIL:
+                    raise failure
+                await send({'type': 'http.response.body', 'body': b'last'})
+        async def receive():
+            return {'type': 'http.request', 'body': b''}
+        async def send(message):
+            if message['type'] == 'http.response.start':
+                headers.append([name.decode().lower()
+                                for name, _ in message['headers']])
+            else:
+                bodies.append(message['body'].decode())
+        class Body:
+            def __init__(self, path, write):
+                self.path = path
+                self.stream = self.chunks(write)
+            def __iter__(self):
+                observe(self.path, 'iter')
+                return self
+            def __next__(self):
+                return next(self.stream)
+            def chunks(self, write):
+                with span('SPAN'):
+                    observe(self.path, 'first')
+                    yield b'first'
+                    observe(self.path, 'last')
+                    write(b'')
+                    if FAIL:
+                        raise failure
+                    yield b'last'
+            def close(self):
+                observe(self.path, 'close')
+                self.stream.close()
+        def sync_app(environ, start_response):
+            path = environ['PATH_INFO']
+            observe(path, 'app')
+            write = start_response('200 OK', [('Cache-Control', 'private')])
+            return Body(path, write)
+        def start_response(status, values, exc_info=None):
+            headers.append([name.lower() for name, _ in values])
+            return lambda data: None
+        observed = (asgi.instrument(async_app) if PROTOCOL == 'asgi'
+                    else wsgi.instrument(sync_app))
+        if PROTOCOL == 'asgi':
+            async def call(path):
+                try:
+                    await observed({**SCOPE, 'path': path}, receive, send)
+                except ValueError as error:
+                    assert FAIL and error is failure
+                else:
+                    assert not FAIL
+                outside()
+            async def run():
+                await asyncio.gather(call('/health/'), call('/safe/'))
+            asyncio.run(run())
+        else:
+            responses = [observed({**ENVIRON, 'PATH_INFO': path}, start_response)
+                         for path in ('/health/', '/safe/')]
+            outside()
+            # Interleave operations, including a manual span held across yield.
+            for body in responses:
+                bodies.append(next(body).decode())
+                outside()
+            for body in responses:
+                try:
+                    while True:
+                        bodies.append(next(body).decode())
+                        outside()
+                except StopIteration:
+                    assert not FAIL
+                except ValueError as error:
+                    assert FAIL and error is failure
+                finally:
+                    body.close()
+                    outside()
+        outside()
+        assert observed._active == 0
+        assert shutdown().completed
+        print(json.dumps({'seen': seen, 'bodies': bodies, 'headers': headers}))
+        """,
+    )
+    assert result["bodies"].count("first") == 2
+    assert result["bodies"].count("last") == (0 if fail else 2)
+    assert "x-altimeter-trace-id" not in result["headers"][0]
+    assert "x-altimeter-trace-id" in result["headers"][1]
+    assert {entry[1] for entry in result["seen"]} == (
+        {"app", "first", "last"}
+        if protocol == "asgi"
+        else {"app", "iter", "first", "last", "close"}
+    )
+    for path, stage, recording, no_state in result["seen"]:
+        assert recording is (path == "/safe/"), (path, stage)
+        assert no_state is (path == "/health/"), (path, stage)
+    spans = _spans(otlp_receiver)
+    (server,) = [record for record in spans if record.kind == 2]
+    (manual,) = [record for record in spans if record.name == "SPAN"]
+    children = [record for record in spans if record.kind == 3]
+    assert len(children) == sum(entry[0] == "/safe/" for entry in result["seen"])
+    assert len(spans) == len(children) + 2
+    assert all(record.trace_id == server.trace_id for record in spans)
+    assert manual.parent_span_id == server.span_id
+    assert all(
+        record.parent_span_id in {server.span_id, manual.span_id} for record in children
+    )
+    assert _count(otlp_receiver) == 1
+    for request in otlp_receiver.requests:
+        assert b"CANARY" not in request.message.SerializeToString()
+
+
+@pytest.mark.parametrize("protocol", ["asgi", "wsgi"])
+@pytest.mark.parametrize("foreign_global", [False, True])
+def test_excluded_unowned_requests_leave_foreign_context_untouched(
+    otlp_receiver: OTLPReceiver, protocol: str, foreign_global: bool
+) -> None:
+    result = _run(
+        otlp_receiver,
+        f"        PROTOCOL, FOREIGN_GLOBAL = {protocol!r}, {foreign_global!r}\n"
+        + """
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
+            OTLPSpanExporter,
+        )
+        from django_altimeter import asgi, wsgi
+        from django_altimeter.http import request_state
+        foreign = TracerProvider(shutdown_on_exit=False)
+        foreign.add_span_processor(SimpleSpanProcessor(OTLPSpanExporter(
+            endpoint=os.environ['TEST_ENDPOINT'] + '/v1/traces', timeout=0.5)))
+        tracer = foreign.get_tracer('foreign')
+        if FOREIGN_GLOBAL:
+            trace.set_tracer_provider(foreign)
+            configure(excluded_routes=frozenset({'/health/'}))
+        else:
+            configure(traces=SignalConfig(), excluded_routes=frozenset({'/health/'}))
+        def inspect():
+            assert trace.get_current_span() is parent
+            assert baggage.get_baggage('business') == 'kept'
+            assert get_correlation() is None
+            assert request_state.get() is None
+            with tracer.start_as_current_span('child') as child:
+                assert child.parent == parent.get_span_context()
+        async def async_app(scope, receive, send):
+            inspect()
+            await send({'type': 'http.response.start', 'status': 200, 'headers': []})
+            await send({'type': 'http.response.body', 'body': b'safe'})
+        async def receive():
+            return {'type': 'http.request', 'body': b''}
+        async def send(message):
+            pass
+        def sync_app(environ, start_response):
+            inspect()
+            start_response('200 OK', [])
+            return iter([b'safe'])
+        token = context.attach(baggage.set_baggage('business', 'kept'))
+        with tracer.start_as_current_span('parent') as parent:
+            if PROTOCOL == 'asgi':
+                asyncio.run(asgi.instrument(async_app)(
+                    {**SCOPE, 'path': '/health/'}, receive, send))
+            else:
+                result = wsgi.instrument(sync_app)(
+                    {**ENVIRON, 'PATH_INFO': '/health/'}, lambda *args: None)
+                assert list(result) == [b'safe']
+            assert trace.get_current_span() is parent
+            assert baggage.get_baggage('business') == 'kept'
+        context.detach(token)
+        assert shutdown().completed
+        foreign.shutdown()
+        print(json.dumps({'restored': not trace.get_current_span().is_recording()}))
+        """,
+    )
+    assert result == {"restored": True}
+    spans = _spans(otlp_receiver)
+    assert sorted(record.name for record in spans) == ["child", "parent"]
+    (child,) = [record for record in spans if record.name == "child"]
+    (parent,) = [record for record in spans if record.name == "parent"]
+    assert child.parent_span_id == parent.span_id
+    assert _count(otlp_receiver) == 0
+
+
+@pytest.mark.parametrize("close_fails", [False, True])
+def test_excluded_native_file_keeps_identity_and_suppresses_close_children(
+    otlp_receiver: OTLPReceiver, close_fails: bool
+) -> None:
+    result = _run(
+        otlp_receiver,
+        f"        CLOSE_FAILS = {close_fails!r}\n"
+        + """
+        from django_altimeter.wsgi import instrument
+        from django_altimeter.context import client_span
+        from django_altimeter.http import request_state
+        configure(excluded_routes=frozenset({'/health/'}))
+        seen = []
+        failure = OSError('CANARY_CLOSE_FAILURE')
+        def observe(path, stage):
+            with client_span('SELECT') as child:
+                seen.append([path, stage, child.is_recording()])
+        class FileWrapper:
+            def __init__(self, path):
+                self.path = path
+                self.closed = 0
+            def __iter__(self):
+                raise AssertionError('adapter must preserve native file dispatch')
+            def close(self):
+                self.closed += 1
+                observe(self.path, 'close')
+                if CLOSE_FAILS:
+                    raise failure
+        def app(environ, start_response):
+            path = environ['PATH_INFO']
+            observe(path, 'app')
+            start_response('200 OK', [])
+            return environ['body']
+        observed = instrument(app)
+        for path in ('/health/', '/safe/'):
+            original = FileWrapper(path)
+            result = observed({**ENVIRON, 'PATH_INFO': path, 'body': original,
+                               'wsgi.file_wrapper': FileWrapper}, lambda *args: None)
+            assert result is original
+            assert request_state.get() is None
+            assert not trace.get_current_span().get_span_context().is_valid
+            try:
+                result.close()
+            except OSError as error:
+                assert CLOSE_FAILS and error is failure
+            else:
+                assert not CLOSE_FAILS
+            result.close()
+            assert original.closed == 1
+            assert request_state.get() is None
+            assert not trace.get_current_span().get_span_context().is_valid
+        assert observed._active == 0
+        assert shutdown().completed
+        print(json.dumps({'seen': seen}))
+        """,
+    )
+    assert result == {
+        "seen": [
+            ["/health/", "app", False],
+            ["/health/", "close", False],
+            ["/safe/", "app", True],
+            ["/safe/", "close", True],
+        ]
+    }
+    spans = _spans(otlp_receiver)
+    (server,) = [record for record in spans if record.kind == 2]
+    children = [record for record in spans if record.kind == 3]
+    assert len(spans) == 3
+    assert len(children) == 2
+    assert all(record.parent_span_id == server.span_id for record in children)
+    assert _count(otlp_receiver) == 1

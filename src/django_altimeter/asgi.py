@@ -14,6 +14,7 @@ from contextvars import Token
 from threading import Lock
 from time import monotonic, time_ns
 from typing import Any
+from uuid import uuid4
 
 from opentelemetry import context, metrics, trace
 from opentelemetry.trace import Span
@@ -107,7 +108,27 @@ class _InstrumentedASGI:
             and len(path) <= config.limits.max_string_bytes
             and path in config.excluded_routes
         ):
-            await self.application(scope, receive, send)
+            excluded_token = None
+            try:
+                if owned_tracing:
+                    # A valid local, non-sampled parent makes owned child spans
+                    # non-recording without creating a SERVER span or counter.
+                    excluded_span = trace.NonRecordingSpan(
+                        trace.SpanContext(uuid4().int, uuid4().int >> 64, False)
+                    )
+                    excluded_token = context.attach(
+                        trace.set_span_in_context(excluded_span, _EMPTY_CONTEXT)
+                    )
+            except Exception:
+                _diagnostic("http.context_failed")
+            try:
+                await self.application(scope, receive, send)
+            finally:
+                if excluded_token is not None:
+                    try:
+                        context.detach(excluded_token)
+                    except Exception:
+                        _diagnostic("http.context_failed")
             return
 
         started_at = monotonic()

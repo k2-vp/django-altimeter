@@ -221,6 +221,7 @@ _RECORD_KEYS = (
     | _DURATION_KEYS
     | {"trace_id", "span_id", "altimeter.overflow"}
 )
+_IDENTITY_RECORD_KEYS = _RECORD_KEYS | _IDENTITY_KEYS
 _RESOURCE_ATTRIBUTE_KEYS = _RESOURCE_KEYS | {"process.pid", "altimeter.probe"}
 _METRIC_KEYS = (
     (_STRING_KEYS - {"exception.type", "error.type"})
@@ -399,15 +400,14 @@ def _attributes(
     maximum = limits.max_resource_attributes if resource else limits.max_attributes
     if len(source) > maximum:
         return
-    allowed_keys = (
-        _RESOURCE_ATTRIBUTE_KEYS
-        if resource
-        else _METRIC_KEYS
-        if metric
-        else _RECORD_KEYS | _IDENTITY_KEYS
-        if identity
-        else _RECORD_KEYS
-    )
+    if resource:
+        allowed_keys = _RESOURCE_ATTRIBUTE_KEYS
+    elif metric:
+        allowed_keys = _METRIC_KEYS
+    elif identity:
+        allowed_keys = _IDENTITY_RECORD_KEYS
+    else:
+        allowed_keys = _RECORD_KEYS
     if server:
         allowed_keys |= _HTTP_SERVER_KEYS
     seen: set[str] = set()
@@ -745,13 +745,7 @@ def _histogram(
     result.explicit_bounds.extend(source.explicit_bounds)
     result.flags = source.flags & 1
     _exemplars(source.exemplars, result.exemplars, limits)
-    for field in ("sum", "min", "max"):
-        if source.HasField(field):
-            value = getattr(source, field)
-            if not isfinite(value):
-                return False
-            setattr(result, field, value)
-    return True
+    return _copy_finite_sum_min_max(source, result)
 
 
 def _exponential(
@@ -779,6 +773,13 @@ def _exponential(
     result.positive.bucket_counts.extend(source.positive.bucket_counts)
     result.negative.offset = source.negative.offset
     result.negative.bucket_counts.extend(source.negative.bucket_counts)
+    return _copy_finite_sum_min_max(source, result)
+
+
+def _copy_finite_sum_min_max(
+    source: HistogramDataPoint | ExponentialHistogramDataPoint,
+    result: HistogramDataPoint | ExponentialHistogramDataPoint,
+) -> bool:
     for field in ("sum", "min", "max"):
         if source.HasField(field):
             value = getattr(source, field)

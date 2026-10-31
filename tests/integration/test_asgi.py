@@ -1567,3 +1567,53 @@ def test_owned_request_correlation_survives_foreign_scope_and_cleans_up(
         assert _attributes(spans[0])["altimeter.http.outcome"] == (
             "aborted" if abort else "completed"
         )
+
+
+@pytest.mark.parametrize("poll_after_body", [False, True])
+def test_cancelled_disconnect_poll_keeps_successful_stream_completed(
+    otlp_receiver: OTLPReceiver, poll_after_body: bool
+) -> None:
+    result = _run(
+        otlp_receiver,
+        f"        POLL_AFTER_BODY = {poll_after_body!r}\n"
+        + """
+        from django_altimeter.asgi import instrument
+        configure()
+        messages = []
+        polls = 0
+        async def poll(receive):
+            global polls
+            try:
+                # Like is_disconnected(): cancel only this receive poll, then
+                # continue the healthy application and its response stream.
+                async with asyncio.timeout(0):
+                    await receive()
+            except TimeoutError:
+                polls += 1
+        async def app(scope, receive, send):
+            if not POLL_AFTER_BODY:
+                await poll(receive)
+            await send({'type': 'http.response.start', 'status': 200,
+                        'headers': [(b'content-type', b'text/event-stream')]})
+            await send({'type': 'http.response.body', 'body': b'data: safe\\n\\n'})
+            if POLL_AFTER_BODY:
+                await poll(receive)
+        async def receive():
+            await asyncio.Future()
+        async def send(message):
+            messages.append(message)
+        observed = instrument(app, surface='mcp')
+        asyncio.run(observed(dict(SCOPE), receive, send))
+        assert observed._active == 0
+        assert shutdown().completed
+        print(json.dumps({'polls': polls, 'body': messages[-1]['body'].decode()}))
+        """,
+    )
+    assert result == {"polls": 1, "body": "data: safe\n\n"}
+    (span,) = _spans(otlp_receiver)
+    assert span.kind == 2
+    assert span.status.code == 0
+    assert _attributes(span)["altimeter.http.outcome"] == "completed"
+    assert _attributes(span)["altimeter.response_mode"] == "streaming"
+    assert _metric_count(otlp_receiver, "altimeter.http.server.requests") == 1
+    assert _metric_count(otlp_receiver, "http.server.request.duration") == 1

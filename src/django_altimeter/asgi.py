@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+from asyncio import CancelledError
 from collections.abc import Awaitable, Callable
 from contextvars import Token
 from threading import Lock
@@ -154,6 +155,10 @@ class _InstrumentedASGI:
             nonlocal aborted_at, failed
             try:
                 message = await receive()
+            except CancelledError:
+                # Applications may cancel a disconnect poll and keep streaming.
+                # Cancellation escaping the app is observed by the outer guard.
+                raise
             except BaseException:
                 failed = True
                 if completed_at is None and aborted_at is None:

@@ -273,7 +273,10 @@ function createAttempt(config: Configuration): JourneyAttempt {
       // Permission callbacks can synchronously discard this attempt.
       if (discarded) return;
       const result = config.capture(event, properties);
-      if (result instanceof Promise) void result.catch(() => {});
+      if (result !== null && (typeof result === 'object' || typeof result === 'function') &&
+          typeof (result as { then?: unknown }).then === 'function') {
+        void Promise.resolve(result).catch(() => {});
+      }
     } catch { /* Best-effort capture is terminal even when the existing client fails. */ }
   }
 

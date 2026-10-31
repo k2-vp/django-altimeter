@@ -1,3 +1,4 @@
+import { runInNewContext } from 'node:vm';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   beginJourney,
@@ -423,6 +424,52 @@ describe('closed output and fail-open telemetry boundaries', () => {
     expect(() => selected(attempt, { requestKey: 'second' })).not.toThrow();
     expect(() => attempt.finish({ outcome: 'success' })).not.toThrow();
     expect(() => attempt.finish({ outcome: 'failure' })).not.toThrow();
+    expect(capture).toHaveBeenCalledOnce();
+  });
+
+  it.each(['native', 'foreign'] as const)('%s rejected capture produces no unhandled rejection', async (realm) => {
+    const unhandled: unknown[] = [];
+    const observe = (error: unknown) => { unhandled.push(error); };
+    let result: Promise<unknown> | undefined;
+    const capture = vi.fn(() => {
+      result = realm === 'native' ? Promise.reject(new Error('capture_failure'))
+        : runInNewContext("Promise.reject(new Error('capture_failure'))") as Promise<unknown>;
+      return result;
+    });
+    process.on('unhandledRejection', observe);
+    try {
+      const { attempt } = navigation({ capture });
+      attempt.finish({ outcome: 'success' });
+      attempt.finish({ outcome: 'failure' });
+      expect(result instanceof Promise).toBe(realm === 'native');
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(capture).toHaveBeenCalledOnce();
+      expect(unhandled).toEqual([]);
+    } finally {
+      void result?.catch(() => {});
+      process.off('unhandledRejection', observe);
+    }
+  });
+
+  it('assimilates a callable thenable and contains its rejection', async () => {
+    const then = vi.fn((_resolve: unknown, reject: (error: Error) => void) => {
+      reject(new Error('capture_failure'));
+    });
+    const capture = vi.fn(() => Object.assign(() => {}, { then }));
+    const { attempt } = navigation({ capture });
+    expect(() => attempt.finish({ outcome: 'success' })).not.toThrow();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expect(then).toHaveBeenCalledOnce();
+    expect(capture).toHaveBeenCalledOnce();
+  });
+
+  it('contains a hostile capture-result then getter without retrying capture', () => {
+    const getter = vi.fn(() => { throw new Error(CANARY); });
+    const capture = vi.fn(() => Object.defineProperty({}, 'then', { get: getter }));
+    const { attempt } = navigation({ capture });
+    expect(() => attempt.finish({ outcome: 'success' })).not.toThrow();
+    attempt.finish({ outcome: 'failure' });
+    expect(getter).toHaveBeenCalledOnce();
     expect(capture).toHaveBeenCalledOnce();
   });
 

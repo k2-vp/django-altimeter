@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     from django_altimeter.exporting import ExportOutcome, SanitizingSession
     from django_altimeter.headers import ResponseHeaderPolicy
     from django_altimeter.metrics import RequestMetrics
+    from django_altimeter.worker_metrics import WorkerMetrics
 
 
 @dataclass(frozen=True)
@@ -118,6 +119,7 @@ class ProcessRuntime:
         self.log_handler: logging.Handler | None = None
         self.meter_provider: metrics.MeterProvider = NoOpMeterProvider()
         self.request_metrics: RequestMetrics | None = None
+        self.worker_metrics: WorkerMetrics | None = None
         self.response_header_policy: ResponseHeaderPolicy | None = None
         self._trace_provider: TracerProvider | None = None
         self._log_provider: LoggerProvider | None = None
@@ -273,10 +275,19 @@ class ProcessRuntime:
             )
         ]
         views.extend(request_metric_views())
+        bounded_instruments = REQUEST_INSTRUMENTS
+        if "celery" in self.config.integrations:
+            from django_altimeter.worker_metrics import (
+                WORKER_INSTRUMENTS,
+                worker_metric_views,
+            )
+
+            views.extend(worker_metric_views())
+            bounded_instruments |= WORKER_INSTRUMENTS
         views.extend(
             View(meter_name=scope, instrument_name=escape(name), attribute_keys=set())
             for scope, name in sorted(
-                self.config.policy.metric_instruments - REQUEST_INSTRUMENTS
+                self.config.policy.metric_instruments - bounded_instruments
             )
         )
         exporter = create_metric_exporter(
@@ -312,6 +323,20 @@ class ProcessRuntime:
             policy=self._policy,
             limits=self.config.limits,
         )
+
+        if "celery" in self.config.integrations and self.config.role in {
+            "celery-prefork",
+            "celery-solo",
+        }:
+            from django_altimeter.worker_metrics import WorkerMetrics, worker_task_names
+
+            self.worker_metrics = WorkerMetrics(
+                provider,
+                policy=self._policy,
+                limits=self.config.limits,
+                task_names=worker_task_names(self.config.policy),
+                queue_names=self.config.queue_names,
+            )
 
     def _resource_attributes(self) -> dict[str, str | bool]:
         attributes: dict[str, str | bool] = {
@@ -356,10 +381,21 @@ class ProcessRuntime:
         self.response_header_policy = prepare_response_header_policy(
             self.config.frontend_origins
         )
-        request_policy = request_metric_policy(self.config.policy)
+        policy = request_metric_policy(self.config.policy)
+        if "celery" in self.config.integrations:
+            from django_altimeter.worker_metrics import (
+                worker_metric_policy,
+                worker_task_names,
+            )
+
+            policy = worker_metric_policy(
+                policy,
+                task_names=worker_task_names(self.config.policy),
+                queue_names=self.config.queue_names,
+            )
         self._policy = replace(
-            request_policy,
-            attribute_values=request_policy.attribute_values
+            policy,
+            attribute_values=policy.attribute_values
             | frozenset(self.config.resource_attributes)
             | {("service.instance.id", self.instance_id)},
         )

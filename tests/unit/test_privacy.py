@@ -1360,3 +1360,30 @@ def test_redis_operation_allowlist_keeps_safe_fact_and_drops_command_canaries(
         "db.system.name": "redis",
     }
     assert CANARY.encode() not in result.SerializeToString()
+
+
+@pytest.mark.parametrize("unit", ["{attempt}", CANARY])
+def test_worker_attempt_unit_survives_beside_unapproved_unit(unit):
+    request = ExportMetricsServiceRequest()
+    scope = request.resource_metrics.add().scope_metrics.add()
+    scope.scope.name = "django_altimeter"
+    metric = scope.metrics.add(name="altimeter.worker.attempts", unit=unit)
+    metric.sum.aggregation_temporality = 1
+    metric.sum.is_monotonic = True
+    point = metric.sum.data_points.add(as_int=3)
+    point.attributes.extend(
+        [attribute("task.name", "reference.echo"), attribute("private", CANARY)]
+    )
+    policy = replace(
+        POLICY,
+        metric_instruments=frozenset({("django_altimeter", metric.name)}),
+        attribute_values=POLICY.attribute_values | {("task.name", "reference.echo")},
+    )
+    result = project_metrics(request, policy=policy)
+    (projected,) = result.resource_metrics[0].scope_metrics[0].metrics
+    assert projected.unit == (unit if unit == "{attempt}" else "")
+    assert projected.sum.data_points[0].as_int == 3
+    assert projected.sum.data_points[0].attributes == [
+        attribute("task.name", "reference.echo")
+    ]
+    assert CANARY.encode() not in result.SerializeToString()

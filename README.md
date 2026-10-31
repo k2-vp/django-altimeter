@@ -420,6 +420,10 @@ If the wrapper cannot accept a close hook, it remains unchanged and finalizes
 at application return with the fixed `http.file_wrapper_unobserved` diagnostic.
 In that case, file-transfer duration, completion and later aborts are unobserved.
 
+For native `wsgi.file_wrapper` responses served without `sendfile`, the server's
+file reads run outside the request context, so logs and spans emitted inside a
+custom file object's `read()` are not parented to the request.
+
 The wrapper reuses the request counters, histogram buckets, route allow-list,
 sampling-independent totals and header trust rules above. The process/branch
 concurrency value counts eligible requests already inside the wrapper,

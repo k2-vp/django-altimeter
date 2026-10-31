@@ -119,6 +119,10 @@ def _provider_created_span(current: Span, provider: trace.TracerProvider) -> boo
     )
 
 
+def _is_owned_span(current: Span, provider: trace.TracerProvider) -> bool:
+    return current is _OWNED_SPAN.get() or _provider_created_span(current, provider)
+
+
 def get_correlation() -> Correlation | None:
     """Return current native IDs only for this process's owned trace provider."""
     try:
@@ -128,9 +132,7 @@ def get_correlation() -> Correlation | None:
         if runtime is None:
             return None
         active = trace.get_current_span()
-        if active is not _OWNED_SPAN.get() and not _provider_created_span(
-            active, runtime.tracer_provider
-        ):
+        if not _is_owned_span(active, runtime.tracer_provider):
             return None
         current = active.get_span_context()
         if type(current) is not SpanContext or not current.is_valid:
@@ -233,7 +235,10 @@ def enrich(subject: object) -> None:
         if runtime is None or runtime.config.identity_resolver is None:
             return
         current = trace.get_current_span()
-        if not current.is_recording():
+        if (
+            not _is_owned_span(current, runtime.tracer_provider)
+            or not current.is_recording()
+        ):
             return
         identity = runtime.config.identity_resolver(subject)
         if type(identity) is not Identity:

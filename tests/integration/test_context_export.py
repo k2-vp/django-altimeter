@@ -681,3 +681,53 @@ def test_client_boundary_keeps_parent_and_application_exception(otlp_receiver):
         CANARY.encode() not in request.message.SerializeToString()
         for request in otlp_receiver.requests
     )
+
+
+def test_enrich_ignores_foreign_span_with_owned_provider_and_exports_neighbors(
+    otlp_receiver,
+):
+    calls = _run(
+        otlp_receiver,
+        """
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
+            OTLPSpanExporter,
+        )
+        from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+
+        calls = []
+        def resolver(subject):
+            calls.append('resolved')
+            return Identity('opaque-person', 'opaque-tenant')
+        assert 'traces' in configure(resolver).enabled_signals
+        foreign = TracerProvider(resource=Resource({}), shutdown_on_exit=False)
+        foreign.add_span_processor(SimpleSpanProcessor(
+            OTLPSpanExporter(endpoint=sys.argv[1]),
+        ))
+        with span('work.execute'):
+            enrich(Subject())
+            with foreign.get_tracer('foreign').start_as_current_span(
+                'foreign', attributes={'http.response.status_code': 201},
+            ):
+                assert get_correlation() is None
+                enrich(Subject())
+        owned = get_owned_trace_runtime().tracer_provider.get_tracer('owned')
+        with owned.start_as_current_span('work.child'):
+            assert get_correlation() is not None
+            enrich(Subject())
+        assert get_correlation() is None
+        assert shutdown().completed
+        foreign.shutdown()
+        print(json.dumps(calls))
+        """,
+    )
+    spans = _spans(otlp_receiver)
+    assert len(spans) == 3
+    foreign = next(item for item in spans if item.name == "foreign")
+    assert _attributes(foreign) == {"http.response.status_code": 201}
+    for name in ("work.execute", "work.child"):
+        current = next(item for item in spans if item.name == name)
+        assert _attributes(current) == {
+            "posthogDistinctId": "opaque-person",
+            "altimeter.tenant_id": "opaque-tenant",
+        }
+    assert calls == ["resolved", "resolved"]

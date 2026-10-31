@@ -497,6 +497,17 @@ def _origins(value: object) -> frozenset[str]:
     return origins
 
 
+def _internal_origins(value: object) -> frozenset[str]:
+    # Outbound context carries no credential. Its declared HTTP(S) destinations
+    # use their own exact-origin policy, independent of secure exporter URLs.
+    from django_altimeter.headers import normalize_internal_origin
+
+    origins = _strings(value)
+    if any(normalize_internal_origin(origin) is None for origin in origins):
+        raise _Invalid("config.invalid_origin")
+    return origins
+
+
 def _callback(value: object) -> Callback | None:
     if value is None:
         return None
@@ -643,7 +654,7 @@ def load_config(
                 _choose(env, "ALTIMETER_SHUTDOWN_TIMEOUT", default="2"), 0.001, 2
             ),
             excluded_routes=_strings(settings.get("EXCLUDED_ROUTES", ())),
-            internal_origins=_origins(settings.get("INTERNAL_ORIGINS", ())),
+            internal_origins=_internal_origins(settings.get("INTERNAL_ORIGINS", ())),
             frontend_origins=_origins(settings.get("FRONTEND_ORIGINS", ())),
             identity_resolver=_callback(settings.get("IDENTITY_RESOLVER")),
             log_scrubber=_callback(settings.get("LOG_SCRUBBER")),
@@ -772,7 +783,7 @@ def validate_config(config: Config) -> ConfigResult:
             if type(collection) is not frozenset:
                 raise _Invalid("config.invalid_settings")
         _strings(config.excluded_routes)
-        _origins(config.internal_origins)
+        _internal_origins(config.internal_origins)
         _origins(config.frontend_origins)
         _callback(config.identity_resolver)
         _callback(config.log_scrubber)

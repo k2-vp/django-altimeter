@@ -1511,3 +1511,59 @@ def test_native_start_hook_cannot_share_parent_context_between_requests(
     assert _metric_count(otlp_receiver, "altimeter.http.server.requests") == 2
     for request in otlp_receiver.requests:
         assert b"CANARY" not in request.message.SerializeToString()
+
+
+@pytest.mark.parametrize("sample_rate", [0.0, 1.0])
+@pytest.mark.parametrize("abort", [False, True])
+def test_owned_request_correlation_survives_foreign_scope_and_cleans_up(
+    otlp_receiver, sample_rate, abort
+):
+    result = _run(
+        otlp_receiver,
+        f"        RATE = {sample_rate!r}; ABORT = {abort!r}\n"
+        + """
+        from opentelemetry.sdk.trace import TracerProvider
+        from django_altimeter.asgi import instrument
+        from django_altimeter.context import get_correlation
+        configure(sample_rate=RATE)
+        foreign = TracerProvider(shutdown_on_exit=False)
+        seen = {}
+        async def app(scope, receive, send):
+            before = get_correlation()
+            seen['owned'] = before is not None
+            with foreign.get_tracer('foreign').start_as_current_span('foreign'):
+                seen['foreign_hidden'] = get_correlation() is None
+            seen['restored'] = get_correlation() == before
+            if ABORT:
+                raise asyncio.CancelledError()
+            await send({'type': 'http.response.start', 'status': 200, 'headers': []})
+            await send({'type': 'http.response.body', 'body': b'safe'})
+        async def receive():
+            return {'type': 'http.request', 'body': b''}
+        async def send(message):
+            pass
+        async def run():
+            try:
+                await instrument(app)(dict(SCOPE), receive, send)
+            except asyncio.CancelledError:
+                assert ABORT
+            seen['clean'] = get_correlation() is None
+        asyncio.run(run())
+        foreign.shutdown()
+        assert shutdown().completed
+        print(json.dumps(seen))
+        """,
+    )
+    assert result == {
+        "owned": True,
+        "foreign_hidden": True,
+        "restored": True,
+        "clean": True,
+    }
+    spans = _spans(otlp_receiver)
+    assert len(spans) == int(sample_rate)
+    if sample_rate:
+        assert spans[0].kind == 2
+        assert _attributes(spans[0])["altimeter.http.outcome"] == (
+            "aborted" if abort else "completed"
+        )

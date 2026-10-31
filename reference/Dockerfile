@@ -40,7 +40,7 @@ subprocess.run(
         'pytest-django==4.14.0',
         *(['django-ninja==1.6.2', 'uvicorn==0.46.0']
           if os.environ['ALTIMETER_REFERENCE_ASGI'] == '1' else []),
-        str(wheels[0]),
+        f"{wheels[0]}[psycopg,httpx,requests,redis,structlog]",
     ],
     check=True,
 )

@@ -791,3 +791,40 @@ def test_explicit_probe_role_validates_without_changing_default_role():
     rejected = load_config(environ=enabled_env(), role=CANARY)
     assert rejected.config is None and rejected.codes == ("config.invalid_role",)
     assert CANARY not in repr(rejected)
+
+
+@pytest.mark.parametrize(
+    "origin", ["http://inventory:8080", "https://catalog.example", "http://[::1]:8080"]
+)
+def test_internal_http_origins_use_a_separate_destination_policy(origin):
+    result = load_config(environ=enabled_env(), values={"INTERNAL_ORIGINS": [origin]})
+    assert result.ok, result.codes
+    assert result.config.internal_origins == frozenset({origin})
+    assert validate_config(result.config).ok
+    assert not load_config(
+        environ=enabled_env(OTEL_EXPORTER_OTLP_ENDPOINT="http://inventory:8080")
+    ).ok
+    assert not load_config(
+        environ=enabled_env(), values={"FRONTEND_ORIGINS": ["http://inventory:8080"]}
+    ).ok
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "https://catalog.example/",
+        "https://catalog.example/path",
+        "https://catalog.example?",
+        "https://catalog.example#fragment",
+        "https://user:secret@catalog.example",
+        "https://*.example",
+        "http://inventory:0",
+        "ftp://inventory",
+    ],
+)
+def test_internal_origins_reject_ambiguous_authority_and_non_origin_parts(origin):
+    result = load_config(environ=enabled_env(), values={"INTERNAL_ORIGINS": [origin]})
+    assert not result.ok and result.config is None
+    assert result.codes == ("config.invalid_origin",)
+    valid = parsed()
+    assert not validate_config(replace(valid, internal_origins=frozenset({origin}))).ok

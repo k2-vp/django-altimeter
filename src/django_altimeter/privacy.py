@@ -146,6 +146,7 @@ _DB_OPERATIONS = frozenset(
         "CALL",
     }
 )
+_REDIS_OPERATIONS = frozenset({"GET", "SET", "DEL", "PING", "PIPELINE"})
 _DB_SYSTEMS = frozenset({"postgresql", "mysql", "sqlite", "redis"})
 _SAFE_NAMES = _HTTP_METHODS | _DB_OPERATIONS | {"HTTP", "DB", "SPAN"}
 
@@ -302,7 +303,7 @@ def _allowed_attribute(
     if key in {"http.method", "http.request.method"}:
         return value in _HTTP_METHODS
     if key in {"db.operation", "db.operation.name"}:
-        return value in _DB_OPERATIONS or value == "DB"
+        return value in _DB_OPERATIONS or value in _REDIS_OPERATIONS or value == "DB"
     if key in {"db.system", "db.system.name"}:
         return value in _DB_SYSTEMS
     return (key, value) in policy.attribute_values

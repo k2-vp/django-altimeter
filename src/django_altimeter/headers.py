@@ -269,3 +269,88 @@ def response_mode(headers: object) -> str:
     except Exception:
         _diagnostic("http.response_mode_failed")
     return "unknown"
+
+
+# Only propagation/identity headers are removed; application auth and body headers
+# remain the client's responsibility. A fixed set also covers mixed-case carriers.
+OUTBOUND_CONTEXT_HEADERS = frozenset(
+    {
+        "traceparent",
+        "tracestate",
+        "baggage",
+        "x-altimeter-trace-id",
+        "x-altimeter-trace-sampled",
+        "posthogdistinctid",
+        "altimeter.tenant_id",
+        "sessionid",
+        "x-posthog-distinct-id",
+        "x-tenant-id",
+        "x-session-id",
+    }
+)
+
+
+def _destination_origin(value: object, *, origin_only: bool = False) -> str | None:
+    from urllib.parse import urlsplit
+
+    if type(value) is not str or len(value) > 2048 or not value.isascii():
+        return None
+    if any(ord(char) <= 32 or ord(char) >= 127 for char in value) or "\\" in value:
+        return None
+    try:
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or "*" in parsed.netloc
+            or "%" in parsed.netloc
+        ):
+            return None
+        if origin_only and (parsed.path or "?" in value or "#" in value):
+            return None
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        if parsed.port == 0 or not 1 <= port <= 65535:
+            return None
+        host = parsed.hostname
+        if ":" in host:
+            from ipaddress import IPv6Address
+
+            host = f"[{IPv6Address(host).compressed}]"
+        return f"{parsed.scheme}://{host}:{port}"
+    except (ValueError, UnicodeError):
+        return None
+
+
+def normalize_internal_origin(value: object) -> str | None:
+    """Validate a declared HTTP(S) origin independently of exporter security."""
+    return _destination_origin(value, origin_only=True)
+
+
+def outgoing_headers(
+    url: object,
+    *,
+    internal_origins: frozenset[str],
+    correlation: Correlation | None = None,
+    owned_tracing: bool = False,
+) -> dict[str, str]:
+    """Generate only a bounded local W3C parent for an exact declared origin.
+
+    Client boundaries remove OUTBOUND_CONTEXT_HEADERS from their native carrier
+    before applying this result, including on every redirect hop. No global
+    propagator is consulted, so baggage and tracestate cannot be injected.
+    """
+    if owned_tracing is not True or not _valid_correlation(correlation):
+        return {}
+    if type(internal_origins) is not frozenset or len(internal_origins) > 128:
+        return {}
+    destination = _destination_origin(url)
+    if destination is None:
+        return {}
+    if not any(
+        normalize_internal_origin(origin) == destination for origin in internal_origins
+    ):
+        return {}
+    flags = "01" if correlation.trace_flags & 1 else "00"
+    return {"traceparent": f"00-{correlation.trace_id}-{correlation.span_id}-{flags}"}

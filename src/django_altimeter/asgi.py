@@ -17,7 +17,7 @@ from typing import Any
 from opentelemetry import context, metrics, trace
 from opentelemetry.trace import Span, SpanKind, Status, StatusCode
 
-from django_altimeter.context import Correlation
+from django_altimeter.context import Correlation, _mark_owned_span, _reset_owned_span
 from django_altimeter.headers import incoming_context, response_headers, response_mode
 from django_altimeter.http import RequestState, request_state
 from django_altimeter.runtime import (
@@ -165,6 +165,7 @@ class _InstrumentedASGI:
         parent = _EMPTY_CONTEXT
         state_token: Token[RequestState | None] | None = None
         trace_token: Token[context.Context] | None = None
+        owned_span_token: Token[Span | None] | None = None
         previous_state = scope.get(_STATE_KEY, _MISSING)
         counted = False
         completed_at: float | None = None
@@ -203,6 +204,8 @@ class _InstrumentedASGI:
             # Even when a native start hook fails, do not disclose or adopt an
             # unrelated caller span as this request's SERVER observation.
             trace_token = context.attach(trace.set_span_in_context(span, parent))
+            if owned_tracing and span is not trace.INVALID_SPAN:
+                owned_span_token = _mark_owned_span(span)
         except Exception:
             _diagnostic("http.context_failed")
 
@@ -321,6 +324,7 @@ class _InstrumentedASGI:
                         failed=failed,
                     )
             finally:
+                _reset_owned_span(owned_span_token)
                 if counted:
                     self._leave()
                 if trace_token is not None:

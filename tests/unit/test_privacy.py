@@ -1321,3 +1321,42 @@ def test_log_projection_preserves_empty_map_wire_presence_after_scrubbing(nested
     assert records[1].body.string_value == "request.completed"
     assert CANARY.encode() not in result.SerializeToString()
     assert request.SerializeToString(deterministic=True) == before
+
+
+@pytest.mark.parametrize("operation", ["GET", "SET", "DEL", "PING", "PIPELINE"])
+def test_redis_operation_allowlist_keeps_safe_fact_and_drops_command_canaries(
+    operation,
+):
+    request = ExportTraceServiceRequest()
+    group = request.resource_spans.add()
+    group.resource.attributes.append(attribute("service.name", "reference"))
+    scope = group.scope_spans.add()
+    scope.scope.name = "django_altimeter"
+    for value in (operation, f"{operation} {CANARY}"):
+        span = scope.spans.add(
+            name="DB",
+            trace_id=TRACE_ID,
+            span_id=SPAN_ID,
+            kind=3,
+            start_time_unix_nano=10,
+            end_time_unix_nano=30,
+        )
+        span.attributes.extend(
+            [
+                attribute("db.system.name", "redis"),
+                attribute("db.operation.name", value),
+                attribute("db.statement", CANARY),
+            ]
+        )
+    assert is_allowed_attribute("db.operation.name", operation)
+    result = project_traces(request, policy=POLICY)
+    spans = result.resource_spans[0].scope_spans[0].spans
+    assert len(spans) == 2
+    assert {item.key: item.value.string_value for item in spans[0].attributes} == {
+        "db.system.name": "redis",
+        "db.operation.name": operation,
+    }
+    assert {item.key: item.value.string_value for item in spans[1].attributes} == {
+        "db.system.name": "redis",
+    }
+    assert CANARY.encode() not in result.SerializeToString()

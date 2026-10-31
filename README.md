@@ -7,8 +7,10 @@ export.
 The current development release provides explicit runtime setup and shutdown,
 safe application spans, correlation, trusted identity enrichment, and on-demand
 configuration and delivery checks. Native ASGI request instrumentation supports
-Django and Ninja with explicit worker startup. WSGI and queue instrumentation are
-not included yet. Telemetry is disabled by default.
+Django and Ninja with explicit worker startup. Optional database and outgoing
+client integrations add safe child spans, and an explicitly attached logging
+handler exports approved records without changing stdout. WSGI and queue
+instrumentation are not included yet. Telemetry is disabled by default.
 
 ## Install
 
@@ -30,6 +32,15 @@ The base package does not install Celery or RQ. Importing `django_altimeter`
 performs no setup and starts no threads. The extras supply dependencies.
 Queue integrations are not included yet.
 
+Install only the optional request-work libraries your application uses:
+
+```sh
+uv pip install '.[psycopg,httpx,requests,redis,structlog]'
+```
+
+These extras supply dependencies; explicit setup and logging attachment below
+enable observation. The base package does not import optional client libraries.
+
 ## Compatibility
 
 The tested combinations are Python 3.12 / Django 5.2 and Python 3.13 / Django
@@ -40,6 +51,12 @@ OpenTelemetry API, SDK, and OTLP/HTTP exporter use >=1.45.1,<1.46 with the
 matching 0.66b1 semantic conventions. Queue extras use Celery >=5.6.3,<5.7
 and Kombu >=5.6.2,<5.7, or RQ >=2.10.0,<2.11. The development lock currently
 resolves those families to 1.45.1/0.66b1, 5.6.3/5.6.2, and 2.10.0 respectively.
+
+Request-work extras pin psycopg 3.3.4, psycopg-pool 3.3.1, HTTPX 0.28.1 and
+structlog 25.5.0. Redis is pinned to 6.1.1 on Python 3.12 and 7.4.0 on Python
+3.13. The verification profiles use Requests/urllib3 2.32.3/1.26.20 and
+2.33.1/2.6.3 respectively. Do not install a second instrumentor for a library
+already observed by Altimeter.
 
 ## Runtime lifecycle
 
@@ -320,6 +337,127 @@ cache directives are never relaxed. For configured frontend origins,
 `Timing-Allow-Origin` echoes only an exact approved origin and `Vary: Origin`
 merges with existing fields. This does not grant application CORS access; retain
 your own CORS and authentication policy.
+
+## Database and outgoing request work
+
+Select installed client integrations before calling `setup()` in the serving
+process. Django opens its database connections lazily; initialize telemetry
+before the first query or pool is opened:
+
+```sh
+export ALTIMETER_INTEGRATIONS=asgi,django,psycopg,requests,httpx,redis
+```
+
+Psycopg observes sync and async Django ORM queries, direct psycopg connections,
+and sync/async psycopg pools. Connections already open before setup, including
+existing pool members, are not adopted. New pool members created through
+`Connection.connect` after setup are instrumented. Missing optional libraries
+produce fixed setup gap codes and leave the application running. Repeated setup
+does not add another observation around the same operation.
+
+Driver spans use bounded operation names such as `SELECT` or the fallback `DB`.
+SQL text, comments, parameters, connection strings, Redis keys, arguments and
+results never become telemetry. SQLCommenter is off and SQL sent to the database
+is unchanged. Redis commands and pipelines get local child spans; no trace
+context is added to Redis commands.
+
+Use registered application spans around work that actually executes. For
+example, materialize a queryset once, then serialize those already loaded rows:
+
+```python
+from django_altimeter import span
+
+
+def render_records(queryset, serialize):
+    with span("records.materialize"):
+        rows = list(queryset)
+    with span("records.serialize"):
+        return serialize(rows)
+```
+
+Add both names to `ALTIMETER["SPAN_NAMES"]`. Driver time includes client work,
+transfer and database waiting; it is not pure database server execution time.
+An enclosing materialization span can overlap driver spans. Do not add
+overlapping durations or treat residual time as proof of queue wait or CPU use.
+Serialization spans cover the serializer call, not client receipt of the body.
+
+Requests and synchronous/asynchronous HTTPX observe physical requests, including
+redirect hops. These child spans end when the transport returns response headers;
+later response-body consumption belongs to the surrounding application work.
+Only exact operator-declared internal origins receive local W3C trace context:
+
+```python
+ALTIMETER = {
+    "SPAN_NAMES": ("records.materialize", "records.serialize"),
+    "INTERNAL_ORIGINS": ("https://catalog.example", "http://inventory:8080"),
+}
+```
+
+Origins consist of scheme, host and optional port; HTTP and HTTPS are allowed.
+Userinfo, paths, queries and wildcards are rejected. Public ingress headers do
+not authorize propagation of a remote identity or sampling decision. Baggage,
+tracestate and application correlation headers are removed at the outbound
+boundary; an approved origin receives the current owned `traceparent` only.
+Each redirect destination is checked again. Third-party and exporter requests
+carry no application trace context. Unrelated application headers and response
+bodies remain unchanged; raw URLs, query strings and bodies do not enter spans.
+
+Psycopg supports `execute` and `executemany` on ordinary, custom and named cursor
+factories. Psycopg2, connect aliases captured before setup, cursor overrides that
+bypass the installed factories, and COPY, stream, fetch or pipeline lifecycle
+timing are unsupported. HTTP transports or adapters that bypass the native
+parent method are also unsupported. Do not install overlapping automatic
+instrumentation.
+
+## Safe application logs
+
+Configure static bodies and approved logger scopes in Django settings, alongside
+your other Altimeter policy:
+
+```python
+ALTIMETER = {
+    "LOG_BODIES": ("records.ready",),
+    "EVENT_NAMES": ("records.ready",),
+    "SCOPE_NAMES": ("example.work",),
+}
+```
+
+After Django has configured logging and the serving process has called setup,
+attach one export route:
+
+```python
+import logging
+
+from django_altimeter import setup
+from django_altimeter.logging import install_logging
+
+setup(role="web")
+result = install_logging(routes=("example.work",))
+logging.getLogger("example.work").info("records.ready")
+```
+
+Enable the logs signal and configure its destination using the runtime settings
+above. `LoggingSetupResult.ok` reports successful attachment; `codes` contains
+fixed diagnostics. Explicitly include relevant nonpropagating loggers. A record
+must not reach both a selected child route and a selected parent route. Repeated
+installation with the same routes is idempotent. Reattach after application
+logging configuration replaces handlers; changing routes requires a new process.
+
+The handler builds a bounded copy for export, preserving application
+`LogRecord` objects, stdout bytes, formatters, levels and propagation settings.
+It supports stdlib records and structlog `ProcessorFormatter` events before
+stdout rendering. Approved static bodies, severity, scope, service and owned
+trace/span IDs survive. Unknown free text, rendered JSON, nested values,
+exception prose and stack traces are dropped. Internal telemetry loggers cannot
+feed export diagnostics back into the export handler. Existing stdout privacy
+and error-reporting policies remain the application responsibility.
+
+Use `get_correlation()` at an existing error-reporting boundary before context
+detach. Pass the immutable scalar snapshot through that reporter, rather than
+passing a native span or looking up context later in a reporting thread.
+Altimeter does not create a PostHog client or report another exception occurrence.
+See [logging attachment and correlation](docs/logging.md) for topology,
+scrubber, nonpropagating logger and post-configuration details.
 
 ## Check configuration and delivery
 
@@ -702,21 +840,33 @@ name for each run:
 
 ```sh
 docker compose -p <unique-asgi-name> -f reference/compose.yaml --profile asgi run --build --rm verify-asgi python -m pytest tests/integration/test_wheel.py
+docker compose -p <unique-asgi-name> -f reference/compose.yaml --profile asgi down --remove-orphans
 docker compose -p <unique-wsgi-name> -f reference/compose.yaml --profile wsgi run --build --rm verify-wsgi python -m pytest tests/integration/test_wheel.py
+docker compose -p <unique-wsgi-name> -f reference/compose.yaml --profile wsgi down --remove-orphans
 ```
+
+Run the matching cleanup command after every verification run, including a
+failed run. `run --rm` removes only the test container; `down --remove-orphans`
+also stops that project's Postgres and Redis and removes its network. In a
+script, use an exit trap so failure cannot bypass cleanup. Keep each project
+name identical between its run and cleanup commands.
 
 Verify the native transport against both installed-wheel profiles:
 
 ```sh
 docker compose -p <unique-asgi-transport-name> -f reference/compose.yaml --profile asgi run --build --rm verify-asgi python -m pytest tests/integration/test_otlp_transport.py
+docker compose -p <unique-asgi-transport-name> -f reference/compose.yaml --profile asgi down --remove-orphans
 docker compose -p <unique-wsgi-transport-name> -f reference/compose.yaml --profile wsgi run --build --rm verify-wsgi python -m pytest tests/integration/test_otlp_transport.py
+docker compose -p <unique-wsgi-transport-name> -f reference/compose.yaml --profile wsgi down --remove-orphans
 ```
 
 Test explicit runtime ownership and Django startup in both profiles:
 
 ```sh
 docker compose -p <unique-asgi-runtime-name> -f reference/compose.yaml --profile asgi run --build --rm verify-asgi python -m pytest tests/integration/test_django_boundary.py tests/integration/test_runtime_process.py
+docker compose -p <unique-asgi-runtime-name> -f reference/compose.yaml --profile asgi down --remove-orphans
 docker compose -p <unique-wsgi-runtime-name> -f reference/compose.yaml --profile wsgi run --build --rm verify-wsgi python -m pytest tests/integration/test_django_boundary.py tests/integration/test_runtime_process.py
+docker compose -p <unique-wsgi-runtime-name> -f reference/compose.yaml --profile wsgi down --remove-orphans
 ```
 
 The ASGI image also pins Ninja 1.6.2 and uvicorn 0.46.0. It uses
@@ -745,11 +895,45 @@ exercise the transport failure cases. Receiver and processor checks run with:
 uv run pytest tests/support/test_otlp_receiver.py tests/integration/test_processor_export.py
 ```
 
+The request-work profiles start dedicated Postgres and Redis services without
+published ports. Every test uses a unique database and Redis key prefix; it
+cleans up only that namespace and never flushes shared Redis. PostgreSQL trust
+authentication is confined to this local, unexposed test network. The reference
+app reuses Django's existing ContentType model and adds no model or migration.
+
+The full host test suite also needs real Postgres and Redis services. Point
+`ALTIMETER_TEST_POSTGRES_DSN` and `ALTIMETER_TEST_REDIS_URL` at isolated test
+services before running `uv run pytest -q`. For example, use
+`host=127.0.0.1 port=<postgres-port> dbname=postgres user=postgres` and
+`redis://127.0.0.1:<redis-port>/0`. The CI host jobs provision health-checked
+services with these settings and pinned image digests. The Compose profiles
+provide the settings automatically.
+
+Run real uvicorn request-to-driver/client/log checks in the ASGI image, and the
+standalone work in both Python environments, after rebuilding the wheel:
+
+```sh
+docker compose -p <unique-asgi-work-name> -f reference/compose.yaml --profile asgi run --build --rm verify-asgi python -m pytest tests/integration/test_reference_work.py
+docker compose -p <unique-asgi-work-name> -f reference/compose.yaml --profile asgi down --remove-orphans
+docker compose -p <unique-wsgi-work-name> -f reference/compose.yaml --profile wsgi run --build --rm verify-wsgi python -m pytest tests/integration/test_reference_work.py::TestStandaloneReferenceWork tests/integration/test_reference_work.py::test_request_work_extras_install_pinned_clients
+docker compose -p <unique-wsgi-work-name> -f reference/compose.yaml --profile wsgi down --remove-orphans
+```
+
+The `/work/` endpoints run sync/async ORM queries, direct psycopg, 4,096-row
+materialization/serialization, Requests and HTTPX calls, redirects, Redis
+commands, and safe/canary logs. They are enabled only by the reference test
+launcher. Outgoing checks delay a real HTTP response by 150 ms and require the
+application span to contain that delay and parent its client spans, covering
+Requests and synchronous/asynchronous HTTPX. The Python 3.12 standalone checks
+do not run a WSGI server.
+
 Test the management command from the installed wheel in both profiles:
 
 ```sh
 docker compose -p <unique-asgi-check-name> -f reference/compose.yaml --profile asgi run --build --rm verify-asgi python -m pytest tests/integration/test_check_command.py
+docker compose -p <unique-asgi-check-name> -f reference/compose.yaml --profile asgi down --remove-orphans
 docker compose -p <unique-wsgi-check-name> -f reference/compose.yaml --profile wsgi run --build --rm verify-wsgi python -m pytest tests/integration/test_check_command.py
+docker compose -p <unique-wsgi-check-name> -f reference/compose.yaml --profile wsgi down --remove-orphans
 ```
 
 The command tests use real subprocesses and a local OTLP receiver. A local HTTP
@@ -771,6 +955,7 @@ with the installed wheel:
 ```sh
 uv build
 docker compose -p <unique-asgi-web-name> -f reference/compose.yaml --profile asgi run --build --rm verify-asgi python -m pytest tests/unit/test_metrics.py tests/integration/test_asgi.py tests/integration/test_uvicorn_server.py tests/performance/test_web_overhead.py -s
+docker compose -p <unique-asgi-web-name> -f reference/compose.yaml --profile asgi down --remove-orphans
 ```
 
 Default test runs, including CI, exclude the wall-clock acceptance test through
@@ -780,6 +965,7 @@ verification image after `uv build`, using a unique project name:
 
 ```sh
 docker compose -p <unique> -f reference/compose.yaml --profile asgi run --build --rm verify-asgi python -m pytest -m performance tests/performance/test_web_overhead.py
+docker compose -p <unique> -f reference/compose.yaml --profile asgi down --remove-orphans
 ```
 
 The explicit `-m performance` overrides the default selection and selects one

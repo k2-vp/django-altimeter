@@ -3,12 +3,13 @@
 import logging
 from collections.abc import Iterator, Mapping
 from contextlib import AbstractContextManager, contextmanager
+from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from math import isfinite
 from typing import TypeGuard
 
 from opentelemetry import trace
-from opentelemetry.trace import Span, SpanContext, Status, StatusCode
+from opentelemetry.trace import Span, SpanContext, SpanKind, Status, StatusCode
 
 from django_altimeter.privacy import PrivacyLimits, is_allowed_attribute
 
@@ -16,6 +17,7 @@ _Scalar = str | bool | int | float
 _DISTINCT_ID_KEY = "posthogDistinctId"
 _TENANT_ID_KEY = "altimeter.tenant_id"
 _RESOLVER_KEYS = frozenset({_DISTINCT_ID_KEY, _TENANT_ID_KEY})
+_OWNED_SPAN: ContextVar[Span | None] = ContextVar("altimeter_owned_span", default=None)
 
 
 @dataclass(frozen=True)
@@ -82,14 +84,55 @@ def _diagnostic(code: str) -> None:
         pass  # An application logging handler cannot break telemetry helpers.
 
 
+def _mark_owned_span(current: Span) -> Token[Span | None] | None:
+    """Mark a span just created by an owned Altimeter boundary, including unsampled."""
+    try:
+        return _OWNED_SPAN.set(current)
+    except Exception:
+        _diagnostic("context.mark_failed")
+        return None
+
+
+def _reset_owned_span(token: Token[Span | None] | None) -> None:
+    try:
+        if token is not None:
+            _OWNED_SPAN.reset(token)
+    except Exception:
+        _diagnostic("context.reset_failed")
+
+
+def _provider_created_span(current: Span, provider: trace.TracerProvider) -> bool:
+    # Pinned SDK 1.45.x has no public Span -> provider link. Its exact native
+    # _Span carries the provider's processor object. Missing or changed private
+    # state fails closed; unknown Span subclasses never have accessors invoked.
+    from opentelemetry.sdk.trace import TracerProvider, _Span
+
+    if type(current) is not _Span or type(provider) is not TracerProvider:
+        return False
+    span_fields = current.__dict__
+    provider_fields = provider.__dict__
+    if type(span_fields) is not dict or type(provider_fields) is not dict:
+        return False
+    processor = span_fields.get("_span_processor")
+    return processor is not None and processor is provider_fields.get(
+        "_active_span_processor"
+    )
+
+
 def get_correlation() -> Correlation | None:
     """Return current native IDs only for this process's owned trace provider."""
     try:
         from django_altimeter.runtime import get_owned_trace_runtime
 
-        if get_owned_trace_runtime() is None:
+        runtime = get_owned_trace_runtime()
+        if runtime is None:
             return None
-        current = trace.get_current_span().get_span_context()
+        active = trace.get_current_span()
+        if active is not _OWNED_SPAN.get() and not _provider_created_span(
+            active, runtime.tracer_provider
+        ):
+            return None
+        current = active.get_span_context()
         if type(current) is not SpanContext or not current.is_valid:
             return None
         return Correlation(
@@ -102,18 +145,32 @@ def get_correlation() -> Correlation | None:
         return None
 
 
-@contextmanager
 def span(
     name: str, *, attributes: Mapping[str, object] | None = None
-) -> Iterator[Span]:
+) -> AbstractContextManager[Span]:
     """Create a registered native span, usable with `with` in sync/async code.
 
     Only exact builtin dictionaries and bounded scalar entries reach the SDK.
     Unknown names and unowned tracing yield INVALID_SPAN without changing the
     caller's existing context. Exceptions from the body always propagate.
     """
+    return _span(name, attributes, SpanKind.INTERNAL)
+
+
+def client_span(
+    name: str, *, attributes: Mapping[str, object] | None = None
+) -> AbstractContextManager[Span]:
+    """Use the same bounded native lifecycle for concrete driver/client calls."""
+    return _span(name, attributes, SpanKind.CLIENT)
+
+
+@contextmanager
+def _span(
+    name: str, attributes: Mapping[str, object] | None, kind: SpanKind
+) -> Iterator[Span]:
     manager: AbstractContextManager[Span] | None = None
     current: Span = trace.INVALID_SPAN
+    marker: Token[Span | None] | None = None
     try:
         from django_altimeter.runtime import get_owned_trace_runtime
 
@@ -129,11 +186,13 @@ def span(
             ).start_as_current_span(
                 name,
                 attributes=safe,
+                kind=kind,
                 record_exception=False,
                 set_status_on_exception=False,
             )
             current = candidate.__enter__()
             manager = candidate
+            marker = _mark_owned_span(current)
     except Exception:
         _diagnostic("context.span_start_failed")
 
@@ -157,6 +216,7 @@ def span(
                 manager.__exit__(None, None, None)
             except Exception:
                 _diagnostic("context.span_end_failed")
+        _reset_owned_span(marker)
 
 
 def enrich(subject: object) -> None:

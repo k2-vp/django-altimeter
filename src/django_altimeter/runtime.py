@@ -116,6 +116,7 @@ class ProcessRuntime:
         self.tracer_provider: trace.TracerProvider = NoOpTracerProvider()
         self.tracer: trace.Tracer = trace.NoOpTracer()
         self.logger_provider: APILoggerProvider = NoOpLoggerProvider()
+        self.log_handler: logging.Handler | None = None
         self.meter_provider: metrics.MeterProvider = NoOpMeterProvider()
         self.request_metrics: RequestMetrics | None = None
         self.response_header_policy: ResponseHeaderPolicy | None = None
@@ -401,6 +402,22 @@ class ProcessRuntime:
             except Exception:
                 code = f"setup.{signal}_failed"
             codes.append(code)
+        self.result = SetupResult(tuple(enabled), tuple(codes))
+        if "traces" in enabled:
+            if self.config.integrations & {"psycopg", "psycopg2"}:
+                try:
+                    from django_altimeter.psycopg import install as install_psycopg
+
+                    codes.extend(install_psycopg(self).codes)
+                except Exception:
+                    codes.append("setup.psycopg_failed")
+            if self.config.integrations & {"requests", "httpx", "redis"}:
+                try:
+                    from django_altimeter.clients import install_clients
+
+                    codes.extend(install_clients(self))
+                except Exception:
+                    codes.append("setup.clients_failed")
         self.result = SetupResult(tuple(enabled), tuple(codes))
         # Start once at setup, not at atexit. Even unsuccessful partial
         # construction can leave native workers that need bounded cleanup.

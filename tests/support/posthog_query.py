@@ -33,6 +33,7 @@ class _Response:
     hang: bool = False
     chunk_size: int = 8192
     chunk_delay: float = 0
+    chunked: bool = False
 
 
 class PostHogQueryServer:
@@ -101,8 +102,11 @@ class PostHogQueryServer:
                     self.send_response(script.status)
                     headers = {
                         "content-type": "application/json",
-                        "content-length": str(len(body)),
                     }
+                    if script.chunked:
+                        headers["transfer-encoding"] = "chunked"
+                    else:
+                        headers["content-length"] = str(len(body))
                     headers.update(
                         (key.lower(), value) for key, value in script.headers
                     )
@@ -112,7 +116,15 @@ class PostHogQueryServer:
                     for offset in range(0, len(body), script.chunk_size):
                         if offset and boundary._stopping.wait(script.chunk_delay):
                             return
-                        self.wfile.write(body[offset : offset + script.chunk_size])
+                        chunk = body[offset : offset + script.chunk_size]
+                        if script.chunked:
+                            self.wfile.write(f"{len(chunk):x}\r\n".encode())
+                        self.wfile.write(chunk)
+                        if script.chunked:
+                            self.wfile.write(b"\r\n")
+                        self.wfile.flush()
+                    if script.chunked:
+                        self.wfile.write(b"0\r\n\r\n")
                         self.wfile.flush()
                 except (OSError, ValueError):
                     self.close_connection = True
@@ -170,12 +182,15 @@ class PostHogQueryServer:
         hang: bool = False,
         chunk_size: int = 8192,
         chunk_delay: float = 0,
+        chunked: bool = False,
     ) -> None:
         if chunk_size < 1 or delay < 0 or chunk_delay < 0:
             raise ValueError("invalid scripted response")
         with self._lock:
             self._responses.append(
-                _Response(status, body, headers, delay, hang, chunk_size, chunk_delay)
+                _Response(
+                    status, body, headers, delay, hang, chunk_size, chunk_delay, chunked
+                )
             )
 
     def _answer(self, payload: dict[str, object]) -> bytes:

@@ -316,6 +316,33 @@ def test_hangs_and_trickled_body_respect_budget_and_server_teardown(mode: str) -
     assert monotonic() - start < 0.6
 
 
+@pytest.mark.parametrize("trickle", [False, True])
+def test_chunked_query_body_obeys_the_same_deadline(trickle: bool) -> None:
+    from time import monotonic
+
+    instance, now = str(uuid4()), datetime.now(UTC)
+    start = monotonic()
+    with PostHogQueryServer() as query:
+        query.queue_response(
+            body=_body("logs", instance, now),
+            chunked=True,
+            chunk_size=1 if trickle else 8192,
+            chunk_delay=0.01 if trickle else 0,
+        )
+        result = _read(
+            query, instance, now, signals=("logs",), timeout=0.15 if trickle else 2
+        )
+        assert result.ok is not trickle
+        assert result.signals[0].code == (
+            "readback.deadline" if trickle else "readback.observed"
+        )
+        assert result.signals[0].attempts == 1
+        assert len(query.requests) == 1
+        assert "CANARY" not in repr(result)
+    if trickle:
+        assert monotonic() - start < 0.6
+
+
 def test_absence_stops_after_six_attempts_with_bounded_backoff() -> None:
     from time import monotonic
 

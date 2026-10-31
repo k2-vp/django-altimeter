@@ -801,6 +801,7 @@ class TestWSGILogFlow:
     def test_request_logs_and_identity_stay_in_their_gthread_context(
         self, wsgi_logging_wheel, tmp_path, sample_rate, threads
     ):
+        from collections import Counter
         from concurrent.futures import ThreadPoolExecutor
 
         from support.gunicorn_server import running_server
@@ -862,6 +863,15 @@ class TestWSGILogFlow:
             }
             assert len(by_trace) == len(identities)
             assert None not in by_trace
+            expected_correlations = Counter(
+                (result["trace_id"], result["span_id"], result["trace_flags"] & 1)
+                for _, result in results
+            )
+            observed_correlations = Counter(
+                (record.trace_id.hex(), record.span_id.hex(), record.flags & 1)
+                for _, _, record in records
+            )
+            assert observed_correlations == expected_correlations
             assert len({result["pid"] for _, result in results}) == 1
             thread_ids = {result["thread_id"] for _, result in results}
             if threads == 1:

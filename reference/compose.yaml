@@ -33,7 +33,9 @@ services:
     environment:
       ALTIMETER_TEST_POSTGRES_DSN: "host=postgres port=5432 dbname=postgres user=postgres"
       ALTIMETER_TEST_REDIS_URL: "redis://redis:6379/0"
-    build:
+      ALTIMETER_TEST_CELERY_BROKER: "redis://redis:6379/13"
+      ALTIMETER_TEST_CELERY_BACKEND: "redis://redis:6379/14"
+    build: &asgi-build
       context: ..
       dockerfile: reference/Dockerfile
       args:
@@ -52,6 +54,8 @@ services:
     environment:
       ALTIMETER_TEST_POSTGRES_DSN: "host=postgres port=5432 dbname=postgres user=postgres"
       ALTIMETER_TEST_REDIS_URL: "redis://redis:6379/0"
+      ALTIMETER_TEST_CELERY_BROKER: "redis://redis:6379/13"
+      ALTIMETER_TEST_CELERY_BACKEND: "redis://redis:6379/14"
     build:
       context: ..
       dockerfile: reference/Dockerfile
@@ -62,3 +66,29 @@ services:
         # Locked transport versions of the supported WSGI deployment shape.
         REQUESTS_VERSION: "2.32.3"
         URLLIB3_VERSION: "1.26.20"
+
+  # Optional manual worker/beat commands use the same installed-wheel ASGI image.
+  # Integration tests launch their own processes with per-test UUID namespaces.
+  celery-worker:
+    profiles: [asgi]
+    build: *asgi-build
+    depends_on:
+      redis: {condition: service_healthy}
+    environment: &celery-environment
+      PYTHONPATH: /verify/reference
+      DJANGO_SETTINGS_MODULE: altimeter_reference.celery_settings
+      ALTIMETER_TEST_CELERY_BROKER: "redis://redis:6379/13"
+      ALTIMETER_TEST_CELERY_BACKEND: "redis://redis:6379/14"
+      REFERENCE_CELERY_QUEUE: reference
+      REFERENCE_CELERY_PREFIX: "reference:"
+    command: [python, -m, celery, -A, altimeter_reference.celery_app, worker, --pool=prefork, --concurrency=1, --loglevel=INFO]
+
+  celery-beat:
+    profiles: [asgi]
+    build: *asgi-build
+    depends_on:
+      redis: {condition: service_healthy}
+    environment:
+      <<: *celery-environment
+      REFERENCE_CELERY_BEAT: "1"
+    command: [python, -m, celery, -A, altimeter_reference.celery_app, beat, --schedule=/tmp/reference-beat, --loglevel=INFO]

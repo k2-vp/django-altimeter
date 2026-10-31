@@ -84,6 +84,8 @@ jobs:
         env:
           ALTIMETER_TEST_POSTGRES_DSN: host=127.0.0.1 port=${{ job.services.postgres.ports[5432] }} dbname=postgres user=postgres
           ALTIMETER_TEST_REDIS_URL: redis://127.0.0.1:${{ job.services.redis.ports[6379] }}/0
+          ALTIMETER_TEST_CELERY_BROKER: redis://127.0.0.1:${{ job.services.redis.ports[6379] }}/13
+          ALTIMETER_TEST_CELERY_BACKEND: redis://127.0.0.1:${{ job.services.redis.ports[6379] }}/14
 
   reference-images:
     runs-on: ubuntu-latest
@@ -102,6 +104,8 @@ jobs:
           enable-cache: false
       - run: uv build
       - name: Verify ${{ matrix.profile }} image
+        # Includes real Celery publication, worker lifecycle and metric/log suites.
+        # Wall-clock worker measurements remain in the explicit local image gate.
         run: >-
           docker compose -p altimeter-ci-${{ matrix.profile }}-${{ github.run_id }}
           -f reference/compose.yaml --profile ${{ matrix.profile }} run --build --rm

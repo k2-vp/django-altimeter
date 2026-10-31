@@ -17,7 +17,7 @@ from glob import escape
 from math import isfinite
 from threading import Event, Lock, Thread, get_ident
 from time import monotonic, time_ns
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NoReturn
 from uuid import uuid4
 
 from opentelemetry import metrics, trace
@@ -26,7 +26,8 @@ from opentelemetry.metrics import NoOpMeterProvider
 from opentelemetry.trace import NoOpTracerProvider
 
 from django_altimeter import _otel_compat
-from django_altimeter.conf import Config, validate_config
+from django_altimeter.conf import Config, SignalConfig, validate_config
+from django_altimeter.privacy import PrivacyLimits, PrivacyPolicy
 
 if TYPE_CHECKING:
     import requests
@@ -35,7 +36,6 @@ if TYPE_CHECKING:
     from opentelemetry.sdk.metrics import MeterProvider
     from opentelemetry.sdk.trace import TracerProvider
 
-    from django_altimeter.conf import SignalConfig
     from django_altimeter.exporting import ExportOutcome, SanitizingSession
     from django_altimeter.headers import ResponseHeaderPolicy
     from django_altimeter.metrics import RequestMetrics
@@ -83,23 +83,22 @@ def _process_session(
             self, method: str, url: str | bytes, *args: Any, **kwargs: Any
         ) -> requests.Response:
             if os.getpid() != runtime.pid:
-                failure = ExportProtocolError("export.owner")
-                self._remember_failure(failure)
-                raise failure
+                self._refuse("export.owner")
             deadline = runtime._shutdown_deadline
             if deadline is not None:
                 remaining = deadline - monotonic()
                 if remaining <= 0 or runtime._finished.is_set():
-                    failure = ExportProtocolError("export.deadline")
-                    self._remember_failure(failure)
-                    raise failure
+                    self._refuse("export.deadline")
                 timeout = kwargs.get("timeout", runtime.config.export_timeout)
                 if type(timeout) not in (int, float):
-                    failure = ExportProtocolError("export.deadline")
-                    self._remember_failure(failure)
-                    raise failure
+                    self._refuse("export.deadline")
                 kwargs["timeout"] = min(timeout, remaining)
             return super().request(method, url, *args, **kwargs)
+
+        def _refuse(self, code: str) -> NoReturn:
+            failure = ExportProtocolError(code)
+            self._remember_failure(failure)
+            raise failure
 
     return ProcessSession(
         signal, endpoint, policy=runtime._policy, limits=runtime.config.limits
@@ -243,6 +242,7 @@ class ProcessRuntime:
 
     def _install_metrics(self) -> None:
         from opentelemetry.sdk.metrics import (
+            AlwaysOffExemplarFilter,
             Counter,
             Histogram,
             MeterProvider,
@@ -295,8 +295,6 @@ class ProcessRuntime:
             export_interval_millis=self.config.metric_export_interval_millis,
             export_timeout_millis=self._export_timeout() * 1000,
         )
-        from opentelemetry.sdk.metrics import AlwaysOffExemplarFilter
-
         provider = MeterProvider(
             resource=Resource(self._resource_attributes()),
             metric_readers=[reader],
@@ -736,8 +734,6 @@ _PROBE_OUTPUT_LIMIT = 16 * 1024
 def _probe_configuration(config: Config, signals: tuple[str, ...]) -> dict[str, Any]:
     # Transfer only the deployment values needed by the existing composition.
     # Callbacks, request policy and operator/read-back credentials never cross.
-    from django_altimeter.conf import SignalConfig
-
     return {
         "service_name": config.service_name,
         "deployment_environment": config.deployment_environment,
@@ -752,9 +748,6 @@ def _probe_configuration(config: Config, signals: tuple[str, ...]) -> dict[str, 
 
 
 def _probe_config_from_json(values: dict[str, Any]) -> Config:
-    from django_altimeter.conf import SignalConfig
-    from django_altimeter.privacy import PrivacyLimits, PrivacyPolicy
-
     def signal(name: str) -> SignalConfig:
         data = values[name]
         return SignalConfig(

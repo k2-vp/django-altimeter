@@ -1,10 +1,12 @@
 """Installed-wheel Redis worker lineage; malformed carriers reach the consumer."""
 
+from collections import Counter
+from shutil import copytree
 from time import time
 
 import pytest
 from support.celery_worker import attributes, running_worker, spans
-from support.uvicorn_server import install_wheel
+from support.uvicorn_server import ROOT, install_wheel
 
 pytestmark = pytest.mark.integration
 _CANARY = "attempt-payload-canary"
@@ -217,4 +219,126 @@ def test_raw_malformed_carrier_fails_open_beside_valid_parent(
         "altimeter.worker.intentional_delay",
     ):
         assert sum(point.count for point in _points(otlp_receiver, name)) == 1
+    assert "canary" not in str(otlp_receiver.requests).lower()
+
+
+@pytest.fixture
+def control_flow_reference(tmp_path):
+    reference = tmp_path / "reference"
+    package = copytree(
+        ROOT / "reference" / "altimeter_reference",
+        reference / "altimeter_reference",
+    )
+    with (package / "celery_tasks.py").open("a") as tasks:
+        tasks.write(
+            """
+
+from celery.exceptions import Reject
+
+@app.task(bind=True, name="reference.replace")
+def replace(self):
+    return self.replace(echo.s("replacement-result-canary"))
+
+@app.task(name="reference.reject")
+def reject():
+    raise Reject("reject-message-canary", requeue=False)
+"""
+        )
+    with (package / "celery_settings.py").open("a") as settings:
+        settings.write(
+            '\nALTIMETER["ATTRIBUTE_VALUES"] += [\n'
+            '    ("task.name", "reference.replace"),\n'
+            '    ("task.name", "reference.reject"),\n'
+            "]\n"
+        )
+    return reference
+
+
+@pytest.mark.parametrize("mode", ["disabled", "enabled"])
+@pytest.mark.parametrize(
+    ("task", "native_state"),
+    [
+        ("reference.replace", "IGNORED"),
+        ("reference.cancel", "IGNORED"),
+        ("reference.reject", "REJECTED"),
+    ],
+    ids=["replace", "ignore", "reject"],
+)
+def test_control_flow_is_not_error_beside_failure_in_reused_prefork(
+    wheel, tmp_path, otlp_receiver, control_flow_reference, mode, task, native_state
+):
+    replaced = task == "reference.replace"
+    control_states = [native_state, "SUCCESS"] if replaced else [native_state]
+    with running_worker(
+        tmp_path / "worker",
+        wheel=wheel,
+        receiver=otlp_receiver,
+        mode=mode,
+        extra_env={"REFERENCE_PATH": str(control_flow_reference)},
+    ) as worker:
+        controlled = worker.submit(task, get=replaced)
+        worker.wait_for("postrun", count=len(control_states))
+        if replaced:
+            assert controlled["state"] == "SUCCESS"
+            assert controlled["result"]["payload"] == "replacement-result-canary"
+        else:
+            # Ignore/Reject deliberately leave the native backend result pending.
+            result = worker.execute(
+                """
+result = app.AsyncResult(json.load(sys.stdin))
+print(json.dumps({"state": result.state, "result": result.result}))
+""",
+                input=controlled["id"],
+            )
+            assert result == {"state": "PENDING", "result": None}
+        failed = worker.submit("reference.fail")
+        recovered = worker.submit(args=[_CANARY])
+        assert failed["state"] == "FAILURE"
+        assert failed["error_type"] == "ValueError"
+        assert failed["error"] == "exception-message-canary"
+        assert recovered["state"] == "SUCCESS"
+        assert recovered["result"]["payload"] == _CANARY
+        postrun = worker.wait_for("postrun", count=len(control_states) + 2)
+        assert [event["state"] for event in postrun] == control_states + [
+            "FAILURE",
+            "SUCCESS",
+        ]
+        assert all(event["correlation"] is None for event in postrun)
+        assert {event["pid"] for event in postrun} == {recovered["result"]["pid"]}
+        assert recovered["result"]["pid"] != worker.process.pid
+        assert [event["task_id"] for event in postrun[: len(control_states)]] == [
+            controlled["id"]
+        ] * len(control_states)
+        assert (
+            len([event for event in worker.events if event["event"] == "failure"]) == 1
+        )
+
+    if mode == "disabled":
+        assert otlp_receiver.requests == ()
+        return
+    consumers = sorted(
+        (span for _, span in spans(otlp_receiver) if span.kind == 5),
+        key=lambda span: span.start_time_unix_nano,
+    )
+    expected = [(task, "unknown", 0)]
+    if replaced:
+        expected.append(("reference.echo", "success", 0))
+    expected.extend(
+        [("reference.fail", "failure", 2), ("reference.echo", "success", 0)]
+    )
+    assert len(consumers) == len(expected)
+    for span, (name, outcome, status) in zip(consumers, expected, strict=True):
+        values = attributes(span.attributes)
+        assert span.name == "celery.process"
+        assert values["task.name"] == name
+        assert values["altimeter.outcome"] == outcome
+        assert span.status.code == status
+    for instrument in ("altimeter.worker.attempts", "altimeter.worker.duration"):
+        totals = Counter()
+        for point in _points(otlp_receiver, instrument):
+            values = attributes(point.attributes)
+            totals[(values["task.name"], values["altimeter.outcome"])] += (
+                point.as_int if instrument.endswith("attempts") else point.count
+            )
+        assert totals == Counter((name, outcome) for name, outcome, _ in expected)
     assert "canary" not in str(otlp_receiver.requests).lower()

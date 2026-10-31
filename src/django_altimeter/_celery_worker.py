@@ -111,7 +111,7 @@ def _detach_context(attempt: _Attempt) -> None:
         attempt.owned_token = None
 
 
-def _finish(attempt: _Attempt) -> None:
+def _finish(attempt: _Attempt, *, control_flow: bool = False) -> None:
     if not attempt.active:
         return
     attempt.active = False
@@ -119,7 +119,7 @@ def _finish(attempt: _Attempt) -> None:
     try:
         if attempt.span is not None:
             attempt.span.set_attribute("altimeter.outcome", attempt.outcome)
-            if attempt.outcome in {"failure", "unknown"}:
+            if not control_flow and attempt.outcome in {"failure", "unknown"}:
                 attempt.span.set_status(Status(StatusCode.ERROR))
             attempt.span.end(
                 end_time=attempt.start_time + int(duration * 1_000_000_000)
@@ -396,7 +396,10 @@ class _WorkerHooks:
                         "RETRY": "retry",
                         "FAILURE": "failure",
                     }.get(state, attempt.outcome)
-                _finish(attempt)
+                # Ignore (including replace) and Reject are deliberate control
+                # flow. Keep the bounded unknown outcome without marking ERROR.
+                control_flow = type(state) is str and state in {"IGNORED", "REJECTED"}
+                _finish(attempt, control_flow=control_flow)
         except Exception:
             _report("celery.finish_failed")
 

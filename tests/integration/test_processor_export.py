@@ -217,3 +217,134 @@ def test_bounds_admission_then_projection_keeps_safe_span_fields(
         "http.response.status_code": 200,
         "http.server.request.duration": 0.125,
     }
+
+
+@pytest.mark.parametrize("signal", ["traces", "logs"])
+def test_native_size_drop_is_reported_after_admission(signal, otlp_receiver, caplog):
+    from django_altimeter.exporting import (
+        SanitizingSession,
+        create_log_exporter,
+        create_span_exporter,
+    )
+
+    session = SanitizingSession(signal, otlp_receiver.url(signal), policy=POLICY)
+    if signal == "traces":
+        provider = TracerProvider(
+            resource=Resource({}),
+            shutdown_on_exit=False,
+            span_limits=native_span_limits(),
+        )
+        processor = BoundedSpanProcessor(
+            create_span_exporter(session), schedule_delay_millis=60_000
+        )
+        provider.add_span_processor(processor)
+        tracer = provider.get_tracer("django_altimeter")
+
+        def emit(attributes):
+            with tracer.start_as_current_span("request", attributes=attributes):
+                pass
+    else:
+        provider = LoggerProvider(
+            resource=Resource({}),
+            shutdown_on_exit=False,
+            log_record_limits=native_log_limits(),
+        )
+        processor = bounded_log_processor(
+            create_log_exporter(session), schedule_delay_millis=60_000
+        )
+        provider.add_log_record_processor(processor)
+        logger = provider.get_logger("django_altimeter")
+
+        def emit(attributes):
+            logger.emit(body="request.complete", attributes=attributes)
+
+    attributes = {f"unknown{i}": "x" * 250 for i in range(32)}
+    try:
+        for _ in range(128):
+            emit(attributes)
+        assert processor.last_diagnostic is None
+        assert provider.force_flush(timeout_millis=5_000)
+        assert not otlp_receiver.requests
+        assert session.outcome.code == "export.local_drop"
+        assert session.outcome.local_dropped_records == 128
+        assert session.outcome.accepted_records == session.outcome.rejected_records == 0
+        diagnostics = [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == "django_altimeter.export"
+        ]
+        assert diagnostics == [f"export.local_drop {signal}"]
+        emit({"http.response.status_code": 200})
+        assert provider.force_flush(timeout_millis=5_000)
+        assert session.outcome.code == "export.accepted"
+        assert session.outcome.accepted_records == 1
+        assert session.outcome.local_dropped_records == 0
+        assert len(otlp_receiver.requests) == 1
+    finally:
+        provider.shutdown()
+
+
+@pytest.mark.parametrize("oversized", [False, True], ids=["accepted", "size-drop"])
+def test_shutdown_reports_native_size_loss(otlp_receiver, oversized):
+    import json
+    import os
+
+    source = """
+import json, os
+from opentelemetry import trace
+from django_altimeter.conf import Config, SignalConfig
+from django_altimeter.runtime import setup, shutdown, get_process_runtime
+config = Config(
+    enabled=True, service_name="size-test", deployment_environment="test", release="v1",
+    traces=SignalConfig(True, os.environ["TEST_ENDPOINT"], destination="collector"),
+    batch_schedule_delay_millis=60000, export_timeout=0.5,
+)
+assert setup(config).ok
+runtime = get_process_runtime()
+tracer = trace.get_tracer("django_altimeter")
+with tracer.start_as_current_span("GET", attributes={"http.response.status_code": 200}):
+    pass
+assert runtime.tracer_provider.force_flush(timeout_millis=1000)
+attributes = ({f"unknown{i}": "x" * 250 for i in range(32)}
+              if os.environ["OVERSIZED"] == "1" else {"http.response.status_code": 200})
+# Less than the batch trigger: the explicit shutdown owns this final flush.
+for _ in range(126):
+    with tracer.start_as_current_span("GET", attributes=attributes):
+        pass
+result = shutdown()
+outcome = runtime._sessions[0].outcome
+print(json.dumps({"completed": result.completed, "codes": result.codes,
+                  "code": outcome.code, "dropped": outcome.local_dropped_records}))
+"""
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("ALTIMETER_", "OTEL_"))
+    }
+    process = subprocess.run(
+        [sys.executable, "-c", source],
+        env={
+            **environment,
+            "TEST_ENDPOINT": otlp_receiver.url("traces"),
+            "OVERSIZED": "1" if oversized else "0",
+        },
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert process.returncode == 0, process.stderr
+    result = json.loads(process.stdout)
+    assert result["completed"] is (not oversized), result
+    assert result["codes"] == (["shutdown.export_failed"] if oversized else [])
+    assert result["code"] == ("export.local_drop" if oversized else "export.accepted")
+    assert result["dropped"] == (126 if oversized else 0)
+    spans = [
+        span
+        for request in otlp_receiver.requests
+        for resource in request.message.resource_spans
+        for scope in resource.scope_spans
+        for span in scope.spans
+    ]
+    assert len(spans) == (1 if oversized else 127)
+    assert all(span.name == "GET" for span in spans)

@@ -488,6 +488,7 @@ _DIAGNOSTIC_CODES = frozenset(
         "export.connection",
         "export.invalid",
         "export.failed",
+        "export.local_drop",
         "export.framing",
         "metrics.timeout_unsupported",
     }
@@ -514,6 +515,7 @@ _OUTCOME_PRIORITY = {
     "export.accepted": 0,
     "export.warning": 1,
     "export.partial": 2,
+    "export.local_drop": 3,
 }
 
 
@@ -679,6 +681,7 @@ class _ProjectionScope:
         self.batch: _ProjectedBatch | None = None
         self.terminal_outcome: ExportOutcome | None = None
         self.active = True
+        self.requests_started = 0
         # Copied contexts may run on another thread while the export finishes.
         self.lock = Lock()
 
@@ -820,7 +823,31 @@ class SanitizingSession(requests.Session):
         self._outcome = ExportOutcome(code, local_dropped_records=local_dropped_records)
         self._emit_diagnostic()
 
-    def _export_in_scope[B, R](self, native_export: Callable[[B], R], batch: B) -> R:
+    def _native_export[B, R](
+        self, native_export: Callable[[B], R], batch: B, record_count: int
+    ) -> R:
+        """Account for native rejection before the transport is reached."""
+        scope = self._projection_scope.get()
+        if scope is None:
+            return native_export(batch)
+        with scope.lock:
+            before = scope.requests_started
+        try:
+            return native_export(batch)
+        finally:
+            with scope.lock:
+                unsent = scope.requests_started == before
+            if unsent and record_count:
+                self._report_outcome("export.local_drop", record_count)
+                scope.record_terminal(self.outcome)
+
+    def _export_in_scope[B, R](
+        self,
+        native_export: Callable[[Sequence[B]], R],
+        batch: Sequence[B],
+        *,
+        count_drops: bool,
+    ) -> R:
         """Run one native span or log export in a fresh projection scope."""
         caller_exception = exception()
         self._outcome = ExportOutcome()
@@ -828,7 +855,9 @@ class SanitizingSession(requests.Session):
         projection_scope = _ProjectionScope()
         projection_token = self._projection_scope.set(projection_scope)
         try:
-            return native_export(batch)
+            return self._native_export(
+                native_export, batch, len(batch) if count_drops else 0
+            )
         finally:
             projection_scope.close()
             self._projection_scope.reset(projection_token)
@@ -956,6 +985,11 @@ class SanitizingSession(requests.Session):
         self, method: str, url: str | bytes, *args: Any, **kwargs: Any
     ) -> requests.Response:
         self._outcome = ExportOutcome()
+        scope = self._projection_scope.get()
+        if scope is not None:
+            with scope.lock:
+                if scope.active:
+                    scope.requests_started += 1
         deadline = monotonic()
         try:
             timeout = kwargs.get("timeout")
@@ -1061,7 +1095,12 @@ def create_span_exporter(
 
     class _SanitizingSpanExporter(OTLPSpanExporter):
         def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
-            return session._export_in_scope(super().export, spans)
+            return session._export_in_scope(
+                super().export,
+                spans,
+                # SDK1.45.x: calls after shutdown never start a native batch.
+                count_drops=getattr(self, "_shutdown", False) is not True,
+            )
 
     exporter = _SanitizingSpanExporter(
         endpoint=session.endpoint,
@@ -1091,7 +1130,11 @@ def create_log_exporter(
 
     class _SanitizingLogExporter(OTLPLogExporter):
         def export(self, batch: Sequence[ReadableLogRecord]) -> LogRecordExportResult:
-            return session._export_in_scope(super().export, batch)
+            return session._export_in_scope(
+                super().export,
+                batch,
+                count_drops=getattr(self, "_shutdown", False) is not True,
+            )
 
     exporter = _SanitizingLogExporter(
         endpoint=session.endpoint,
@@ -1140,6 +1183,15 @@ def create_metric_exporter(
             self._timeout_supported = self._native_timeout() is not None
             if not self._timeout_supported:
                 session._report_outcome("metrics.timeout_unsupported")
+
+        def _export_batch(
+            self, export_request: ExportMetricsServiceRequest
+        ) -> MetricExportResult:
+            # SDK1.45.x splits before this hook; count only this native batch.
+            count = _record_count(
+                export_request, "metrics", session.limits.max_batch_size
+            )
+            return session._native_export(super()._export_batch, export_request, count)
 
         def _native_timeout(self) -> float | int | None:
             value = getattr(getattr(self, "_client", None), "_timeout", None)

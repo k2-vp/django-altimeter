@@ -462,6 +462,10 @@ results never become telemetry. SQLCommenter is off and SQL sent to the database
 is unchanged. Redis commands and pipelines get local child spans; no trace
 context is added to Redis commands.
 
+Failed or cancelled work marks its recorded child span as an error, including
+async cancellation. The original exception propagates unchanged; normal
+generator closure (`GeneratorExit`) does not mark an error.
+
 Use registered application spans around work that actually executes. For
 example, materialize a queryset once, then serialize those already loaded rows:
 

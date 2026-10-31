@@ -348,3 +348,62 @@ print(json.dumps({"completed": result.completed, "codes": result.codes,
     ]
     assert len(spans) == (1 if oversized else 127)
     assert all(span.name == "GET" for span in spans)
+
+
+def test_native_exception_admission_reports_loss_and_keeps_safe_spans(
+    otlp_receiver, caplog
+):
+    from django_altimeter.exporting import SanitizingSession, create_span_exporter
+
+    session = SanitizingSession("traces", otlp_receiver.url("traces"), policy=POLICY)
+    provider = TracerProvider(
+        resource=Resource({}), shutdown_on_exit=False, span_limits=native_span_limits()
+    )
+    processor = BoundedSpanProcessor(
+        create_span_exporter(session), schedule_delay_millis=60_000
+    )
+    provider.add_span_processor(processor)
+    tracer = provider.get_tracer("django_altimeter")
+    try:
+        for size in (50, 240, 260, 600, 90):
+            message = "界" * size if size == 90 else (CANARY + "x" * size)[:size]
+            try:
+                with tracer.start_as_current_span("request"):
+                    raise RuntimeError(message)
+            except RuntimeError as error:
+                assert str(error) == message
+                assert error.__traceback__ is not None
+        with tracer.start_as_current_span("request", attributes={"private": [CANARY]}):
+            pass
+        with tracer.start_as_current_span(
+            "request", attributes={"http.response.status_code": 200}
+        ):
+            pass
+        assert provider.force_flush(timeout_millis=5_000)
+    finally:
+        provider.shutdown()
+    requests = otlp_receiver.wait_for_requests()
+    spans = [
+        span
+        for request in requests
+        for resource in request.message.resource_spans
+        for scope in resource.scope_spans
+        for span in scope.spans
+    ]
+    assert len(spans) == 3
+    assert [span.status.code for span in spans] == [2, 2, 0]
+    assert spans[-1].attributes[0].value.int_value == 200
+    assert len({span.span_id for span in spans}) == 3
+    assert all(span.name == "request" for span in spans)
+    assert all(
+        CANARY.encode() not in request.message.SerializeToString()
+        for request in requests
+    )
+    diagnostics = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "django_altimeter.export"
+    ]
+    assert diagnostics == ["admission.size traces", "admission.type traces"]
+    assert processor.local_dropped_records == 4
+    assert CANARY not in caplog.text

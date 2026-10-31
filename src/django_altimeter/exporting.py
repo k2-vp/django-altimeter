@@ -371,6 +371,9 @@ class BoundedSpanProcessor(SpanProcessor):
         _check_limits(limits)
         self._limits = limits
         self.last_diagnostic: str | None = None
+        self._local_dropped_records = 0
+        self._drop_lock = Lock()
+        self._drop_diagnostics: dict[str, float] = {}
         self._delegate = BatchSpanProcessor(
             exporter,
             max_queue_size=limits.max_queue_size,
@@ -378,6 +381,30 @@ class BoundedSpanProcessor(SpanProcessor):
             schedule_delay_millis=schedule_delay_millis,
             meter_provider=meter_provider,
         )
+
+    @property
+    def local_dropped_records(self) -> int:
+        """Cumulative admission losses for this processor, before batching."""
+        with self._drop_lock:
+            return self._local_dropped_records
+
+    def _record_drop(self, code: str) -> None:
+        if code not in {"admission.size", "admission.type", "span.admission_error"}:
+            code = "span.admission_error"
+        self.last_diagnostic = code
+        try:
+            with self._drop_lock:
+                self._local_dropped_records += 1
+                now = monotonic()
+                previous = self._drop_diagnostics.get(code)
+                if previous is not None and now - previous < 60:
+                    return
+                self._drop_diagnostics[code] = now
+            # Log outside the lock, after throttling, including for reentrant
+            # handlers. Neither the dropped record nor its values are retained.
+            _DIAGNOSTIC_LOGGER.warning("%s traces", code)
+        except Exception:
+            pass  # A diagnostic handler cannot break the application span.
 
     def on_start(self, span: Span, parent_context: Context | None = None) -> None:
         try:
@@ -390,9 +417,9 @@ class BoundedSpanProcessor(SpanProcessor):
             _span_size(span, self._limits)
             self._delegate.on_end(span)
         except _Rejected as error:
-            self.last_diagnostic = str(error)
+            self._record_drop(str(error))
         except Exception:
-            self.last_diagnostic = "span.admission_error"
+            self._record_drop("span.admission_error")
 
     def force_flush(self, timeout_millis: int = 30000) -> bool:
         try:

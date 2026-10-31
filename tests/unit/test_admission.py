@@ -824,3 +824,81 @@ def test_newly_admitted_metadata_still_obeys_utf8_size_limit(span_pipeline, surf
     assert processor.force_flush()
     assert exporter.get_finished_spans() == (safe,)
     assert processor.last_diagnostic == "admission.size"
+
+
+@pytest.mark.parametrize(
+    "changes,code",
+    [
+        ({"attributes": {"private": CANARY + "界" * 128}}, "admission.size"),
+        ({"attributes": {"private": [CANARY]}}, "admission.type"),
+        ({"status": Status(StatusCode.ERROR, CANARY + "x" * 600)}, "admission.size"),
+    ],
+)
+def test_rejected_span_is_counted_and_reports_only_a_bounded_code(
+    span_pipeline, caplog, changes, code
+):
+    processor, exporter = span_pipeline
+    rejected = span(**changes)
+    safe = span()
+    for _ in range(100):
+        processor.on_end(rejected)
+    processor.on_end(safe)
+    assert processor.force_flush()
+    assert exporter.get_finished_spans() == (safe,)
+    diagnostics = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "django_altimeter.export"
+    ]
+    assert diagnostics == [f"{code} traces"]
+    assert processor.local_dropped_records == 100
+    assert processor.last_diagnostic == code
+    assert CANARY not in caplog.text
+
+
+def test_admission_drop_diagnostics_are_rate_limited_and_resume(
+    span_pipeline, caplog, monkeypatch
+):
+    import django_altimeter.exporting as exporting
+
+    processor, _ = span_pipeline
+    rejected = span(name="x" * 257)
+    monkeypatch.setattr(exporting, "monotonic", lambda: 10.0)
+    processor.on_end(rejected)
+    processor.on_end(rejected)
+    monkeypatch.setattr(exporting, "monotonic", lambda: 70.0)
+    processor.on_end(rejected)
+    diagnostics = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "django_altimeter.export"
+    ]
+    assert diagnostics == ["admission.size traces", "admission.size traces"]
+    assert processor.local_dropped_records == 3
+
+
+def test_admission_drop_count_survives_threads_and_diagnostic_failure(span_pipeline):
+    import logging
+    from concurrent.futures import ThreadPoolExecutor
+
+    processor, exporter = span_pipeline
+    rejected = span(attributes={"private": [CANARY]})
+    safe = span()
+
+    class FailingHandler(logging.Handler):
+        def emit(self, record):
+            raise RuntimeError(CANARY)
+
+    logger = logging.getLogger("django_altimeter.export")
+    handler = FailingHandler()
+    logger.addHandler(handler)
+    try:
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(processor.on_end, [rejected] * 1000))
+    finally:
+        logger.removeHandler(handler)
+    processor.on_end(safe)
+    assert processor.force_flush()
+    assert exporter.get_finished_spans() == (safe,)
+    assert processor.local_dropped_records == 1000
+    assert processor.last_diagnostic == "admission.type"

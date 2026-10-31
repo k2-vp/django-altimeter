@@ -729,6 +729,7 @@ _PROBE_SIGNALS = ("traces", "logs", "metrics")
 _PROBE_NAME = "altimeter.probe"
 _PROBE_INPUT_LIMIT = 256 * 1024
 _PROBE_OUTPUT_LIMIT = 16 * 1024
+_PROBE_STARTUP_ALLOWANCE = 8.0
 
 
 def _probe_configuration(config: Config, signals: tuple[str, ...]) -> dict[str, Any]:
@@ -782,9 +783,7 @@ def _probe_config_from_json(values: dict[str, Any]) -> Config:
     )
 
 
-def _perform_probe(
-    config: Config, started_at: datetime, deadline: float
-) -> ProbeResult:
+def _perform_probe(config: Config, started_at: datetime, timeout: float) -> ProbeResult:
     from opentelemetry._logs import SeverityNumber
     from opentelemetry.context import Context
 
@@ -794,8 +793,12 @@ def _perform_probe(
         return ProbeResult(None, started_at, datetime.now(UTC), codes=validation.codes)
     runtime = ProcessRuntime(config)
     codes: list[str] = []
+    deadline = monotonic()
     try:
         initialized = runtime.initialize()
+        # Imports and provider construction cannot consume the export/drain
+        # budget. Only the helper's parent watchdog includes startup time.
+        deadline = monotonic() + min(timeout, config.shutdown_timeout, 2.0)
         codes.extend(initialized.codes)
         if monotonic() >= deadline:
             codes.append("probe.deadline")
@@ -861,7 +864,7 @@ def _probe_child() -> None:
         request = json.loads(raw)
         started = datetime.fromisoformat(request["started_at"])
         result = _perform_probe(
-            _probe_config_from_json(request["config"]), started, request["deadline"]
+            _probe_config_from_json(request["config"]), started, request["timeout"]
         )
     except Exception:
         result = ProbeResult(None, started, datetime.now(UTC), codes=("probe.failed",))
@@ -882,11 +885,13 @@ def probe(
     signals: tuple[str, ...] | None = None,
     timeout: float = 2.0,
 ) -> ProbeResult:
-    """Send one isolated safe probe per selected signal within a total budget.
+    """Send one isolated safe probe per signal with bounded startup and drain.
 
     A fresh helper owns all providers, native workers and at-fork hooks. Its
     bounded stdin contains validated values, never command-line credentials.
     No application provider or module runtime is installed in the caller.
+    The child caps export/drain at two seconds after initialization; its parent
+    allows eight additional seconds for cold startup and always reaps it.
     """
     import json
     import subprocess
@@ -907,7 +912,6 @@ def probe(
     try:
         if type(timeout) not in (int, float) or not isfinite(timeout) or timeout <= 0:
             return failure("probe.invalid_timeout")
-        deadline = monotonic() + min(timeout, 2.0)
         validation = validate_config(config)
         if validation.config is None:
             return failure(*validation.codes)
@@ -933,12 +937,13 @@ def probe(
             return failure("nothing_to_probe")
         if any(name not in enabled for name in requested):
             return failure("probe.signal_disabled")
-        deadline = min(deadline, monotonic() + config.shutdown_timeout)
+        budget = min(timeout, config.shutdown_timeout, 2.0)
+        deadline = monotonic() + _PROBE_STARTUP_ALLOWANCE + budget
         request = json.dumps(
             {
                 "config": _probe_configuration(config, requested),
                 "started_at": started.isoformat(),
-                "deadline": deadline,
+                "timeout": budget,
             },
             ensure_ascii=False,
         ).encode("utf-8")

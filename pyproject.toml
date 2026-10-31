@@ -65,7 +65,12 @@ include = ["django_altimeter*"]
 namespaces = false
 
 [tool.setuptools.package-data]
-django_altimeter = ["py.typed"]
+django_altimeter = [
+    "py.typed",
+    "browser/*.ts",
+    "browser/VERSION",
+    "browser/examples/*.ts",
+]
 
 [tool.ruff]
 target-version = "py312"

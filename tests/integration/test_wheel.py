@@ -16,7 +16,18 @@ pytestmark = pytest.mark.integration
 
 ROOT = Path(__file__).resolve().parents[2]
 PACKAGE = PurePosixPath("django_altimeter")
-REQUIRED_ASSETS = {PACKAGE / "__init__.py", PACKAGE / "py.typed"}
+BROWSER_ASSETS = {
+    PACKAGE / "browser" / name
+    for name in (
+        "VERSION",
+        "headers.ts",
+        "journey.ts",
+        "resource_timing.ts",
+        "examples/asgi.ts",
+        "examples/wsgi.ts",
+    )
+}
+REQUIRED_ASSETS = {PACKAGE / "__init__.py", PACKAGE / "py.typed"} | BROWSER_ASSETS
 FORBIDDEN_PARTS = {
     "tests",
     "reference",
@@ -39,7 +50,11 @@ def _is_package_asset(path: PurePosixPath) -> bool:
     return (
         path.is_relative_to(PACKAGE)
         and not FORBIDDEN_PARTS.intersection(path.parts)
-        and (path.suffix == ".py" or path == PACKAGE / "py.typed")
+        and (
+            path.suffix == ".py"
+            or path == PACKAGE / "py.typed"
+            or path in BROWSER_ASSETS
+        )
     )
 
 

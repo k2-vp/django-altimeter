@@ -405,14 +405,20 @@ To disable telemetry, set `ALTIMETER_ENABLED=false` and restart gunicorn with
 the same command. The wrapper preserves application responses and exceptions
 when telemetry is disabled or configuration is invalid.
 
-WSGI duration runs from application entry to observed iterable exhaustion or
-early close. It includes application work, iteration and observed writes; it
-does not measure client receipt, download time, or time waiting for a gthread
+For ordinary iterables, WSGI duration runs from application entry to observed
+exhaustion or early close. It includes application work, iteration and observed
+writes; it does not measure client receipt, download time, or time waiting for a gthread
 slot before entry. File and streaming responses remain unbuffered. Context is
 attached only during the application, iterator, write and close operations;
 it is detached between yielded chunks. `start_response`, its `exc_info`, the
 legacy write callable and underlying exceptions retain their WSGI behavior.
 Each iterable closes once, and each eligible request finalizes once.
+
+A native `wsgi.file_wrapper` result keeps the server's `sendfile` path. Its
+duration ends when the server calls `close()`, before application close work.
+If the wrapper cannot accept a close hook, it remains unchanged and finalizes
+at application return with the fixed `http.file_wrapper_unobserved` diagnostic.
+In that case, file-transfer duration, completion and later aborts are unobserved.
 
 The wrapper reuses the request counters, histogram buckets, route allow-list,
 sampling-independent totals and header trust rules above. The process/branch

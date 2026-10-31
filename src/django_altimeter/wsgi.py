@@ -26,7 +26,7 @@ from typing import Any, cast
 from wsgiref.types import StartResponse, WSGIApplication, WSGIEnvironment
 
 from opentelemetry import context, metrics, trace
-from opentelemetry.trace import Span, SpanKind
+from opentelemetry.trace import Span
 
 from django_altimeter.context import (
     _OWNED_SPAN,
@@ -38,8 +38,14 @@ from django_altimeter.headers import (
     wsgi_request_headers,
     wsgi_response_headers,
 )
-from django_altimeter.http import RequestState, finish_request, request_state
-from django_altimeter.privacy import is_allowed_attribute
+from django_altimeter.http import (
+    RequestState,
+    finish_request,
+    request_state,
+    start_server_span,
+    valid_boundary,
+)
+from django_altimeter.privacy import _request_method
 from django_altimeter.runtime import (
     ProcessRuntime,
     _owns_trace_provider,
@@ -56,16 +62,6 @@ def _diagnostic(code: str) -> None:
         logging.getLogger("django_altimeter.wsgi").warning("%s", code)
     except Exception:
         pass  # Application log handlers cannot change protocol behavior.
-
-
-def _method(value: object) -> str:
-    if (
-        type(value) is str
-        and len(value) <= 7
-        and is_allowed_attribute("http.request.method", value)
-    ):
-        return value
-    return "_OTHER"
 
 
 class _Response:
@@ -101,7 +97,7 @@ class _Response:
         self._start_time = time_ns()
         self.state = RequestState(
             monotonic(),
-            _method(environ.get("REQUEST_METHOD")),
+            _request_method(environ.get("REQUEST_METHOD")),
             owner.surface,
             runtime.config,
         )
@@ -123,18 +119,8 @@ class _Response:
                     trust_remote_parent=True,
                 )
             if self._owned_tracing:
-                self._span = self._runtime.tracer.start_span(
-                    self.state.method if self.state.method != "_OTHER" else "HTTP",
-                    context=self._parent,
-                    kind=SpanKind.SERVER,
-                    start_time=self._start_time,
-                    attributes={
-                        "http.request.method": self.state.method,
-                        "altimeter.surface": self.state.surface,
-                        "altimeter.http.server.concurrent_at_start": (
-                            self.state.concurrent_at_start
-                        ),
-                    },
+                self._span = start_server_span(
+                    self._runtime.tracer, self.state, self._parent, self._start_time
                 )
         except Exception:
             _diagnostic("http.span_start_failed")
@@ -471,12 +457,7 @@ def instrument(
     """
     if isinstance(application, _InstrumentedWSGI):
         return application
-    if (
-        type(surface) is not str
-        or len(surface) > 6
-        or surface not in {"django", "mcp"}
-        or type(trusted_ingress) is not bool
-    ):
+    if not valid_boundary(surface, trusted_ingress):
         _diagnostic("http.invalid_boundary")
         return application
     return _InstrumentedWSGI(application, surface, trusted_ingress)

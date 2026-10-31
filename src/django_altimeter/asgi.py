@@ -15,11 +15,18 @@ from time import monotonic, time_ns
 from typing import Any
 
 from opentelemetry import context, metrics, trace
-from opentelemetry.trace import Span, SpanKind
+from opentelemetry.trace import Span
 
 from django_altimeter.context import Correlation, _mark_owned_span, _reset_owned_span
 from django_altimeter.headers import incoming_context, response_headers, response_mode
-from django_altimeter.http import RequestState, finish_request, request_state
+from django_altimeter.http import (
+    RequestState,
+    finish_request,
+    request_state,
+    start_server_span,
+    valid_boundary,
+)
+from django_altimeter.privacy import _request_method
 from django_altimeter.runtime import (
     _owns_trace_provider,
     get_owned_trace_runtime,
@@ -32,9 +39,6 @@ type Receive = Callable[[], Awaitable[Message]]
 type Send = Callable[[Message], Awaitable[None]]
 type ASGIApplication = Callable[[Scope, Receive, Send], Awaitable[None]]
 
-_METHODS = frozenset(
-    {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "CONNECT", "TRACE"}
-)
 _STATE_KEY = "django_altimeter.request_state"
 _MISSING = object()
 # OTel Context is immutable; each attached span receives a separate derived context.
@@ -46,14 +50,6 @@ def _diagnostic(code: str) -> None:
         logging.getLogger("django_altimeter.asgi").warning("%s", code)
     except Exception:
         pass  # Application logging handlers cannot change request behavior.
-
-
-def _method(value: object) -> str:
-    return (
-        value
-        if type(value) is str and len(value) <= 7 and value in _METHODS
-        else "_OTHER"
-    )
 
 
 class _InstrumentedASGI:
@@ -116,7 +112,7 @@ class _InstrumentedASGI:
         started_at = monotonic()
         start_time = time_ns()
         state = RequestState(
-            started_at, _method(scope.get("method")), self.surface, config
+            started_at, _request_method(scope.get("method")), self.surface, config
         )
         span: Span = trace.INVALID_SPAN
         parent = _EMPTY_CONTEXT
@@ -142,19 +138,7 @@ class _InstrumentedASGI:
                     trust_remote_parent=True,
                 )
             if owned_tracing:
-                span = runtime.tracer.start_span(
-                    state.method if state.method != "_OTHER" else "HTTP",
-                    context=parent,
-                    kind=SpanKind.SERVER,
-                    start_time=start_time,
-                    attributes={
-                        "http.request.method": state.method,
-                        "altimeter.surface": state.surface,
-                        "altimeter.http.server.concurrent_at_start": (
-                            state.concurrent_at_start
-                        ),
-                    },
-                )
+                span = start_server_span(runtime.tracer, state, parent, start_time)
         except Exception:
             _diagnostic("http.span_start_failed")
         try:
@@ -292,12 +276,7 @@ def instrument(
     """
     if isinstance(application, _InstrumentedASGI):
         return application
-    if (
-        type(surface) is not str
-        or len(surface) > 6
-        or surface not in {"django", "mcp"}
-        or type(trusted_ingress) is not bool
-    ):
+    if not valid_boundary(surface, trusted_ingress):
         _diagnostic("http.invalid_boundary")
         return application
     return _InstrumentedASGI(application, surface, trusted_ingress)

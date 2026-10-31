@@ -344,6 +344,15 @@ def is_allowed_attribute(
         return False
 
 
+def _request_method(value: object) -> str:
+    """Return an approved HTTP method token, or ``_OTHER``."""
+    return (
+        value
+        if type(value) is str and len(value) <= 7 and value in _HTTP_METHODS
+        else "_OTHER"
+    )
+
+
 def normalize_span_name(
     name: object,
     *,

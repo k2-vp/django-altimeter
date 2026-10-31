@@ -55,6 +55,7 @@ from opentelemetry.sdk.util.instrumentation import (
     InstrumentationInfo,
     InstrumentationScope,
 )
+from opentelemetry.sdk.version import __version__ as sdk_version
 from opentelemetry.trace import (
     Link,
     SpanContext,
@@ -728,6 +729,8 @@ class SanitizingSession(requests.Session):
         self.policy = policy
         self.limits = limits
         self.trust_env = False
+        self.headers.clear()
+        self._configured_headers: dict[str, str] = {}
         self._outcome = ExportOutcome()
         self._diagnostic_times: dict[str, float] = {}
         self._diagnostic_lock = Lock()
@@ -745,6 +748,17 @@ class SanitizingSession(requests.Session):
         self._projection_scope: ContextVar[_ProjectionScope | None] = ContextVar(
             "altimeter_export_projection", default=None
         )
+
+    def _configure_transport(self, headers: Mapping[str, str] | None) -> None:
+        # Configuration owns header validation. Keep its explicit values separate
+        # from the native exporter, which merges ambient OTEL_* credentials.
+        from django_altimeter.conf import _headers
+
+        self._configured_headers = dict(_headers(headers))
+        self.headers.clear()
+        # The native constructor writes environment-derived TLS settings here.
+        self.verify = True
+        self.cert = None
 
     @property
     def outcome(self) -> ExportOutcome:
@@ -977,7 +991,12 @@ class SanitizingSession(requests.Session):
                 raise ExportProtocolError("export.batch_size")
             projected, count, dropped = self._project_for_attempt(data)
             self._outcome = ExportOutcome(local_dropped_records=dropped)
-            headers["Accept-Encoding"] = "identity"
+            request_headers = {
+                "Content-Type": "application/x-protobuf",
+                "User-Agent": f"OTel-OTLP-Exporter-Python/{sdk_version}",
+                **self._configured_headers,
+                "Accept-Encoding": "identity",
+            }
 
             # A hook runs before requests' redirect-resolution/body buffering
             # (which also runs with allow_redirects=False) and cookie persistence.
@@ -991,7 +1010,7 @@ class SanitizingSession(requests.Session):
                 "POST",
                 self.endpoint,
                 data=projected,
-                headers=headers,
+                headers=request_headers,
                 # HTTPAdapter supports urllib3 Timeout; requests' annotation
                 # only lists its scalar/tuple shortcuts.
                 timeout=cast(
@@ -1044,7 +1063,7 @@ def create_span_exporter(
         def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
             return session._export_in_scope(super().export, spans)
 
-    return _SanitizingSpanExporter(
+    exporter = _SanitizingSpanExporter(
         endpoint=session.endpoint,
         session=session,
         timeout=timeout,
@@ -1053,6 +1072,8 @@ def create_span_exporter(
         max_request_size=session.limits.max_batch_bytes,
         meter_provider=meter_provider,
     )
+    session._configure_transport(headers)
+    return exporter
 
 
 def create_log_exporter(
@@ -1072,7 +1093,7 @@ def create_log_exporter(
         def export(self, batch: Sequence[ReadableLogRecord]) -> LogRecordExportResult:
             return session._export_in_scope(super().export, batch)
 
-    return _SanitizingLogExporter(
+    exporter = _SanitizingLogExporter(
         endpoint=session.endpoint,
         session=session,
         timeout=timeout,
@@ -1081,6 +1102,8 @@ def create_log_exporter(
         max_request_size=session.limits.max_batch_bytes,
         meter_provider=meter_provider,
     )
+    session._configure_transport(headers)
+    return exporter
 
 
 def create_metric_exporter(
@@ -1188,4 +1211,6 @@ def create_metric_exporter(
                 self._export_lock.release()
                 session._export_completed(completed_outcome)
 
-    return _DeadlineMetricExporter()
+    exporter = _DeadlineMetricExporter()
+    session._configure_transport(headers)
+    return exporter

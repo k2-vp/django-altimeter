@@ -284,6 +284,7 @@ OUTBOUND_CONTEXT_HEADERS = frozenset(
         "altimeter.tenant_id",
         "sessionid",
         "x-posthog-distinct-id",
+        "x-posthog-session-id",
         "x-tenant-id",
         "x-session-id",
     }

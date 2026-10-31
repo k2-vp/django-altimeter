@@ -235,6 +235,10 @@ Unknown or unapproved routes omit `http.route`; raw paths, object IDs and query
 strings never replace it. `EXCLUDED_ROUTES` contains **exact static request
 paths**, checked at entry before creating any span or metric. It accepts no
 route templates, wildcards, or regular expressions.
+When Altimeter owns tracing, child spans inside an excluded request inherit a
+local unsampled context instead of creating orphan traces. Foreign tracing
+remains unchanged. WSGI applies this during application and iterable operations;
+native file-response limits are described below.
 
 Create Django before setup, then initialize telemetry in each serving worker's
 lifespan. The native wrapper looks up the owned runtime per request, so it can
@@ -427,6 +431,8 @@ In that case, file-transfer duration, completion and later aborts are unobserved
 For native `wsgi.file_wrapper` responses served without `sendfile`, the server's
 file reads run outside the request context, so logs and spans emitted inside a
 custom file object's `read()` are not parented to the request.
+These file reads and an unhookable wrapper's `close()` also run outside
+route-exclusion suppression.
 
 The wrapper reuses the request counters, histogram buckets, route allow-list,
 sampling-independent totals and header trust rules above. The process/branch

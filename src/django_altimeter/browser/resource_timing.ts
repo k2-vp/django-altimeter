@@ -130,7 +130,6 @@ const INACTIVE: ResourceTimingOwner = Object.freeze({
  * Create once in an existing permitted journey/request owner, before HTTP work.
  * Keep each returned ticket with that physical request, outside query-cache data.
  * Spread complete()'s result into the selected request's recordRequest call.
- * B1 flushes queued entries before terminal capture and disconnects on discard.
  *
  * At most 32 candidates retain bounded resolved URLs. Matches retain numbers
  * only; unrelated entries are discarded. Overflow (including observer batches
@@ -148,11 +147,14 @@ function createOwner(attempt: JourneyAttempt, canCapture: () => boolean, baseUrl
   let disabled: TimingUnavailableReason | null = null;
   const pending: Candidate[] = [];
 
+  function forget(candidate: Candidate): void {
+    candidate.url = '';
+    candidate.match = null;
+  }
   function release(candidate: Candidate): void {
     const index = pending.indexOf(candidate);
     if (index >= 0) pending.splice(index, 1);
-    candidate.url = '';
-    candidate.match = null;
+    forget(candidate);
   }
   function disconnectObserver(): void {
     const previous = observer;
@@ -172,8 +174,7 @@ function createOwner(attempt: JourneyAttempt, canCapture: () => boolean, baseUrl
     disconnectObserver();
     while (pending.length) {
       const candidate = pending.pop()!;
-      candidate.url = '';
-      candidate.match = null;
+      forget(candidate);
       candidate.result = unavailable(reason);
       if (candidate.completed) notify(candidate);
     }
@@ -184,8 +185,7 @@ function createOwner(attempt: JourneyAttempt, canCapture: () => boolean, baseUrl
     disconnectObserver(); // disconnect also empties the browser-owned queue.
     while (pending.length) {
       const candidate = pending.pop()!;
-      candidate.url = '';
-      candidate.match = null;
+      forget(candidate);
       candidate.retired = true;
       candidate.result = unavailable('late');
     }

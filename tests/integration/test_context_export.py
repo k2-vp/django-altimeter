@@ -731,3 +731,59 @@ def test_enrich_ignores_foreign_span_with_owned_provider_and_exports_neighbors(
             "altimeter.tenant_id": "opaque-tenant",
         }
     assert calls == ["resolved", "resolved"]
+
+
+@pytest.mark.parametrize("helper", ["span", "client_span"])
+@pytest.mark.parametrize(
+    ("exception_type", "expected_status"),
+    [
+        ("BaseException", 2),
+        ("asyncio.CancelledError", 2),
+        ("KeyboardInterrupt", 2),
+        ("GeneratorExit", 0),
+    ],
+)
+def test_base_exception_status_preserves_exception_and_safe_neighbor(
+    otlp_receiver, helper, exception_type, expected_status
+):
+    _run(
+        otlp_receiver,
+        f"""
+        from django_altimeter.context import client_span
+        assert 'traces' in configure().enabled_signals
+        class ApplicationFailure({exception_type}):
+            def __str__(self):
+                raise AssertionError('Exception prose must never be formatted')
+        failure = ApplicationFailure(CANARY)
+        with span('work.execute') as parent:
+            before = get_correlation()
+            try:
+                with {helper}('work.child'):
+                    raise failure
+            except BaseException as caught:
+                assert caught is failure
+            else:
+                raise AssertionError('Application exception was suppressed')
+            assert get_correlation() == before
+            with {helper}('work.sibling'):
+                assert get_correlation().trace_id == before.trace_id
+        assert get_correlation() is None
+        assert shutdown().completed
+        print(json.dumps(True))
+        """,
+    )
+    spans = _spans(otlp_receiver)
+    assert len(spans) == 3
+    parent = next(item for item in spans if item.name == "work.execute")
+    failed = next(item for item in spans if item.name == "work.child")
+    safe = next(item for item in spans if item.name == "work.sibling")
+    assert failed.status.code == expected_status
+    assert safe.status.code == parent.status.code == 0
+    assert failed.kind == safe.kind == (3 if helper == "client_span" else 1)
+    assert failed.parent_span_id == safe.parent_span_id == parent.span_id
+    assert failed.trace_id == safe.trace_id == parent.trace_id
+    assert all(not item.events and not item.status.message for item in spans)
+    assert all(
+        CANARY.encode() not in request.message.SerializeToString()
+        for request in otlp_receiver.requests
+    )

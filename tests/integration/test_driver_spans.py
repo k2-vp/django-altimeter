@@ -555,6 +555,8 @@ print("WORK_RESULT " + json.dumps(result))
         assert len(children) == 2
         assert all(item.name == "SELECT" for item in children)
         assert all(item.parent_span_id == parent.span_id for item in children)
+        assert [item.status.code for item in children] == [2, 0]
+        assert all(not item.events and not item.status.message for item in children)
 
     def test_absent_optional_driver_reports_gap_and_keeps_native_span(
         self, tmp_path, otlp_receiver

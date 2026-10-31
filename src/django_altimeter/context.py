@@ -203,8 +203,8 @@ def _span(
     del attributes, name
     try:
         yield current
-    except Exception:
-        if manager is not None:
+    except BaseException as error:
+        if manager is not None and not isinstance(error, GeneratorExit):
             try:
                 current.set_status(Status(StatusCode.ERROR))
             except Exception:

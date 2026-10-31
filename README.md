@@ -169,9 +169,11 @@ finally:
 Repeated or concurrent setup with the same effective configuration installs once.
 Changing configuration after setup requires a worker restart. Each signal checks
 ownership independently: an existing third-party provider is left untouched, and
-Altimeter disables its use of that signal. Unowned tracing discloses no
-correlation or identity. Every exporting worker has a fresh UUID
-`service.instance.id`, including for delta metrics.
+Altimeter disables its use of that signal. When tracing is disabled or owned
+elsewhere, the ASGI and WSGI boundaries preserve the application's current span
+and baggage, so spans from its own tracer retain their parent. Altimeter
+discloses no correlation or identity for unowned tracing. Every exporting worker
+has a fresh UUID `service.instance.id`, including for delta metrics.
 
 Keep setup and shutdown in the application's explicit startup and cleanup
 hooks. **Gunicorn preload is unsupported.** Initialize after forking; a child

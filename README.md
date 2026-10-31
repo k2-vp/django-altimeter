@@ -496,7 +496,9 @@ Origins consist of scheme, host and optional port; HTTP and HTTPS are allowed.
 Userinfo, paths, queries and wildcards are rejected. Public ingress headers do
 not authorize propagation of a remote identity or sampling decision. Baggage,
 tracestate and application correlation headers are removed at the outbound
-boundary; an approved origin receives the current owned `traceparent` only.
+boundary, including `X-PostHog-Session-ID` and `X-PostHog-Distinct-ID`, for both
+internal and third-party destinations. An approved origin receives the current
+owned `traceparent` only.
 Each redirect destination is checked again. Third-party and exporter requests
 carry no application trace context. Unrelated application headers and response
 bodies remain unchanged; raw URLs, query strings and bodies do not enter spans.

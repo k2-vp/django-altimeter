@@ -57,7 +57,15 @@ once `pyproject.toml` exists:
   and standalone Python 3.12 checks:
   `docker compose -p <unique-wsgi-work-name> -f reference/compose.yaml --profile wsgi run --build --rm verify-wsgi python -m pytest tests/integration/test_reference_work.py::TestStandaloneReferenceWork tests/integration/test_reference_work.py::test_request_work_extras_install_pinned_clients`
   then `docker compose -p <unique-wsgi-work-name> -f reference/compose.yaml --profile wsgi down --remove-orphans`
-- Browser tests: `cd tests/browser && bun run test:unit <spec>` or `bun run test:e2e <spec>`
+- Browser setup (Bun 1.3.14, Node 26.12.1), after `uv sync --all-extras --dev` and `uv build`:
+  `cd tests/browser && bun install --frozen-lockfile && bun run install:browser`
+- Browser unit tests: `cd tests/browser && bun run test:unit`
+- Browser TypeScript checks (harness plus ASGI/WSGI compiler profiles):
+  `cd tests/browser && bun run typecheck`
+- Real Chromium, cross-origin axios and installed-wheel uvicorn checks:
+  `cd tests/browser && bun run test:e2e resource_timing.spec.ts journey_e2e.spec.ts`
+  The browser harness owns temporary origins, ports, processes and its OTLP receiver;
+  it tears them down on exit. Build the wheel again after changing shipped source.
 
 Default test runs, including CI, deselect the `performance` marker. Explicit
 `-m performance` overrides that default. Only the two wall-clock acceptance tests
@@ -68,7 +76,7 @@ Do not add a second command layer (Makefile, justfile, scripts) unless a bead
 asks for it. When a change adds or changes a command, update this list and the
 README in the same commit.
 
-In a swarm, run full-suite, full-build and Docker profile runs through the
+In a swarm, run full-suite, full-build, browser e2e and Docker profile runs through the
 build slot: `am am-run build --exclusive -- <command>`. Targeted per-file checks
 may run directly. The orchestrator runs the integrated gate for each slice.
 After every Compose run, whether it succeeds or fails, run the matching project's

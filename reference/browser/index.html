@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <meta name="api-origin" content="__API_ORIGIN__">
+    <title>Work queue · Altimeter reference</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <main>
+      <p class="eyebrow">Reference workspace</p>
+      <h1>Work queue</h1>
+      <nav aria-label="Views">
+        <button type="button" id="board">Board</button>
+        <button type="button" id="repair">Repair</button>
+      </nav>
+      <section aria-labelledby="view-title">
+        <h2 id="view-title">Board</h2>
+        <p role="status" id="status">Choose a view to load its current items.</p>
+        <ul id="items"></ul>
+        <div class="actions">
+          <button type="button" id="reload">Refresh</button>
+          <button type="button" id="cancel" disabled>Cancel</button>
+        </div>
+      </section>
+    </main>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

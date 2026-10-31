@@ -43,9 +43,14 @@ once `pyproject.toml` exists:
   `docker compose -p <unique-name> -f reference/compose.yaml --profile asgi run --build --rm verify-asgi python -m pytest <paths>`
   then `docker compose -p <unique-name> -f reference/compose.yaml --profile asgi down --remove-orphans`
   (use `--profile wsgi` in both commands and `verify-wsgi` for the Python 3.12 gunicorn/RQ shape)
-- Wall-clock performance acceptance, only in the local ASGI image after `uv build`:
+- Wall-clock performance acceptance, only in the matching local image after `uv build`:
   `docker compose -p <unique> -f reference/compose.yaml --profile asgi run --build --rm verify-asgi python -m pytest -m performance tests/performance/test_web_overhead.py`
   then `docker compose -p <unique> -f reference/compose.yaml --profile asgi down --remove-orphans`
+  WSGI: `docker compose -p <unique> -f reference/compose.yaml --profile wsgi run --build --rm verify-wsgi python -m pytest -m performance tests/performance/test_wsgi_overhead.py`
+  then `docker compose -p <unique> -f reference/compose.yaml --profile wsgi down --remove-orphans`
+- Gunicorn gthread protocol, lifecycle and combined request-work checks after `uv build`:
+  `docker compose -p <unique-wsgi-web-name> -f reference/compose.yaml --profile wsgi run --build --rm verify-wsgi python -m pytest tests/integration/test_wsgi.py tests/integration/test_gthread.py tests/integration/test_wsgi_headers.py tests/integration/test_driver_spans.py::TestWSGIDriverFlow tests/integration/test_outbound_context.py::TestWSGIPropagation tests/integration/test_logging_topology.py::TestWSGILogFlow tests/integration/test_wsgi_metrics.py`
+  then `docker compose -p <unique-wsgi-web-name> -f reference/compose.yaml --profile wsgi down --remove-orphans`
 - Request-work reference checks, after `uv build`, with isolated Compose services:
   `docker compose -p <unique-asgi-work-name> -f reference/compose.yaml --profile asgi run --build --rm verify-asgi python -m pytest tests/integration/test_reference_work.py`
   then `docker compose -p <unique-asgi-work-name> -f reference/compose.yaml --profile asgi down --remove-orphans`
@@ -55,8 +60,8 @@ once `pyproject.toml` exists:
 - Browser tests: `cd tests/browser && bun run test:unit <spec>` or `bun run test:e2e <spec>`
 
 Default test runs, including CI, deselect the `performance` marker. Explicit
-`-m performance` overrides that default. Only the wall-clock acceptance test has
-this marker; its harness self-tests remain in the default suite. A performance
+`-m performance` overrides that default. Only the two wall-clock acceptance tests
+have this marker; their harness self-tests remain in the default suite. A performance
 command that selects zero tests is a failure.
 
 Do not add a second command layer (Makefile, justfile, scripts) unless a bead

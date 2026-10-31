@@ -6,11 +6,12 @@ export.
 
 The current development release provides explicit runtime setup and shutdown,
 safe application spans, correlation, trusted identity enrichment, and on-demand
-configuration and delivery checks. Native ASGI request instrumentation supports
-Django and Ninja with explicit worker startup. Optional database and outgoing
+configuration and delivery checks. Native request instrumentation supports
+Django/Ninja under ASGI and Django/DRF under gunicorn gthread, with explicit
+worker startup. Optional database and outgoing
 client integrations add safe child spans, and an explicitly attached logging
-handler exports approved records without changing stdout. WSGI and queue
-instrumentation are not included yet. Telemetry is disabled by default.
+handler exports approved records without changing stdout. Queue instrumentation
+is not included yet. Telemetry is disabled by default.
 
 ## Install
 
@@ -173,7 +174,7 @@ correlation or identity. Every exporting worker has a fresh UUID
 Keep setup and shutdown in the application's explicit startup and cleanup
 hooks. **Gunicorn preload is unsupported.** Initialize after forking; a child
 that inherits initialized providers disables the affected signals.
-WSGI and queue lifecycle adapters are not included.
+Queue lifecycle adapters are not included.
 
 Use one shutdown call at worker exit, outside request and task bodies:
 
@@ -337,6 +338,94 @@ cache directives are never relaxed. For configured frontend origins,
 `Timing-Allow-Origin` echoes only an exact approved origin and `Vary: Origin`
 merges with existing fields. This does not grant application CORS access; retain
 your own CORS and authentication policy.
+
+## WSGI requests under gunicorn
+
+The supported WSGI server is gunicorn 23.0.0 with `gthread`, without preload.
+The reference app uses Django 5.2 and Django REST Framework 3.16.1:
+
+```sh
+uv pip install 'gunicorn==23.0.0' 'djangorestframework==3.16.1'
+export ALTIMETER_INTEGRATIONS=wsgi,django
+```
+
+Configure `RequestMetadataMiddleware` before Django builds its handler, as in
+the ASGI example. Initialize telemetry after Django setup in each serving
+child, before opening database connections or pools. A child marker makes an
+accidental preloaded master detectably unsupported. In `gunicorn_conf.py`:
+
+```python
+import os
+
+
+def post_fork(server, worker):
+    os.environ["APP_SERVING_PID"] = str(worker.pid)
+
+
+def worker_exit(server, worker):
+    from django_altimeter import shutdown
+
+    shutdown(timeout=2.0)
+```
+
+In the application's WSGI module, with `DJANGO_SETTINGS_MODULE` already set:
+
+```python
+import logging
+import os
+
+from django.core.wsgi import get_wsgi_application
+from django_altimeter import setup
+from django_altimeter.wsgi import instrument
+
+django_application = get_wsgi_application()
+if os.environ.get("APP_SERVING_PID") == str(os.getpid()):
+    setup(role="web")
+else:
+    logging.getLogger("django_altimeter.reference").warning(
+        "setup.preload_unsupported"
+    )
+application = instrument(django_application)
+```
+
+Start the application with its configuration file and deployment's actual
+worker/thread capacity; this example uses two workers and four threads each:
+
+```sh
+gunicorn --config gunicorn_conf.py --worker-class gthread --workers 2 --threads 4 project.wsgi:application
+```
+
+Do not pass `--preload`. The example guard leaves the application usable but
+disables telemetry for a preloaded application and emits the fixed
+`setup.preload_unsupported` diagnostic. Recycled children initialize fresh
+providers and `service.instance.id` values. The shared two-second `worker_exit`
+budget covers all signals; hard kills and undrained queues can lose telemetry.
+
+To disable telemetry, set `ALTIMETER_ENABLED=false` and restart gunicorn with
+the same command. The wrapper preserves application responses and exceptions
+when telemetry is disabled or configuration is invalid.
+
+WSGI duration runs from application entry to observed iterable exhaustion or
+early close. It includes application work, iteration and observed writes; it
+does not measure client receipt, download time, or time waiting for a gthread
+slot before entry. File and streaming responses remain unbuffered. Context is
+attached only during the application, iterator, write and close operations;
+it is detached between yielded chunks. `start_response`, its `exc_info`, the
+legacy write callable and underlying exceptions retain their WSGI behavior.
+Each iterable closes once, and each eligible request finalizes once.
+
+The wrapper reuses the request counters, histogram buckets, route allow-list,
+sampling-independent totals and header trust rules above. The process/branch
+concurrency value counts eligible requests already inside the wrapper,
+including unsampled requests. It is supporting evidence alongside the actual
+thread capacity, not queue length or a wait-time measurement. Aborted responses
+retain a status already observed and decrement concurrency during finalization.
+
+The checkout includes an equivalent bootstrap and DRF reference app:
+
+```sh
+gunicorn --pythonpath reference --config reference/altimeter_reference/gunicorn_conf.py --worker-class gthread --workers 2 --threads 4 altimeter_reference.wsgi:application
+```
 
 ## Database and outgoing request work
 
@@ -871,7 +960,8 @@ docker compose -p <unique-wsgi-runtime-name> -f reference/compose.yaml --profile
 
 The ASGI image also pins Ninja 1.6.2 and uvicorn 0.46.0. It uses
 Requests 2.33.1 / urllib3 2.6.3; the WSGI image pins
-Requests 2.32.3 / urllib3 1.26.20. Both exercise the same transport contract.
+gunicorn 23.0.0, DRF 3.16.1, Requests 2.32.3 / urllib3 1.26.20.
+Both exercise the same transport contract.
 
 The images install the built wheel, copy both distribution artifacts and tests,
 and verify the installed package against that wheel. They contain no package
@@ -879,8 +969,8 @@ source checkout or editable installation. The image and its nested clean venv
 both use the declared Python/Django profile. The Django boundary tests use the
 small reference settings and health callable in fresh subprocesses, including
 migrations and shell commands. Tests cover packaging, explicit runtime ownership,
-Django startup, local OTLP behavior, and real uvicorn/Ninja request and worker
-lifecycles. WSGI server and queue worker workloads are not covered yet.
+Django startup, local OTLP behavior, real uvicorn/Ninja and gunicorn gthread/DRF
+requests, and serving-worker lifecycles. Queue worker workloads are not covered yet.
 
 The function-scoped `otlp_receiver` fixture listens on an ephemeral loopback
 port. `.endpoint` gives the base URL and `.url("traces")`, `.url("logs")`, or
@@ -958,26 +1048,38 @@ docker compose -p <unique-asgi-web-name> -f reference/compose.yaml --profile asg
 docker compose -p <unique-asgi-web-name> -f reference/compose.yaml --profile asgi down --remove-orphans
 ```
 
-Default test runs, including CI, exclude the wall-clock acceptance test through
+Verify WSGI protocol behavior, recycled children and combined request work:
+
+```sh
+uv build
+docker compose -p <unique-wsgi-web-name> -f reference/compose.yaml --profile wsgi run --build --rm verify-wsgi python -m pytest tests/integration/test_wsgi.py tests/integration/test_gthread.py tests/integration/test_wsgi_headers.py tests/integration/test_driver_spans.py::TestWSGIDriverFlow tests/integration/test_outbound_context.py::TestWSGIPropagation tests/integration/test_logging_topology.py::TestWSGILogFlow tests/integration/test_wsgi_metrics.py
+docker compose -p <unique-wsgi-web-name> -f reference/compose.yaml --profile wsgi down --remove-orphans
+```
+
+Default test runs, including CI, exclude the wall-clock acceptance tests through
 the `performance` marker. The harness self-tests remain in the default host,
-ASGI and WSGI suites. Run the timing test explicitly only in the local ASGI
+ASGI and WSGI suites. Run each timing test explicitly only in its matching local
 verification image after `uv build`, using a unique project name:
 
 ```sh
 docker compose -p <unique> -f reference/compose.yaml --profile asgi run --build --rm verify-asgi python -m pytest -m performance tests/performance/test_web_overhead.py
 docker compose -p <unique> -f reference/compose.yaml --profile asgi down --remove-orphans
+docker compose -p <unique> -f reference/compose.yaml --profile wsgi run --build --rm verify-wsgi python -m pytest -m performance tests/performance/test_wsgi_overhead.py
+docker compose -p <unique> -f reference/compose.yaml --profile wsgi down --remove-orphans
 ```
 
-The explicit `-m performance` overrides the default selection and selects one
-test. A command that selects zero tests fails.
+The explicit `-m performance` overrides the default selection; each command
+selects one timing test. A command that selects zero tests fails.
 
-The performance test uses one worker, four persistent connections and a static
-1 KiB response. Each fresh process warms 200 requests, settles for one second,
+Each performance test uses one worker, four persistent connections and a static
+1 KiB response; gunicorn uses four gthread threads. Each fresh process warms
+200 requests, settles for one second,
 then runs for ten seconds; three balanced repetitions cover disabled, enabled
 and failing-export modes, each requiring at least 1,000 completed requests.
 It pools individual latencies for each mode and gates p95 increase against
 `max(2 ms, 5% of disabled p95)`. Output includes the wheel hash, versions,
 throughput, RSS, errors, aborts and sample counts. A separate 60-second failure
-run samples Linux resident pages and checks the fixed plateau thresholds in
+run samples the serving process's Linux resident pages and checks the fixed
+plateau thresholds in
 the test. These measurements describe that workload and machine, not production
 latency or arbitrary-lifetime memory use.

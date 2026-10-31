@@ -382,9 +382,7 @@ django_application = get_wsgi_application()
 if os.environ.get("APP_SERVING_PID") == str(os.getpid()):
     setup(role="web")
 else:
-    logging.getLogger("django_altimeter.reference").warning(
-        "setup.preload_unsupported"
-    )
+    logging.getLogger("django_altimeter.reference").warning("setup.preload_unsupported")
 application = instrument(django_application)
 ```
 

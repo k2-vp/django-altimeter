@@ -43,6 +43,7 @@ _INTEGRATIONS = frozenset(
         "redis",
         "celery",
         "rq",
+        "process",
     }
 )
 _SETTINGS = frozenset(

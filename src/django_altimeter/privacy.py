@@ -197,6 +197,8 @@ _STRING_KEYS = frozenset(
         "db.operation.name",
         "db.collection.name",
         "db.sql.table",
+        "cpu.mode",
+        "altimeter.gc.generation",
         "task.name",
         "queue.name",
         "altimeter.task.name",
@@ -297,6 +299,10 @@ def _allowed_attribute(
         return len(value) == size and all(c in "0123456789abcdef" for c in value)
     if key not in _STRING_KEYS:
         return False
+    if key == "cpu.mode":
+        return value in {"user", "system"} and (key, value) in policy.attribute_values
+    if key == "altimeter.gc.generation":
+        return value in {"0", "1", "2"} and (key, value) in policy.attribute_values
     if key in _HTTP_CATEGORY_KEYS:
         return (key, value) in HTTP_ATTRIBUTE_VALUES
     if key == "error.type" and value == "after_response":
@@ -886,7 +892,19 @@ def project_metrics(
                         unit=metric.unit
                         if _text(metric.unit, limits.max_string_bytes)
                         and metric.unit
-                        in {"s", "ms", "By", "1", "{request}", "{task}", "{attempt}"}
+                        in {
+                            "s",
+                            "ms",
+                            "By",
+                            "1",
+                            "{request}",
+                            "{task}",
+                            "{attempt}",
+                            "{thread}",
+                            "{file_descriptor}",
+                            "{collection}",
+                            "{object}",
+                        }
                         else "",
                     )
                     output = getattr(projected, kind)

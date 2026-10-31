@@ -17,3 +17,5 @@
 **/playwright-report/
 !reference/altimeter_reference/
 !reference/altimeter_reference/*.py
+!deploy/
+!deploy/collector.yaml

@@ -1,0 +1,226 @@
+# Single source; see docs/collector.md for Kamal/ECS receiver selection and ownership.
+# Tested distribution 0.164.0 embeds contrib 0.164.1; the image digest is pinned in
+# reference/Dockerfile. No OTLP listener, host mounts, cloud polling or disk queue.
+receivers:
+  postgresql:
+    endpoint: ${env:ALTIMETER_PG_HOST:-localhost}:${env:ALTIMETER_PG_PORT:-5432}
+    transport: tcp
+    username: ${env:ALTIMETER_PG_USERNAME:-altimeter_monitor}
+    password: ${env:ALTIMETER_PG_PASSWORD:-unused}
+    databases: ["${env:ALTIMETER_PG_DATABASE:-postgres}"]
+    connect_database: ${env:ALTIMETER_PG_DATABASE:-postgres}
+    collection_interval: ${env:ALTIMETER_COLLECTION_INTERVAL:-30s}
+    initial_delay: 1s
+    timeout: 2s
+    connection_pool:
+      max_open: 1
+      max_idle: 1
+      max_lifetime: 5m
+      max_idle_time: 1m
+    tls:
+      insecure: false
+      insecure_skip_verify: false
+      ca_file: ${env:ALTIMETER_PG_CA_FILE:-}
+    events:
+      db.server.query_sample: {enabled: false}
+      db.server.top_query: {enabled: false}
+      db.server.query_plan: {enabled: false}
+    # Relation/table/index instruments stay disabled, rather than deleting their
+    # dimensions and creating colliding time series. Locks are aggregated below.
+    metrics:
+      postgresql.backends: {enabled: true}
+      postgresql.bgwriter.buffers.allocated: {enabled: false}
+      postgresql.bgwriter.buffers.writes: {enabled: false}
+      postgresql.bgwriter.checkpoint.count: {enabled: false}
+      postgresql.bgwriter.duration: {enabled: false}
+      postgresql.bgwriter.maxwritten: {enabled: false}
+      postgresql.blocks_read: {enabled: false}
+      postgresql.commits: {enabled: false}
+      postgresql.connection.max: {enabled: true}
+      postgresql.database.count: {enabled: false}
+      postgresql.database.locks: {enabled: false}
+      postgresql.db_size: {enabled: false}
+      postgresql.deadlocks: {enabled: true}
+      postgresql.index.scans: {enabled: false}
+      postgresql.index.size: {enabled: false}
+      postgresql.operations: {enabled: false}
+      postgresql.replication.data_delay: {enabled: false}
+      postgresql.rollbacks: {enabled: false}
+      postgresql.rows: {enabled: false}
+      postgresql.table.count: {enabled: false}
+      postgresql.table.size: {enabled: false}
+      postgresql.table.vacuum.count: {enabled: false}
+      postgresql.wal.age: {enabled: false}
+      postgresql.wal.lag: {enabled: false}
+
+  sqlquery/lock_wait:
+    driver: postgres
+    host: ${env:ALTIMETER_PG_HOST:-localhost}
+    port: ${env:ALTIMETER_PG_PORT:-5432}
+    database: ${env:ALTIMETER_PG_DATABASE:-postgres}
+    username: ${env:ALTIMETER_PG_USERNAME:-altimeter_monitor}
+    password: ${env:ALTIMETER_PG_PASSWORD:-unused}
+    additional_params:
+      sslmode: verify-full
+      sslrootcert: ${env:ALTIMETER_PG_CA_FILE:-}
+      connect_timeout: "2"
+      statement_timeout: "1000"
+      application_name: altimeter_monitor
+    collection_interval: ${env:ALTIMETER_COLLECTION_INTERVAL:-30s}
+    initial_delay: 1s
+    timeout: 2s
+    max_open_conn: 1
+    telemetry:
+      logs:
+        query: false
+    queries:
+      # One row for one explicitly selected database. Never select query text,
+      # relation names, PIDs or user names. This is context, not a request join.
+      - sql: >-
+          SELECT
+          (SELECT count(*) FROM pg_locks
+           WHERE database = (SELECT oid FROM pg_database
+                             WHERE datname = current_database())) AS locks,
+          (SELECT count(*) FROM pg_stat_activity
+           WHERE datname = current_database() AND wait_event_type = 'Lock') AS waits
+        metrics:
+          - metric_name: altimeter.postgresql.locks
+            value_column: locks
+            unit: "{lock}"
+            data_type: gauge
+            static_attributes:
+              db.namespace: ${env:ALTIMETER_PG_DATABASE:-postgres}
+          - metric_name: altimeter.postgresql.lock_waits
+            value_column: waits
+            unit: "{connection}"
+            data_type: gauge
+            static_attributes:
+              db.namespace: ${env:ALTIMETER_PG_DATABASE:-postgres}
+
+  redis:
+    endpoint: ${env:ALTIMETER_REDIS_ENDPOINT:-localhost:6379}
+    transport: tcp
+    username: ${env:ALTIMETER_REDIS_USERNAME:-altimeter_monitor}
+    password: ${env:ALTIMETER_REDIS_PASSWORD:-unused}
+    collection_interval: ${env:ALTIMETER_COLLECTION_INTERVAL:-30s}
+    initial_delay: 1s
+    timeout: 2s
+    tls:
+      insecure: false
+      insecure_skip_verify: false
+      ca_file: ${env:ALTIMETER_REDIS_CA_FILE:-}
+    resource_attributes:
+      server.address: {enabled: true}
+      server.port: {enabled: true}
+      redis.version: {enabled: false}
+    metrics:
+      redis.clients.blocked: {enabled: true}
+      redis.clients.connected: {enabled: true}
+      redis.clients.max_input_buffer: {enabled: false}
+      redis.clients.max_output_buffer: {enabled: false}
+      redis.commands: {enabled: false}
+      redis.commands.processed: {enabled: false}
+      redis.connections.received: {enabled: false}
+      redis.connections.rejected: {enabled: false}
+      redis.cpu.time: {enabled: false}
+      redis.db.avg_ttl: {enabled: false}
+      redis.db.expires: {enabled: false}
+      redis.db.keys: {enabled: false}
+      redis.keys.evicted: {enabled: true}
+      redis.keys.expired: {enabled: false}
+      redis.keyspace.hits: {enabled: false}
+      redis.keyspace.misses: {enabled: false}
+      redis.latest_fork: {enabled: false}
+      redis.memory.fragmentation_ratio: {enabled: false}
+      redis.memory.lua: {enabled: false}
+      redis.memory.peak: {enabled: false}
+      redis.memory.rss: {enabled: true}
+      redis.memory.used: {enabled: true}
+      redis.net.input: {enabled: false}
+      redis.net.output: {enabled: false}
+      redis.rdb.changes_since_last_save: {enabled: false}
+      redis.replication.backlog_first_byte_offset: {enabled: false}
+      redis.replication.offset: {enabled: false}
+      redis.slaves.connected: {enabled: false}
+      redis.uptime: {enabled: false}
+
+  # Instantiated ONLY when selected in the active receiver list. V4 task metadata
+  # is supplied by ECS_CONTAINER_METADATA_URI_V4; there is no AWS API polling.
+  awsecscontainermetrics:
+    collection_interval: ${env:ALTIMETER_COLLECTION_INTERVAL:-30s}
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 256
+    spike_limit_mib: 64
+  filter/allowed:
+    error_mode: propagate
+    metrics:
+      metric:
+        - >-
+          name != "postgresql.backends" and name != "postgresql.connection.max"
+          and name != "postgresql.deadlocks"
+          and name != "altimeter.postgresql.locks"
+          and name != "altimeter.postgresql.lock_waits"
+          and name != "redis.clients.connected" and name != "redis.clients.blocked"
+          and name != "redis.memory.used" and name != "redis.memory.rss"
+          and name != "redis.keys.evicted"
+          and name != "ecs.task.cpu.usage.total" and name != "ecs.task.memory.usage"
+          and name != "ecs.task.memory.utilized" and name != "ecs.task.memory.reserved"
+  transform/attributes:
+    error_mode: propagate
+    metric_statements:
+      - context: resource
+        statements:
+          - >-
+            keep_keys(attributes, ["postgresql.database.name", "server.address",
+            "server.port", "aws.ecs.task.id", "aws.ecs.task.arn", "cloud.region",
+            "cloud.availability_zone"])
+          - set(attributes["service.name"], "altimeter-collector")
+          - set(attributes["service.instance.id"], "${env:ALTIMETER_COLLECTOR_INSTANCE_ID}")
+      - context: datapoint
+        statements:
+          - keep_keys(attributes, ["db.namespace"])
+  batch:
+    timeout: 1s
+    send_batch_size: 64
+    send_batch_max_size: 128
+
+exporters:
+  otlp_http:
+    # Full signal URL, e.g. https://<PostHog ingestion host>/i/v1/metrics.
+    metrics_endpoint: ${env:ALTIMETER_METRICS_ENDPOINT}
+    headers:
+      Authorization: ${env:ALTIMETER_METRICS_AUTHORIZATION}
+    compression: none
+    timeout: 2s
+    tls:
+      insecure: false
+      insecure_skip_verify: false
+    sending_queue:
+      enabled: true
+      num_consumers: 1
+      sizer: requests
+      queue_size: 2
+      block_on_overflow: false
+    retry_on_failure:
+      enabled: true
+      initial_interval: 1s
+      max_interval: 2s
+      max_elapsed_time: 5s
+
+service:
+  telemetry:
+    logs:
+      level: error
+    metrics:
+      level: none
+  pipelines:
+    metrics:
+      # Kamal fleet: [postgresql, redis, sqlquery/lock_wait]
+      # ECS task: [awsecscontainermetrics]. Set the YAML list as an env value;
+      # native env-provider parsing selects it without generating a second file.
+      receivers: ${env:ALTIMETER_COLLECTOR_RECEIVERS}
+      processors: [memory_limiter, filter/allowed, transform/attributes, batch]
+      exporters: [otlp_http]

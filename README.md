@@ -1006,7 +1006,8 @@ every record was accepted or durably stored.
 | `export.warning` | A valid response reports zero rejected records and a warning. The attempt is accepted with this fixed warning code; server warning text is discarded. |
 | Fixed protocol error | Redirects, unexpected non-200 success statuses, wrong content type or encoding, malformed/truncated/oversized bodies, ambiguous framing, and invalid rejection counts fail without retry and report zero accepted records. Non-identity HTTP 200 encoding is refused before reading or decompressing its body. |
 | `export.http_error` | Ordinary 4xx/5xx bodies are discarded unread. Actual status and a valid bounded `Retry-After` remain available to the native retry code. The pinned client retries 429, 502, 503, and 504, subject to its deadline and retry budget; connection failures also use its native retry path. |
-| Local sanitizer rejection | Invalid input, excessive counts/bytes, projection failure, or zero surviving records sends nothing for that attempt and reports zero accepted records. There is no fallback to the original bytes. A native no-send path resets the outcome to `export.not_sent`. |
+| `export.local_drop` | A nonempty native batch never reached the sanitized HTTP session, including a native 1 MiB size rejection. `local_dropped_records` counts the unsent records in that batch. Earlier metric batches from the same call may already have been sent. |
+| Local sanitizer rejection | Invalid input, excessive counts/bytes, projection failure, or zero surviving records sends nothing for that attempt and reports zero accepted records. There is no fallback to the original bytes. An empty native export retains `export.not_sent`. |
 
 `Retry-After` values below one second are treated as absent, so the SDK uses
 its own exponential backoff. This includes numeric values below one and
@@ -1058,7 +1059,8 @@ export.content_type   export.projection     export.empty
 export.http_error     export.status         export.response_size
 export.rejected_count export.partial        export.warning
 export.deadline       export.connection     export.invalid
-export.failed         export.framing        metrics.timeout_unsupported
+export.failed         export.local_drop     export.framing
+metrics.timeout_unsupported
 ```
 
 ## Development

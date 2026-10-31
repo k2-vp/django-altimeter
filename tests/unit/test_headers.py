@@ -721,3 +721,166 @@ def test_outbound_headers_are_local_valid_context_for_exact_origin(url, approved
         )
         == {}
     )
+
+
+@pytest.mark.parametrize(
+    "trusted, configured",
+    [(True, True), (False, True), (True, False), (1, True), (True, 1), ("true", True)],
+)
+def test_wsgi_environ_delegates_literal_true_trust_to_shared_policy(
+    trusted, configured
+):
+    from django_altimeter.headers import wsgi_request_headers
+
+    pairs = wsgi_request_headers(
+        {
+            "HTTP_TRACEPARENT": TRACEPARENT.decode(),
+            "HTTP_ORIGIN": ORIGIN,
+            "HTTP_TRACESTATE": "private=identity-canary",
+            "HTTP_BAGGAGE": "posthogDistinctId=identity-canary",
+            "HTTP_X_POSTHOG_DISTINCT_ID": "identity-canary",
+            "HTTP_X_ALTIMETER_TRUSTED": "true",
+        }
+    )
+    assert pairs == [(b"traceparent", TRACEPARENT), (b"origin", ORIGIN.encode())]
+    clean = incoming_context(
+        pairs, trusted_ingress=trusted, trust_remote_parent=configured
+    )
+    current = trace.get_current_span(clean).get_span_context()
+    assert current.is_valid is (trusted is True and configured is True)
+    assert not current.trace_state
+    assert not baggage.get_all(clean)
+
+
+@pytest.mark.parametrize(
+    "value", [None, 1, b"bytes", "x" * 1_000_000, "\ud800", "é", HostileContainer()]
+)
+def test_wsgi_request_headers_reject_values_before_encoding(value):
+    from django_altimeter.headers import wsgi_request_headers
+
+    assert wsgi_request_headers({"HTTP_ORIGIN": value, "HTTP_TRACEPARENT": value}) == []
+    assert wsgi_request_headers(
+        {"HTTP_ORIGIN": value, "HTTP_TRACEPARENT": TRACEPARENT.decode()}
+    ) == [(b"traceparent", TRACEPARENT)]
+
+
+def test_wsgi_request_header_selection_never_traverses_unrelated_environ_values():
+    from django_altimeter.headers import wsgi_request_headers
+
+    class HostileEnviron(dict):
+        def get(self, key, default=None):
+            raise AssertionError("Subclass accessor invoked")
+
+    class HostileText(str):
+        def encode(self, *args, **kwargs):
+            raise AssertionError("Subclass encoder invoked")
+
+        def __len__(self):
+            raise AssertionError("Subclass length invoked")
+
+    assert wsgi_request_headers(HostileEnviron(HTTP_ORIGIN=ORIGIN)) == []
+    assert wsgi_request_headers({"HTTP_ORIGIN": HostileText(ORIGIN)}) == []
+    environ = {f"unrelated_{index}": HostileContainer() for index in range(50000)}
+    environ["HTTP_ORIGIN"] = ORIGIN
+    assert wsgi_request_headers(environ) == [(b"origin", ORIGIN.encode())]
+
+
+@pytest.mark.parametrize("owned", [False, True, 1])
+@pytest.mark.parametrize(
+    "origin", [None, ORIGIN, ORIGIN + ":443", ORIGIN + ", " + ORIGIN]
+)
+@pytest.mark.parametrize(
+    "original",
+    [
+        [
+            ("Cache-Control", "private, no-store"),
+            ("Vary", "Cookie"),
+            ("Vary", "Accept-Encoding"),
+        ],
+        [("Cache-Control", "public, max-age=60"), ("X-Altimeter-Trace-Id", "stale")],
+        [("Cache-Control", 'private="Set-Cookie"'), ("Timing-Allow-Origin", "*")],
+        [
+            ("Cache-Control", "private"),
+            ("Vary", "*"),
+            ("Set-Cookie", "a=one"),
+            ("Set-Cookie", "b=two"),
+        ],
+        [
+            ("Cache-Control", "private"),
+            ("Vary", "Cookie, oRiGiN"),
+            ("X-Business", "café"),
+        ],
+    ],
+)
+def test_wsgi_response_policy_matches_asgi_without_changing_application_headers(
+    original, origin, owned
+):
+    from django_altimeter.headers import (
+        prepare_response_header_policy,
+        wsgi_request_headers,
+        wsgi_response_headers,
+    )
+
+    environ = {"HTTP_ORIGIN": origin} if origin is not None else {}
+    policy = prepare_response_header_policy(frozenset({ORIGIN}))
+    before = list(original)
+    expected = response_headers(
+        [(key.encode("latin-1"), value.encode("latin-1")) for key, value in original],
+        request_headers=wsgi_request_headers(environ),
+        policy=policy,
+        correlation=CORRELATION,
+        owned_tracing=owned,
+    )
+    result = wsgi_response_headers(
+        original,
+        environ=environ,
+        policy=policy,
+        correlation=CORRELATION,
+        owned_tracing=owned,
+    )
+    assert result == [
+        (key.decode("latin-1"), value.decode("latin-1")) for key, value in expected
+    ]
+    assert original == before
+    assert all(type(key) is type(value) is str for key, value in result)
+
+
+def test_wsgi_response_header_bounds_are_checked_before_allocation_or_accessors():
+    import tracemalloc
+
+    from django_altimeter.headers import (
+        prepare_response_header_policy,
+        wsgi_response_headers,
+    )
+
+    class HostileText(str):
+        def encode(self, *args, **kwargs):
+            raise AssertionError("Subclass encoder invoked")
+
+        def __len__(self):
+            raise AssertionError("Subclass length invoked")
+
+    policy = prepare_response_header_policy(frozenset({ORIGIN}))
+    for original in (
+        [("X-Business", "x" * 1_000_000)],
+        [("Vary", "x" * 8193)],
+        [("x" * 129, "value")],
+        [("X-Business", "value")] * 129,
+        [("X-Business", HostileText("canary"))],
+        [(HostileText("X-Business"), "canary")],
+        [("X-Business", "\ud800")],
+        [("broken",)],
+        HostileContainer(),
+    ):
+        tracemalloc.start()
+        result = wsgi_response_headers(
+            original,
+            environ={"HTTP_ORIGIN": ORIGIN},
+            policy=policy,
+            correlation=CORRELATION,
+            owned_tracing=True,
+        )
+        _, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        assert result is original
+        assert peak < 32768

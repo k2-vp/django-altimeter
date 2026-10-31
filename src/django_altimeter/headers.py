@@ -354,3 +354,65 @@ def outgoing_headers(
         return {}
     flags = "01" if correlation.trace_flags & 1 else "00"
     return {"traceparent": f"00-{correlation.trace_id}-{correlation.span_id}-{flags}"}
+
+
+def wsgi_request_headers(environ: object) -> Headers:
+    """Read only the bounded WSGI fields consumed by the shared header policy."""
+    if type(environ) is not dict:
+        return []
+    result: Headers = []
+    for key, name, maximum in (
+        ("HTTP_TRACEPARENT", b"traceparent", 512),
+        ("HTTP_ORIGIN", b"origin", 2048),
+    ):
+        value = environ.get(key)
+        if type(value) is str and len(value) <= maximum and value.isascii():
+            result.append((name, value.encode("ascii")))
+    return result
+
+
+def wsgi_response_headers(
+    headers: list[tuple[str, str]],
+    *,
+    environ: object,
+    policy: ResponseHeaderPolicy | None,
+    correlation: Correlation | None = None,
+    owned_tracing: bool = False,
+) -> list[tuple[str, str]]:
+    """Apply the shared frozen policy to bounded native WSGI string headers.
+
+    Native WSGI uses Latin-1 strings. Check lengths before encoding, and leave
+    malformed or oversized application headers untouched on telemetry failure.
+    """
+    try:
+        if type(headers) not in {list, tuple} or len(headers) > _HEADERS_LIMIT:
+            return headers
+        encoded: Headers = []
+        for pair in cast(list[object], headers):
+            if type(pair) not in {list, tuple}:
+                return headers
+            parts = cast(list[object] | tuple[object, ...], pair)
+            if len(parts) != 2:
+                return headers
+            key, value = parts
+            if (
+                type(key) is not str
+                or len(key) > 128
+                or type(value) is not str
+                or len(value) > _VALUE_LIMIT
+            ):
+                return headers
+            encoded.append((key.encode("latin-1"), value.encode("latin-1")))
+        projected = response_headers(
+            encoded,
+            request_headers=wsgi_request_headers(environ),
+            policy=policy,
+            correlation=correlation,
+            owned_tracing=owned_tracing,
+        )
+        return [
+            (key.decode("latin-1"), value.decode("latin-1")) for key, value in projected
+        ]
+    except Exception:
+        _diagnostic("http.headers_failed")
+        return headers

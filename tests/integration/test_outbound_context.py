@@ -1058,3 +1058,269 @@ class TestASGIPropagation:
                 CANARY.encode() not in request.message.SerializeToString()
                 for request in otlp_receiver.requests
             )
+
+
+@pytest.fixture(scope="module")
+def wsgi_client_wheel(tmp_path_factory):
+    from support.gunicorn_server import install_wheel
+    from support.reference_work import WORK_EXTRAS
+
+    return install_wheel(
+        tmp_path_factory.mktemp("wsgi-client-wheel"), extras=WORK_EXTRAS
+    )
+
+
+def _wsgi_client_environment(services, internal, external, **values):
+    return {
+        **services.environment(),
+        "DJANGO_SETTINGS_MODULE": "altimeter_reference.wsgi_settings",
+        "WSGI_APPLICATION": os.environ.get(
+            "H2_WSGI_APPLICATION", "altimeter_reference.wsgi:application"
+        ),
+        "ALTIMETER_INTEGRATIONS": "wsgi,django,requests,httpx,redis",
+        "REFERENCE_INTERNAL_ORIGIN": internal.origin,
+        "REFERENCE_EXTERNAL_ORIGIN": external.origin,
+        **values,
+    }
+
+
+def _assert_wsgi_client_wire_is_safe(receiver):
+    from django_altimeter.headers import OUTBOUND_CONTEXT_HEADERS
+
+    for request in receiver.requests:
+        wire = request.message.SerializeToString()
+        for canary in (
+            CANARY,
+            "query-canary",
+            "header-canary",
+            "state-canary",
+            "baggage-canary",
+            "identity-header-canary",
+            "key-canary",
+            "redis-value-canary",
+        ):
+            assert canary.encode() not in wire
+        assert not OUTBOUND_CONTEXT_HEADERS.intersection(
+            key.lower() for key in request.headers
+        )
+
+
+class TestWSGIPropagation:
+    @pytest.mark.parametrize("client", ["requests", "httpx"])
+    @pytest.mark.parametrize("sample_rate", ["0", "1"])
+    def test_gthread_clients_share_the_server_parent_and_exact_origin_policy(
+        self, wsgi_client_wheel, tmp_path, otlp_receiver, client, sample_rate
+    ):
+        from concurrent.futures import ThreadPoolExecutor
+
+        from support.gunicorn_server import running_server
+        from support.reference_work import isolated_services
+
+        from django_altimeter.headers import OUTBOUND_CONTEXT_HEADERS
+
+        with (
+            isolated_services() as services,
+            HTTPReceiver() as internal,
+            HTTPReceiver() as external,
+        ):
+            with running_server(
+                tmp_path,
+                wheel=wsgi_client_wheel,
+                receiver=otlp_receiver,
+                threads=4,
+                extra_env=_wsgi_client_environment(
+                    services,
+                    internal,
+                    external,
+                    ALTIMETER_SAMPLE_RATE=sample_rate,
+                    ALTIMETER_TRUST_REMOTE_PARENT="true",
+                ),
+            ) as server:
+
+                def request(_):
+                    status, headers, body = server.request(
+                        f"/work/outgoing?client={client}",
+                        headers={
+                            "traceparent": "00-" + "1" * 32 + "-" + "2" * 16 + "-01",
+                            "baggage": "posthogDistinctId=" + CANARY,
+                            "X-Tenant-Id": CANARY,
+                            "X-Altimeter-Trusted": "true",
+                        },
+                    )
+                    assert status == 200, body
+                    assert json.loads(body) == {
+                        "internal": "safe-response",
+                        "external": "safe-response",
+                    }
+                    return {key.lower(): value for key, value in headers.items()}
+
+                with ThreadPoolExecutor(max_workers=4) as executor:
+                    responses = list(executor.map(request, range(4)))
+            assert len(internal.requests) == len(external.requests) == 4
+            parents = []
+            for captured in internal.requests:
+                headers = {key.lower(): value for key, value in captured.headers}
+                assert headers["x-application"] == "header-canary"
+                assert OUTBOUND_CONTEXT_HEADERS.intersection(headers) == {"traceparent"}
+                parents.append(headers["traceparent"])
+            assert len(set(parents)) == 4
+            assert all(parent.split("-")[1] != "1" * 32 for parent in parents)
+            assert all(
+                parent.endswith("-00" if sample_rate == "0" else "-01")
+                for parent in parents
+            )
+            for captured in external.requests:
+                headers = {key.lower(): value for key, value in captured.headers}
+                assert headers["x-application"] == "header-canary"
+                assert not OUTBOUND_CONTEXT_HEADERS.intersection(headers)
+            assert {headers["x-altimeter-trace-id"] for headers in responses} == {
+                parent.split("-")[1] for parent in parents
+            }
+            assert all(
+                headers["x-altimeter-trace-sampled"] == sample_rate
+                for headers in responses
+            )
+            spans = _spans(otlp_receiver)
+            roots = [item for item in spans if item.kind == 2]
+            children = [item for item in spans if item.kind == 3]
+            assert len(roots) == 4 * int(sample_rate)
+            assert len(children) == 8 * int(sample_rate)
+            if sample_rate == "1":
+                by_id = {item.span_id: item for item in spans}
+                root_ids = {item.span_id for item in roots}
+                assert len({item.trace_id for item in roots}) == 4
+                for child in children:
+                    enclosing = by_id[child.parent_span_id]
+                    assert enclosing.name == "reference.outgoing"
+                    assert enclosing.parent_span_id in root_ids
+                    root = by_id[enclosing.parent_span_id]
+                    assert child.trace_id == enclosing.trace_id == root.trace_id
+                    assert (
+                        root.start_time_unix_nano
+                        <= child.start_time_unix_nano
+                        <= child.end_time_unix_nano
+                        <= root.end_time_unix_nano
+                    )
+                    assert _attributes(child)["http.response.status_code"] == 200
+                for parent in parents:
+                    child = by_id[bytes.fromhex(parent.split("-")[2])]
+                    assert (
+                        child.kind == 3 and child.trace_id.hex() == parent.split("-")[1]
+                    )
+            _assert_wsgi_client_wire_is_safe(otlp_receiver)
+
+    @pytest.mark.parametrize("client", ["requests", "httpx"])
+    def test_gthread_redirect_removes_context_before_external_hop(
+        self, wsgi_client_wheel, tmp_path, otlp_receiver, client
+    ):
+        from support.gunicorn_server import running_server
+        from support.reference_work import isolated_services
+
+        from django_altimeter.headers import OUTBOUND_CONTEXT_HEADERS
+
+        with (
+            isolated_services() as services,
+            HTTPReceiver() as internal,
+            HTTPReceiver() as external,
+        ):
+            internal.respond(
+                status=302, headers={"Location": external.origin + "/final"}
+            )
+            with running_server(
+                tmp_path,
+                wheel=wsgi_client_wheel,
+                receiver=otlp_receiver,
+                extra_env=_wsgi_client_environment(services, internal, external),
+            ) as server:
+                status, _, body = server.request(f"/work/redirect?client={client}")
+                assert status == 200, body
+                assert json.loads(body) == {"body": "safe-response"}
+            assert len(internal.requests) == len(external.requests) == 1
+            inside = {key.lower(): value for key, value in internal.requests[0].headers}
+            outside = {
+                key.lower(): value for key, value in external.requests[0].headers
+            }
+            assert OUTBOUND_CONTEXT_HEADERS.intersection(inside) == {"traceparent"}
+            assert not OUTBOUND_CONTEXT_HEADERS.intersection(outside)
+            assert (
+                inside["x-application"] == outside["x-application"] == "header-canary"
+            )
+            spans = _spans(otlp_receiver)
+            roots = [item for item in spans if item.kind == 2]
+            children = [item for item in spans if item.kind == 3]
+            assert len(roots) == 1 and len(children) == 2
+            assert all(item.trace_id == roots[0].trace_id for item in children)
+            assert sorted(
+                _attributes(item)["http.response.status_code"] for item in children
+            ) == [200, 302]
+            _assert_wsgi_client_wire_is_safe(otlp_receiver)
+
+    def test_gthread_redis_commands_keep_the_server_parent(
+        self, wsgi_client_wheel, tmp_path, otlp_receiver
+    ):
+        from support.gunicorn_server import running_server
+        from support.reference_work import isolated_services
+
+        with (
+            isolated_services() as services,
+            HTTPReceiver() as internal,
+            HTTPReceiver() as external,
+        ):
+            with running_server(
+                tmp_path,
+                wheel=wsgi_client_wheel,
+                receiver=otlp_receiver,
+                extra_env=_wsgi_client_environment(services, internal, external),
+            ) as server:
+                status, _, body = server.request("/work/redis")
+                assert status == 200, body
+                assert json.loads(body) == {"redis": "redis-value-canary"}
+            roots = [item for item in _spans(otlp_receiver) if item.kind == 2]
+            children = [item for item in _spans(otlp_receiver) if item.kind == 3]
+            assert len(roots) == 1 and len(children) == 2
+            assert sorted(
+                _attributes(item)["db.operation.name"] for item in children
+            ) == ["GET", "SET"]
+            assert all(
+                _attributes(item)["db.system.name"] == "redis" for item in children
+            )
+            assert all(
+                item.parent_span_id == roots[0].span_id
+                and item.trace_id == roots[0].trace_id
+                for item in children
+            )
+            _assert_wsgi_client_wire_is_safe(otlp_receiver)
+
+    @pytest.mark.parametrize("client", ["requests", "httpx"])
+    @pytest.mark.parametrize("mode", ["disabled", "invalid"])
+    def test_gthread_unowned_clients_preserve_application_results(
+        self, wsgi_client_wheel, tmp_path, otlp_receiver, client, mode
+    ):
+        from support.gunicorn_server import running_server
+        from support.reference_work import isolated_services
+
+        with (
+            isolated_services() as services,
+            HTTPReceiver() as internal,
+            HTTPReceiver() as external,
+        ):
+            with running_server(
+                tmp_path,
+                wheel=wsgi_client_wheel,
+                receiver=otlp_receiver,
+                enabled=mode != "disabled",
+                extra_env=_wsgi_client_environment(
+                    services,
+                    internal,
+                    external,
+                    ALTIMETER_EXPORT_TIMEOUT="-1" if mode == "invalid" else "0.2",
+                ),
+            ) as server:
+                status, _, body = server.request(f"/work/outgoing?client={client}")
+                assert status == 200, body
+                assert json.loads(body) == {
+                    "internal": "safe-response",
+                    "external": "safe-response",
+                }
+            assert len(internal.requests) == len(external.requests) == 1
+            assert not otlp_receiver.requests

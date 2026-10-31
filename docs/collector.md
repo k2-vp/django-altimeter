@@ -47,7 +47,11 @@ Required environment for either profile:
 
 - `ALTIMETER_COLLECTOR_RECEIVERS`: exactly the selected YAML list above.
 - `ALTIMETER_COLLECTOR_INSTANCE_ID`: a fresh UUID for this observer process,
-  supplied at each deployment/start. Do not share it between running observers.
+  supplied at each deployment/start. An unset or empty value makes the collector
+  exit with an error naming `service.instance.id` before receivers start.
+  Generating a fresh UUID and keeping it distinct between running observers
+  remains the deployment's responsibility; UUID format and uniqueness are not
+  validated by the collector.
 - `ALTIMETER_METRICS_ENDPOINT`: the full HTTPS metrics ingestion URL supplied by
   your PostHog project, ending in `/i/v1/metrics`; not a base OTLP URL.
 - `ALTIMETER_METRICS_AUTHORIZATION`: the configured authorization header value,
@@ -66,6 +70,12 @@ Validate with the same environment and pinned binary before deployment:
 ```sh
 otelcol-contrib validate --config=deploy/collector.yaml
 ```
+
+This checks the configuration schema; it does not construct the processors.
+The required identity check runs at actual collector startup: the standalone
+native env value resolves to null when unset or empty, and `resource/identity`
+rejects an upsert without a value. A successful `validate` alone does not prove
+that the observer can start. No wrapper or generated configuration is needed.
 
 The repository's README and AGENTS.md provide the two exact-wheel verification
 commands. They run `tests/integration/test_collector_profiles.py` in each image.

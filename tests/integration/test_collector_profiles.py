@@ -137,6 +137,7 @@ def test_profiles_validate_with_native_binary_and_disabled_sources_do_not_start(
                 "memory_limiter",
                 "filter/allowed",
                 "transform/attributes",
+                "resource/identity",
                 "batch",
             ]
             assert "otlp" not in config["receivers"]
@@ -518,3 +519,85 @@ def test_stalled_export_has_bounded_memory_batch_queue_and_shutdown(
     assert process.returncode == 0, (
         "Native bounded shutdown must finish without killing it"
     )
+
+
+@pytest.mark.parametrize("profile", ["kamal", "ecs"])
+@pytest.mark.parametrize("identity_state", ["unset", "empty", "present"])
+def test_collector_requires_instance_id_at_startup(
+    tmp_path, sources, otlp_receiver, profile, identity_state
+):
+    """A real start rejects missing identity before any receiver exports."""
+    import os
+    import shutil
+    import subprocess
+    from uuid import uuid4
+
+    from support.collector import ROOT, ecs_metadata
+
+    identity = str(uuid4())
+    with ecs_metadata() as (metadata_env, metadata_requests, _):
+        environment = {
+            "PATH": os.environ.get("PATH", ""),
+            "GOMEMLIMIT": "192MiB",
+            **sources.environment,
+            **metadata_env,
+            "ALTIMETER_COLLECTOR_RECEIVERS": (
+                "[postgresql, redis, sqlquery/lock_wait]"
+                if profile == "kamal"
+                else "[awsecscontainermetrics]"
+            ),
+            "ALTIMETER_METRICS_ENDPOINT": otlp_receiver.url("metrics"),
+            "ALTIMETER_METRICS_AUTHORIZATION": "Bearer test-only",
+            "ALTIMETER_COLLECTION_INTERVAL": "500ms",
+        }
+        if identity_state != "unset":
+            environment["ALTIMETER_COLLECTOR_INSTANCE_ID"] = (
+                identity if identity_state == "present" else ""
+            )
+        binary = shutil.which("otelcol-contrib")
+        assert binary, "Run the pinned collector in a reference verification image"
+        with (tmp_path / "identity-startup.log").open("w+") as log:
+            process = subprocess.Popen(
+                [binary, "--config", str(ROOT / "deploy/collector.yaml")],
+                env=environment,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+            )
+            try:
+                if identity_state == "present":
+                    expected = (
+                        {"redis.clients.connected"}
+                        if profile == "kamal"
+                        else {"ecs.task.cpu.usage.total"}
+                    )
+                    points = wait_for_metrics(otlp_receiver, expected, process)
+                    assert all(
+                        any(
+                            item.key == "service.instance.id"
+                            and item.value.string_value == identity
+                            for item in resource.attributes
+                        )
+                        for resource, _, _, _ in points
+                    )
+                else:
+                    try:
+                        process.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        pytest.fail(
+                            "Collector started with a missing service.instance.id"
+                        )
+                    assert process.returncode != 0
+                    log.seek(0)
+                    assert "service.instance.id" in log.read()
+                    assert otlp_receiver.requests == ()
+                    assert metadata_requests == []
+            finally:
+                if process.poll() is None:
+                    process.terminate()
+                try:
+                    process.wait(timeout=8)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=3)
+                log.seek(0)
+                print(log.read(), end="")

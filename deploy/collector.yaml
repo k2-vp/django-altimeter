@@ -177,11 +177,19 @@ processors:
             keep_keys(attributes, ["postgresql.database.name", "server.address",
             "server.port", "aws.ecs.task.id", "aws.ecs.task.arn", "cloud.region",
             "cloud.availability_zone"])
-          - set(attributes["service.name"], "altimeter-collector")
-          - set(attributes["service.instance.id"], "${env:ALTIMETER_COLLECTOR_INSTANCE_ID}")
       - context: datapoint
         statements:
           - keep_keys(attributes, ["db.namespace"])
+  resource/identity:
+    attributes:
+      - key: service.name
+        value: altimeter-collector
+        action: upsert
+      - key: service.instance.id
+        # Without a default, an unset or empty env value resolves to null.
+        # Native upsert validation refuses startup before receivers start.
+        value: ${env:ALTIMETER_COLLECTOR_INSTANCE_ID}
+        action: upsert
   batch:
     timeout: 1s
     send_batch_size: 64
@@ -222,5 +230,6 @@ service:
       # ECS task: [awsecscontainermetrics]. Set the YAML list as an env value;
       # native env-provider parsing selects it without generating a second file.
       receivers: ${env:ALTIMETER_COLLECTOR_RECEIVERS}
-      processors: [memory_limiter, filter/allowed, transform/attributes, batch]
+      processors:
+        [memory_limiter, filter/allowed, transform/attributes, resource/identity, batch]
       exporters: [otlp_http]

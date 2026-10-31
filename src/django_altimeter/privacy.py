@@ -885,7 +885,8 @@ def project_metrics(
                         name=metric.name,
                         unit=metric.unit
                         if _text(metric.unit, limits.max_string_bytes)
-                        and metric.unit in {"s", "ms", "By", "1", "{request}", "{task}"}
+                        and metric.unit
+                        in {"s", "ms", "By", "1", "{request}", "{task}", "{attempt}"}
                         else "",
                     )
                     output = getattr(projected, kind)

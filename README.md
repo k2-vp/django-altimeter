@@ -12,8 +12,8 @@ worker startup. Optional database and outgoing
 client integrations add safe child spans, and an explicitly attached logging
 handler exports approved records without changing stdout. Vendored TypeScript
 helpers link board/repair readiness events to current request traces and passive
-browser resource timing. Queue instrumentation
-is not included yet. Telemetry is disabled by default.
+browser resource timing. Optional Celery instrumentation observes publication,
+execution attempts and worker metrics. Telemetry is disabled by default.
 
 ## Install
 
@@ -32,8 +32,8 @@ uv pip install '.[rq]'
 ```
 
 The base package does not install Celery or RQ. Importing `django_altimeter`
-performs no setup and starts no threads. The extras supply dependencies.
-Queue integrations are not included yet.
+performs no setup and starts no threads. The Celery integration requires explicit
+installation below. RQ integration is not available yet.
 
 Install only the optional request-work libraries your application uses:
 
@@ -51,9 +51,8 @@ The tested combinations are Python 3.12 / Django 5.2 and Python 3.13 / Django
 versions have not been tested.
 
 OpenTelemetry API, SDK, and OTLP/HTTP exporter use >=1.45.1,<1.46 with the
-matching 0.66b1 semantic conventions. Queue extras use Celery >=5.6.3,<5.7
-and Kombu >=5.6.2,<5.7, or RQ >=2.10.0,<2.11. The development lock currently
-resolves those families to 1.45.1/0.66b1, 5.6.3/5.6.2, and 2.10.0 respectively.
+matching 0.66b1 semantic conventions. The Celery extra pins Celery 5.6.3,
+Kombu 5.6.2 and Billiard 4.2.4. The RQ dependency extra uses >=2.10.0,<2.11.
 
 Request-work extras pin psycopg 3.3.4, psycopg-pool 3.3.1, HTTPX 0.28.1 and
 structlog 25.5.0. Redis is pinned to 6.1.1 on Python 3.12 and 7.4.0 on Python
@@ -574,6 +573,117 @@ Altimeter does not create a PostHog client or report another exception occurrenc
 See [logging attachment and correlation](docs/logging.md) for topology,
 scrubber, nonpropagating logger and post-configuration details.
 
+## Celery workers and beat
+
+Real Celery prefork workers with reused and recycled children, solo workers,
+and beat are verified in the ASGI reference image (Python 3.13, Django 6.0,
+Redis client 7.4.0) and the WSGI reference image (Python 3.12, Django 5.2,
+Redis client 6.1.1). The HTTP publisher runs on uvicorn in both images.
+Supported execution pools are prefork (including reused and recycled children)
+and solo. Beat can publish instrumented tasks. Other pools are unsupported for
+telemetry; their application tasks still run. Do not also install the OTel
+Celery instrumentor.
+
+Install the `celery` extra, use the runtime destination/resource settings above,
+and enable the integration:
+
+```sh
+export ALTIMETER_INTEGRATIONS=celery
+```
+
+For a web publisher, include its existing integrations, for example
+`ALTIMETER_INTEGRATIONS=asgi,django,celery`. Declare approved task and queue names
+in Django settings; names must be static application policy:
+
+```python
+ALTIMETER = {
+    "QUEUE_NAMES": ["default", "reports"],
+    "ATTRIBUTE_VALUES": [("task.name", "example.tasks.generate_report")],
+    "LOG_BODIES": ["report.complete"],
+}
+```
+
+Task names are limited to 128 approved values of at most 128 UTF-8 bytes;
+queue configuration allows at most 32 names.
+
+Register the integration on your existing Celery app after its ordinary
+configuration, without calling `setup()` in the worker parent:
+
+```python
+from django_altimeter.celery import install
+
+install(app)
+```
+
+Registration is idempotent and starts no providers, exporter threads or network
+work. The prefork child initializes in `worker_process_init`; solo initializes
+in its own pool lifecycle; beat initializes in `beat_init`. Each exporting
+process gets a fresh `service.instance.id`, including recycled children.
+Logging attachment follows Celery's logging setup and preserves existing
+handlers. Web publication uses the serving process's existing `setup()`.
+
+Start a worker or beat with the ordinary Celery CLI (replace `example.celery`
+with your app module):
+
+```sh
+celery -A example.celery worker --pool=prefork --concurrency=2
+celery -A example.celery worker --pool=prefork --concurrency=2 --max-tasks-per-child=1
+celery -A example.celery worker --pool=solo
+celery -A example.celery beat
+```
+
+The public publication wrapper calls the existing `send_task` once and restores
+context even when the broker raises. Native publication signals supply the
+actual destination, including queue overrides; configured routing tables are
+not used to infer it. Each execution attempt gets a CONSUMER span, parented to
+its PRODUCER publication span when valid metadata exists. Instrumented retries
+get distinct attempts and a link to the observed previous attempt. The original
+publication context remains unchanged. A versioned header carries only bounded
+trace context and timestamps, at most 1 KiB; arguments, results, identities and
+baggage are excluded. Missing or malformed headers do not prevent task execution.
+Publication adds no telemetry carrier when a header map has more than 128 keys,
+non-string keys or keys longer than 128 characters; it preserves the native
+message.
+
+For errors raised in the task body, context stays available through failure
+reporting, then finalizes once at `task_postrun` and clears before reuse.
+Celery emits `task_postrun` before its later internal-error/failure callbacks
+when a loader fails outside the task body. Logs emitted by the loader before
+raising retain correlation; those later callbacks run after context cleanup.
+Parent-side lost-child callbacks
+create no Altimeter runtime, spans or metrics. Celery's native result backend
+and events report the loss; a replacement child can initialize independently.
+Telemetry emitted before a kill does not describe the task's final outcome.
+
+Worker metrics are native delta instruments, independent of trace sampling:
+
+| Instrument | Unit | Observation |
+| --- | --- | --- |
+| `altimeter.worker.attempts` | `{attempt}` | Observed execution attempts by outcome |
+| `altimeter.worker.duration` | `s` | Monotonic execution-attempt lifetime |
+| `altimeter.worker.enqueue_to_start` | `s` | Start minus this attempt's publication, including intentional delay |
+| `altimeter.worker.intentional_delay` | `s` | Known nonnegative eligibility minus publication |
+
+Dimensions are `messaging.system=celery`, approved `task.name`, approved
+`queue.name`, and `altimeter.outcome` (`success`, `retry`, `failure`, `unknown`).
+Unknown names normalize to `_OTHER`; no task IDs, arguments or results become
+labels. Invalid cross-process clock intervals are omitted, never clamped.
+Writer resources remain distinct. Histograms use finite seconds boundaries
+0.005, 0.01, 0.05, 0.1, 0.5, 1, 5, 15, 30, 60, 120, 300, 900, 3600 and 86400.
+Admission allows at most 2,000 combinations per instrument, including reserved
+queue/outcome overflow combinations; overflow removes task detail and sets
+`altimeter.overflow=true` while retaining totals.
+
+Send SIGTERM for normal worker or beat shutdown. Owned signals share one
+two-second drain budget; task bodies never wait for export. A hard kill,
+interpreter crash or insufficient termination grace can lose pending telemetry.
+Disable telemetry and restart every worker, beat and web publisher to remove
+instrumentation while preserving ordinary task execution:
+
+```sh
+export ALTIMETER_ENABLED=false
+```
+
 ## Browser journeys
 
 The wheel and sdist include framework-independent TypeScript in
@@ -1078,6 +1188,30 @@ admission.size        admission.type        span.admission_error
 Revalidate the metric timeout compatibility guard and deadline tests before
 changing the OTel version bounds.
 
+Celery checks install the built wheel and run real workers, beat and a local
+OTLP receiver against isolated Redis broker/backend databases and UUID key
+prefixes. They use neither eager tasks nor a mocked broker:
+
+```sh
+uv build
+docker compose -p <unique-celery> -f reference/compose.yaml --profile asgi run --build --rm verify-asgi python -m pytest tests/integration/test_celery_publication.py tests/integration/test_celery_workers.py tests/integration/test_celery_metrics_logs.py
+docker compose -p <unique-celery> -f reference/compose.yaml --profile asgi down --remove-orphans
+```
+
+Run the predeclared worker measurements explicitly in the local ASGI image:
+
+```sh
+docker compose -p <unique-celery-perf> -f reference/compose.yaml --profile asgi run --build --rm verify-asgi python -m pytest -m performance -s tests/performance/test_worker_overhead.py
+docker compose -p <unique-celery-perf> -f reference/compose.yaml --profile asgi down --remove-orphans
+```
+
+The measured workload compares disabled, healthy and hanging-export modes,
+including child recycling, normal exit cost, throughput and RSS. The added
+recycled-child setup target is under 50 ms; the complete parameters and memory
+plateau criteria are declared in `tests/performance/test_worker_overhead.py`.
+Timing measurements run locally; CI keeps the real-process correctness suites
+and harness self-tests. Run the matching cleanup command even after a failure.
+
 Browser checks use Bun 1.3.14 and Node 26.12.1. After Python setup and `uv build`,
 install the locked development dependencies and Chromium:
 
@@ -1264,7 +1398,7 @@ docker compose -p <unique> -f reference/compose.yaml --profile wsgi down --remov
 The explicit `-m performance` overrides the default selection; each command
 selects one timing test. A command that selects zero tests fails.
 
-Each performance test uses one worker, four persistent connections and a static
+Each web performance test uses one worker, four persistent connections and a static
 1 KiB response; gunicorn uses four gthread threads. Each fresh process warms
 200 requests, settles for one second,
 then runs for ten seconds; three balanced repetitions cover disabled, enabled

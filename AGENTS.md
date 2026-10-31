@@ -59,6 +59,13 @@ once `pyproject.toml` exists:
   then `docker compose -p <unique-wsgi-work-name> -f reference/compose.yaml --profile wsgi down --remove-orphans`
 - Browser setup (Bun 1.3.14, Node 26.12.1), after `uv sync --all-extras --dev` and `uv build`:
   `cd tests/browser && bun install --frozen-lockfile && bun run install:browser`
+- Real Celery publication, worker lifecycle and metric/log checks after `uv build`:
+  `docker compose -p <unique-celery> -f reference/compose.yaml --profile asgi run --build --rm verify-asgi python -m pytest tests/integration/test_celery_publication.py tests/integration/test_celery_workers.py tests/integration/test_celery_metrics_logs.py`
+  then `docker compose -p <unique-celery> -f reference/compose.yaml --profile asgi down --remove-orphans`
+  (repeat with `--profile wsgi` and `verify-wsgi` for Python 3.12 compatibility).
+- Predeclared Celery measurements, local ASGI image only after `uv build`:
+  `docker compose -p <unique-celery-perf> -f reference/compose.yaml --profile asgi run --build --rm verify-asgi python -m pytest -m performance -s tests/performance/test_worker_overhead.py`
+  then `docker compose -p <unique-celery-perf> -f reference/compose.yaml --profile asgi down --remove-orphans`
 - Browser unit tests: `cd tests/browser && bun run test:unit`
 - Browser TypeScript checks (harness plus ASGI/WSGI compiler profiles):
   `cd tests/browser && bun run typecheck`
@@ -68,7 +75,7 @@ once `pyproject.toml` exists:
   it tears them down on exit. Build the wheel again after changing shipped source.
 
 Default test runs, including CI, deselect the `performance` marker. Explicit
-`-m performance` overrides that default. Only the two wall-clock acceptance tests
+`-m performance` overrides that default. Only the wall-clock acceptance tests
 have this marker; their harness self-tests remain in the default suite. A performance
 command that selects zero tests is a failure.
 

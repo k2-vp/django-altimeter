@@ -44,7 +44,7 @@ subprocess.run(
           if os.environ['ALTIMETER_REFERENCE_ASGI'] == '1' else []),
         *(['gunicorn==23.0.0', 'djangorestframework==3.16.1']
           if os.environ['ALTIMETER_REFERENCE_WSGI'] == '1' else []),
-        f"{wheels[0]}[psycopg,httpx,requests,redis,structlog]",
+        f"{wheels[0]}[celery,psycopg,httpx,requests,redis,structlog]",
     ],
     check=True,
 )

@@ -52,11 +52,11 @@ wheels = [
 
 [[package]]
 name = "billiard"
-version = "4.3.1"
+version = "4.2.4"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/ea/0d/8921e960be19fa226358bf933509f57ec679d9b35a1e7ea43460af4b7fef/billiard-4.3.1.tar.gz", hash = "sha256:c88559b306ee5dc93f8d5f843d07da15d795d67af26720d14ee9d09f09eb0b22", size = 166478, upload-time = "2026-10-05T06:38:30.496Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/58/23/b12ac0bcdfb7360d664f40a00b1bda139cbbbced012c34e375506dbd0143/billiard-4.2.4.tar.gz", hash = "sha256:55f542c371209e03cd5862299b74e52e4fbcba8250ba611ad94276b369b6a85f", size = 156537, upload-time = "2025-11-30T13:28:48.52Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/bb/b1/360936699597063a2d9863aa94ccc3a6951e906ced032a9a1d8e562fc56b/billiard-4.3.1-py3-none-any.whl", hash = "sha256:2c7075283191d9c0add66cf8fca8e06ba599e75fe7319b67186759f8877dfdaf", size = 90178, upload-time = "2026-10-05T06:38:28.373Z" },
+    { url = "https://files.pythonhosted.org/packages/cb/87/8bab77b323f16d67be364031220069f79159117dd5e43eeb4be2fef1ac9b/billiard-4.2.4-py3-none-any.whl", hash = "sha256:525b42bdec68d2b983347ac312f892db930858495db601b5836ac24e6477cde5", size = 87070, upload-time = "2025-11-30T13:28:47.016Z" },
 ]
 
 [[package]]
@@ -314,8 +314,11 @@ dependencies = [
 
 [package.optional-dependencies]
 celery = [
+    { name = "billiard" },
     { name = "celery" },
     { name = "kombu" },
+    { name = "redis", version = "6.1.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.13'" },
+    { name = "redis", version = "7.4.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.13'" },
 ]
 httpx = [
     { name = "httpx" },
@@ -354,10 +357,11 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "celery", marker = "extra == 'celery'", specifier = ">=5.6.3,<5.7" },
+    { name = "billiard", marker = "extra == 'celery'", specifier = "==4.2.4" },
+    { name = "celery", marker = "extra == 'celery'", specifier = "==5.6.3" },
     { name = "django", specifier = ">=5.2,<6.1" },
     { name = "httpx", marker = "extra == 'httpx'", specifier = "==0.28.1" },
-    { name = "kombu", marker = "extra == 'celery'", specifier = ">=5.6.2,<5.7" },
+    { name = "kombu", marker = "extra == 'celery'", specifier = "==5.6.2" },
     { name = "opentelemetry-api", specifier = ">=1.45.1,<1.46" },
     { name = "opentelemetry-exporter-otlp-proto-http", specifier = ">=1.45.1,<1.46" },
     { name = "opentelemetry-instrumentation-httpx", marker = "extra == 'httpx'", specifier = "==0.66b1" },
@@ -367,7 +371,9 @@ requires-dist = [
     { name = "opentelemetry-sdk", specifier = ">=1.45.1,<1.46" },
     { name = "psycopg", extras = ["binary"], marker = "extra == 'psycopg'", specifier = "==3.3.4" },
     { name = "psycopg-pool", marker = "extra == 'psycopg'", specifier = "==3.3.1" },
+    { name = "redis", marker = "python_full_version >= '3.13' and extra == 'celery'", specifier = "==7.4.0" },
     { name = "redis", marker = "python_full_version >= '3.13' and extra == 'redis'", specifier = "==7.4.0" },
+    { name = "redis", marker = "python_full_version < '3.13' and extra == 'celery'", specifier = "==6.1.1" },
     { name = "redis", marker = "python_full_version < '3.13' and extra == 'redis'", specifier = "==6.1.1" },
     { name = "rq", marker = "extra == 'rq'", specifier = ">=2.10.0,<2.11" },
     { name = "structlog", marker = "extra == 'structlog'", specifier = "==25.5.0" },

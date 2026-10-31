@@ -575,10 +575,10 @@ scrubber, nonpropagating logger and post-configuration details.
 
 ## Celery workers and beat
 
-The real Celery worker profile is verified on Python 3.13 / Django 6.0 in the
-ASGI image, with Redis client 7.4.0. Python 3.12 retains Redis client 6.1.1;
-its wheel installation and import checks do not verify worker behavior on that
-version.
+Real Celery prefork workers with reused and recycled children, solo workers,
+and beat are verified in the ASGI reference image (Python 3.13, Django 6.0,
+Redis client 7.4.0) and the WSGI reference image (Python 3.12, Django 5.2,
+Redis client 6.1.1). The HTTP publisher runs on uvicorn in both images.
 Supported execution pools are prefork (including reused and recycled children)
 and solo. Beat can publish instrumented tasks. Other pools are unsupported for
 telemetry; their application tasks still run. Do not also install the OTel

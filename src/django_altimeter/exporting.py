@@ -10,7 +10,7 @@ it is a payload estimate, not a measurement of Python heap usage.
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -55,6 +55,7 @@ from opentelemetry.sdk.util.instrumentation import (
     InstrumentationInfo,
     InstrumentationScope,
 )
+from opentelemetry.sdk.version import __version__ as sdk_version
 from opentelemetry.trace import (
     Link,
     SpanContext,
@@ -370,6 +371,9 @@ class BoundedSpanProcessor(SpanProcessor):
         _check_limits(limits)
         self._limits = limits
         self.last_diagnostic: str | None = None
+        self._local_dropped_records = 0
+        self._drop_lock = Lock()
+        self._drop_diagnostics: dict[str, float] = {}
         self._delegate = BatchSpanProcessor(
             exporter,
             max_queue_size=limits.max_queue_size,
@@ -377,6 +381,30 @@ class BoundedSpanProcessor(SpanProcessor):
             schedule_delay_millis=schedule_delay_millis,
             meter_provider=meter_provider,
         )
+
+    @property
+    def local_dropped_records(self) -> int:
+        """Cumulative admission losses for this processor, before batching."""
+        with self._drop_lock:
+            return self._local_dropped_records
+
+    def _record_drop(self, code: str) -> None:
+        if code not in {"admission.size", "admission.type", "span.admission_error"}:
+            code = "span.admission_error"
+        self.last_diagnostic = code
+        try:
+            with self._drop_lock:
+                self._local_dropped_records += 1
+                now = monotonic()
+                previous = self._drop_diagnostics.get(code)
+                if previous is not None and now - previous < 60:
+                    return
+                self._drop_diagnostics[code] = now
+            # Log outside the lock, after throttling, including for reentrant
+            # handlers. Neither the dropped record nor its values are retained.
+            _DIAGNOSTIC_LOGGER.warning("%s traces", code)
+        except Exception:
+            pass  # A diagnostic handler cannot break the application span.
 
     def on_start(self, span: Span, parent_context: Context | None = None) -> None:
         try:
@@ -389,9 +417,9 @@ class BoundedSpanProcessor(SpanProcessor):
             _span_size(span, self._limits)
             self._delegate.on_end(span)
         except _Rejected as error:
-            self.last_diagnostic = str(error)
+            self._record_drop(str(error))
         except Exception:
-            self.last_diagnostic = "span.admission_error"
+            self._record_drop("span.admission_error")
 
     def force_flush(self, timeout_millis: int = 30000) -> bool:
         try:
@@ -487,6 +515,7 @@ _DIAGNOSTIC_CODES = frozenset(
         "export.connection",
         "export.invalid",
         "export.failed",
+        "export.local_drop",
         "export.framing",
         "metrics.timeout_unsupported",
     }
@@ -513,6 +542,7 @@ _OUTCOME_PRIORITY = {
     "export.accepted": 0,
     "export.warning": 1,
     "export.partial": 2,
+    "export.local_drop": 3,
 }
 
 
@@ -532,13 +562,14 @@ class ExportProtocolError(Exception):
 
 def _record_count(message: Message, signal: Signal, ceiling: int) -> int:
     """Bound every container before walking even a decoded, byte-bounded batch."""
-    groups = getattr(message, f"resource_{signal if signal != 'traces' else 'spans'}")
+    suffix = "spans" if signal == "traces" else signal
+    groups = getattr(message, f"resource_{suffix}")
     if len(groups) > ceiling:
         raise ExportProtocolError("export.batch_count")
     scopes_left = instruments_left = ceiling
     count = 0
     for group in groups:
-        scopes = getattr(group, f"scope_{signal if signal != 'traces' else 'spans'}")
+        scopes = getattr(group, f"scope_{suffix}")
         if len(scopes) > scopes_left:
             raise ExportProtocolError("export.batch_count")
         scopes_left -= len(scopes)
@@ -598,6 +629,11 @@ def _remaining(deadline: float) -> float:
     if remaining <= 0:
         raise ExportProtocolError("export.deadline")
     return remaining
+
+
+def _is_protobuf(headers: Mapping[str, str]) -> bool:
+    content_type = headers.get("Content-Type", "").split(";", 1)[0]
+    return content_type.strip().lower() == "application/x-protobuf"
 
 
 def _read_response(response: requests.Response, ceiling: int, deadline: float) -> bytes:
@@ -672,6 +708,7 @@ class _ProjectionScope:
         self.batch: _ProjectedBatch | None = None
         self.terminal_outcome: ExportOutcome | None = None
         self.active = True
+        self.requests_started = 0
         # Copied contexts may run on another thread while the export finishes.
         self.lock = Lock()
 
@@ -722,6 +759,8 @@ class SanitizingSession(requests.Session):
         self.policy = policy
         self.limits = limits
         self.trust_env = False
+        self.headers.clear()
+        self._configured_headers: dict[str, str] = {}
         self._outcome = ExportOutcome()
         self._diagnostic_times: dict[str, float] = {}
         self._diagnostic_lock = Lock()
@@ -739,6 +778,17 @@ class SanitizingSession(requests.Session):
         self._projection_scope: ContextVar[_ProjectionScope | None] = ContextVar(
             "altimeter_export_projection", default=None
         )
+
+    def _configure_transport(self, headers: Mapping[str, str] | None) -> None:
+        # Configuration owns header validation. Keep its explicit values separate
+        # from the native exporter, which merges ambient OTEL_* credentials.
+        from django_altimeter.conf import _headers
+
+        self._configured_headers = dict(_headers(headers))
+        self.headers.clear()
+        # The native constructor writes environment-derived TLS settings here.
+        self.verify = True
+        self.cert = None
 
     @property
     def outcome(self) -> ExportOutcome:
@@ -795,6 +845,52 @@ class SanitizingSession(requests.Session):
             _DIAGNOSTIC_LOGGER.warning("%s %s", code, self.signal)
         except Exception:
             pass  # Diagnostic/logging failure must not change export behavior.
+
+    def _report_outcome(self, code: str, local_dropped_records: int = 0) -> None:
+        self._outcome = ExportOutcome(code, local_dropped_records=local_dropped_records)
+        self._emit_diagnostic()
+
+    def _native_export[B, R](
+        self, native_export: Callable[[B], R], batch: B, record_count: int
+    ) -> R:
+        """Account for native rejection before the transport is reached."""
+        scope = self._projection_scope.get()
+        if scope is None:
+            return native_export(batch)
+        with scope.lock:
+            before = scope.requests_started
+        try:
+            return native_export(batch)
+        finally:
+            with scope.lock:
+                unsent = scope.requests_started == before
+            if unsent and record_count:
+                self._report_outcome("export.local_drop", record_count)
+                scope.record_terminal(self.outcome)
+
+    def _export_in_scope[B, R](
+        self,
+        native_export: Callable[[Sequence[B]], R],
+        batch: Sequence[B],
+        *,
+        count_drops: bool,
+    ) -> R:
+        """Run one native span or log export in a fresh projection scope."""
+        caller_exception = exception()
+        self._outcome = ExportOutcome()
+        failures_token = self._failures.set(())
+        projection_scope = _ProjectionScope()
+        projection_token = self._projection_scope.set(projection_scope)
+        try:
+            return self._native_export(
+                native_export, batch, len(batch) if count_drops else 0
+            )
+        finally:
+            projection_scope.close()
+            self._projection_scope.reset(projection_token)
+            self._clear_failure_frames(caller_exception)
+            self._failures.reset(failures_token)
+            self._export_completed()
 
     def _project_for_attempt(self, data: bytes) -> tuple[bytes, int, int]:
         signal, policy, limits = self.signal, self.policy, self.limits
@@ -864,10 +960,7 @@ class SanitizingSession(requests.Session):
             _remaining(deadline)
             status = response.status_code
             if 400 <= status <= 599:
-                self._outcome = ExportOutcome(
-                    "export.http_error", local_dropped_records=dropped
-                )
-                self._emit_diagnostic()
+                self._report_outcome("export.http_error", dropped)
                 return _safe_response(
                     status, _safe_retry_after(response.headers.get("Retry-After"))
                 )
@@ -878,13 +971,7 @@ class SanitizingSession(requests.Session):
                 != "identity"
             ):
                 raise ExportProtocolError("export.encoding")
-            if (
-                response.headers.get("Content-Type", "")
-                .split(";", 1)[0]
-                .strip()
-                .lower()
-                != "application/x-protobuf"
-            ):
+            if not _is_protobuf(response.headers):
                 raise ExportProtocolError("export.content_type")
             body = _read_response(response, self.limits.max_response_bytes, deadline)
             if self.signal == "traces":
@@ -925,6 +1012,11 @@ class SanitizingSession(requests.Session):
         self, method: str, url: str | bytes, *args: Any, **kwargs: Any
     ) -> requests.Response:
         self._outcome = ExportOutcome()
+        scope = self._projection_scope.get()
+        if scope is not None:
+            with scope.lock:
+                if scope.active:
+                    scope.requests_started += 1
         deadline = monotonic()
         try:
             timeout = kwargs.get("timeout")
@@ -949,10 +1041,7 @@ class SanitizingSession(requests.Session):
             if method != "POST" or url != self.endpoint:
                 raise ExportProtocolError("export.destination")
             headers = requests.structures.CaseInsensitiveDict(kwargs.get("headers"))
-            if (
-                headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
-                != "application/x-protobuf"
-            ):
+            if not _is_protobuf(headers):
                 raise ExportProtocolError("export.content_type")
             if headers.get("Content-Encoding", "identity").lower() != "identity":
                 raise ExportProtocolError("export.encoding")
@@ -963,7 +1052,12 @@ class SanitizingSession(requests.Session):
                 raise ExportProtocolError("export.batch_size")
             projected, count, dropped = self._project_for_attempt(data)
             self._outcome = ExportOutcome(local_dropped_records=dropped)
-            headers["Accept-Encoding"] = "identity"
+            request_headers = {
+                "Content-Type": "application/x-protobuf",
+                "User-Agent": f"OTel-OTLP-Exporter-Python/{sdk_version}",
+                **self._configured_headers,
+                "Accept-Encoding": "identity",
+            }
 
             # A hook runs before requests' redirect-resolution/body buffering
             # (which also runs with allow_redirects=False) and cookie persistence.
@@ -977,7 +1071,7 @@ class SanitizingSession(requests.Session):
                 "POST",
                 self.endpoint,
                 data=projected,
-                headers=headers,
+                headers=request_headers,
                 # HTTPAdapter supports urllib3 Timeout; requests' annotation
                 # only lists its scalar/tuple shortcuts.
                 timeout=cast(
@@ -989,35 +1083,25 @@ class SanitizingSession(requests.Session):
             )
         except ExportProtocolError as error:
             self._remember_failure(error)
-            self._outcome = ExportOutcome(
-                str(error), local_dropped_records=self._outcome.local_dropped_records
-            )
-            self._emit_diagnostic()
+            self._report_outcome(str(error), self._outcome.local_dropped_records)
             raise
         except (requests.ConnectionError, requests.Timeout, ReadTimeoutError, SSLError):
             if monotonic() >= deadline:
-                self._outcome = ExportOutcome(
-                    "export.deadline",
-                    local_dropped_records=self._outcome.local_dropped_records,
+                self._report_outcome(
+                    "export.deadline", self._outcome.local_dropped_records
                 )
-                self._emit_diagnostic()
                 failure = ExportProtocolError("export.deadline")
                 self._remember_failure(failure)
                 raise failure from None
-            self._outcome = ExportOutcome(
-                "export.connection",
-                local_dropped_records=self._outcome.local_dropped_records,
+            self._report_outcome(
+                "export.connection", self._outcome.local_dropped_records
             )
-            self._emit_diagnostic()
             connection_failure = requests.ConnectionError("export.connection")
             self._remember_failure(connection_failure)
             raise connection_failure from None
         except Exception:
             code = "export.deadline" if monotonic() >= deadline else "export.invalid"
-            self._outcome = ExportOutcome(
-                code, local_dropped_records=self._outcome.local_dropped_records
-            )
-            self._emit_diagnostic()
+            self._report_outcome(code, self._outcome.local_dropped_records)
             failure = ExportProtocolError(code)
             self._remember_failure(failure)
             raise failure from None
@@ -1038,21 +1122,14 @@ def create_span_exporter(
 
     class _SanitizingSpanExporter(OTLPSpanExporter):
         def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
-            caller_exception = exception()
-            session._outcome = ExportOutcome()
-            failures_token = session._failures.set(())
-            projection_scope = _ProjectionScope()
-            projection_token = session._projection_scope.set(projection_scope)
-            try:
-                return super().export(spans)
-            finally:
-                projection_scope.close()
-                session._projection_scope.reset(projection_token)
-                session._clear_failure_frames(caller_exception)
-                session._failures.reset(failures_token)
-                session._export_completed()
+            return session._export_in_scope(
+                super().export,
+                spans,
+                # SDK1.45.x: calls after shutdown never start a native batch.
+                count_drops=getattr(self, "_shutdown", False) is not True,
+            )
 
-    return _SanitizingSpanExporter(
+    exporter = _SanitizingSpanExporter(
         endpoint=session.endpoint,
         session=session,
         timeout=timeout,
@@ -1061,6 +1138,8 @@ def create_span_exporter(
         max_request_size=session.limits.max_batch_bytes,
         meter_provider=meter_provider,
     )
+    session._configure_transport(headers)
+    return exporter
 
 
 def create_log_exporter(
@@ -1078,21 +1157,13 @@ def create_log_exporter(
 
     class _SanitizingLogExporter(OTLPLogExporter):
         def export(self, batch: Sequence[ReadableLogRecord]) -> LogRecordExportResult:
-            caller_exception = exception()
-            session._outcome = ExportOutcome()
-            failures_token = session._failures.set(())
-            projection_scope = _ProjectionScope()
-            projection_token = session._projection_scope.set(projection_scope)
-            try:
-                return super().export(batch)
-            finally:
-                projection_scope.close()
-                session._projection_scope.reset(projection_token)
-                session._clear_failure_frames(caller_exception)
-                session._failures.reset(failures_token)
-                session._export_completed()
+            return session._export_in_scope(
+                super().export,
+                batch,
+                count_drops=getattr(self, "_shutdown", False) is not True,
+            )
 
-    return _SanitizingLogExporter(
+    exporter = _SanitizingLogExporter(
         endpoint=session.endpoint,
         session=session,
         timeout=timeout,
@@ -1101,6 +1172,8 @@ def create_log_exporter(
         max_request_size=session.limits.max_batch_bytes,
         meter_provider=meter_provider,
     )
+    session._configure_transport(headers)
+    return exporter
 
 
 def create_metric_exporter(
@@ -1136,8 +1209,16 @@ def create_metric_exporter(
             self._export_lock = Lock()
             self._timeout_supported = self._native_timeout() is not None
             if not self._timeout_supported:
-                session._outcome = ExportOutcome("metrics.timeout_unsupported")
-                session._emit_diagnostic()
+                session._report_outcome("metrics.timeout_unsupported")
+
+        def _export_batch(
+            self, export_request: ExportMetricsServiceRequest
+        ) -> MetricExportResult:
+            # SDK1.45.x splits before this hook; count only this native batch.
+            count = _record_count(
+                export_request, "metrics", session.limits.max_batch_size
+            )
+            return session._native_export(super()._export_batch, export_request, count)
 
         def _native_timeout(self) -> float | int | None:
             value = getattr(getattr(self, "_client", None), "_timeout", None)
@@ -1162,18 +1243,15 @@ def create_metric_exporter(
                 and type(timeout_millis) is not int
                 and type(timeout_millis) is not float
             ):
-                session._outcome = ExportOutcome("export.deadline")
-                session._emit_diagnostic()
+                session._report_outcome("export.deadline")
                 return MetricExportResult.FAILURE
             budget = timeout if timeout_millis is None else timeout_millis / 1000
             if not isfinite(budget) or budget <= 0:
-                session._outcome = ExportOutcome("export.deadline")
-                session._emit_diagnostic()
+                session._report_outcome("export.deadline")
                 return MetricExportResult.FAILURE
             deadline = monotonic() + min(timeout, budget)
             if not self._export_lock.acquire(timeout=max(0, deadline - monotonic())):
-                session._outcome = ExportOutcome("export.deadline")
-                session._emit_diagnostic()
+                session._report_outcome("export.deadline")
                 return MetricExportResult.FAILURE
             token = session._deadline.set(deadline)
             failures_token = session._failures.set(())
@@ -1212,4 +1290,6 @@ def create_metric_exporter(
                 self._export_lock.release()
                 session._export_completed(completed_outcome)
 
-    return _DeadlineMetricExporter()
+    exporter = _DeadlineMetricExporter()
+    session._configure_transport(headers)
+    return exporter

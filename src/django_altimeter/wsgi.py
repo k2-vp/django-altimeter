@@ -10,6 +10,10 @@ observation ends when the server calls close(), before application close work.
 If an instance cannot accept a close hook, it is returned untouched and the
 observation ends at app return with http.file_wrapper_unobserved. That fallback
 cannot observe file-transfer duration, completion or subsequent aborts.
+
+Excluded requests keep owned child spans non-recording during application,
+iterator and hooked close operations. Native server file-transfer code, and an
+unhookable close method, remain outside the adapter's context boundary.
 """
 
 from __future__ import annotations
@@ -23,10 +27,11 @@ from contextvars import Token
 from threading import Lock
 from time import monotonic, time_ns
 from typing import Any, cast
+from uuid import uuid4
 from wsgiref.types import StartResponse, WSGIApplication, WSGIEnvironment
 
 from opentelemetry import context, metrics, trace
-from opentelemetry.trace import Span, SpanKind
+from opentelemetry.trace import Span
 
 from django_altimeter.context import (
     _OWNED_SPAN,
@@ -38,8 +43,14 @@ from django_altimeter.headers import (
     wsgi_request_headers,
     wsgi_response_headers,
 )
-from django_altimeter.http import RequestState, finish_request, request_state
-from django_altimeter.privacy import is_allowed_attribute
+from django_altimeter.http import (
+    RequestState,
+    finish_request,
+    request_state,
+    start_server_span,
+    valid_boundary,
+)
+from django_altimeter.privacy import _request_method
 from django_altimeter.runtime import (
     ProcessRuntime,
     _owns_trace_provider,
@@ -49,6 +60,7 @@ from django_altimeter.runtime import (
 _STATE_KEY = "django_altimeter.request_state"
 _MISSING = object()
 _EMPTY_CONTEXT = context.Context()
+_EXCLUDED_CONTEXT_KEY = context.create_key("altimeter_excluded_wsgi")
 
 
 def _diagnostic(code: str) -> None:
@@ -56,16 +68,6 @@ def _diagnostic(code: str) -> None:
         logging.getLogger("django_altimeter.wsgi").warning("%s", code)
     except Exception:
         pass  # Application log handlers cannot change protocol behavior.
-
-
-def _method(value: object) -> str:
-    if (
-        type(value) is str
-        and len(value) <= 7
-        and is_allowed_attribute("http.request.method", value)
-    ):
-        return value
-    return "_OTHER"
 
 
 class _Response:
@@ -79,6 +81,8 @@ class _Response:
         start_response: StartResponse,
         owned_tracing: bool,
         owned_metrics: bool,
+        *,
+        excluded: bool = False,
     ) -> None:
         self._owner = owner
         self._counted = False
@@ -87,6 +91,7 @@ class _Response:
         self._start_response = start_response
         self._owned_tracing = owned_tracing
         self._owned_metrics = owned_metrics
+        self._excluded_marker = object() if excluded else None
         self._span: Span = trace.INVALID_SPAN
         self._parent = _EMPTY_CONTEXT
         self._application_context: context.Context | None = None
@@ -101,13 +106,24 @@ class _Response:
         self._start_time = time_ns()
         self.state = RequestState(
             monotonic(),
-            _method(environ.get("REQUEST_METHOD")),
+            _request_method(environ.get("REQUEST_METHOD")),
             owner.surface,
             runtime.config,
+            excluded=excluded,
         )
 
     def _begin(self) -> None:
         try:
+            if self.state.excluded:
+                self._span = trace.NonRecordingSpan(
+                    trace.SpanContext(uuid4().int, uuid4().int >> 64, False)
+                )
+                # A response-local marker keeps nested write() calls in their
+                # current manual span without exposing an HTTP request state.
+                self._parent = context.set_value(
+                    _EXCLUDED_CONTEXT_KEY, self._excluded_marker, _EMPTY_CONTEXT
+                )
+                return
             if self._owned_tracing:
                 self.state.concurrent_at_start = self._owner._enter(self._runtime.pid)
                 self._counted = True
@@ -123,18 +139,8 @@ class _Response:
                     trust_remote_parent=True,
                 )
             if self._owned_tracing:
-                self._span = self._runtime.tracer.start_span(
-                    self.state.method if self.state.method != "_OTHER" else "HTTP",
-                    context=self._parent,
-                    kind=SpanKind.SERVER,
-                    start_time=self._start_time,
-                    attributes={
-                        "http.request.method": self.state.method,
-                        "altimeter.surface": self.state.surface,
-                        "altimeter.http.server.concurrent_at_start": (
-                            self.state.concurrent_at_start
-                        ),
-                    },
+                self._span = start_server_span(
+                    self._runtime.tracer, self.state, self._parent, self._start_time
                 )
         except Exception:
             _diagnostic("http.span_start_failed")
@@ -143,23 +149,28 @@ class _Response:
     def _active_context(self) -> Iterator[None]:
         # write() can be called inside app/next/close while a manual span is
         # current. Keep that live scope; the enclosing operation saves it.
-        if request_state.get() is self.state:
+        if request_state.get() is self.state or (
+            self.state.excluded
+            and context.get_value(_EXCLUDED_CONTEXT_KEY) is self._excluded_marker
+        ):
             yield
             return
         state_token: Token[RequestState | None] | None = None
         trace_token: Token[context.Context] | None = None
         owned_token: Token[Span | None] | None = None
         try:
-            state_token = request_state.set(self.state)
-            application_context = self._application_context
-            owned_span = self._application_owned_span
-            if application_context is None:
-                application_context = trace.set_span_in_context(
-                    self._span, self._parent
-                )
-                owned_span = self._span if self._owned_tracing else None
-            trace_token = context.attach(application_context)
-            owned_token = _OWNED_SPAN.set(owned_span)
+            if not self.state.excluded:
+                state_token = request_state.set(self.state)
+            if self._owned_tracing:
+                application_context = self._application_context
+                owned_span = self._application_owned_span
+                if application_context is None:
+                    application_context = trace.set_span_in_context(
+                        self._span, self._parent
+                    )
+                    owned_span = None if self.state.excluded else self._span
+                trace_token = context.attach(application_context)
+                owned_token = _OWNED_SPAN.set(owned_span)
         except Exception:
             _diagnostic("http.context_failed")
         try:
@@ -256,13 +267,14 @@ class _Response:
     ) -> Callable[[bytes], object]:
         outgoing = headers
         try:
-            outgoing = wsgi_response_headers(
-                headers,
-                environ=self._environ,
-                policy=self._runtime.response_header_policy,
-                correlation=get_correlation() if self._owned_tracing else None,
-                owned_tracing=self._owned_tracing,
-            )
+            if not self.state.excluded:
+                outgoing = wsgi_response_headers(
+                    headers,
+                    environ=self._environ,
+                    policy=self._runtime.response_header_policy,
+                    correlation=get_correlation() if self._owned_tracing else None,
+                    owned_tracing=self._owned_tracing,
+                )
         except Exception:
             _diagnostic("http.headers_failed")
         try:
@@ -331,6 +343,9 @@ class _Response:
                 _diagnostic("http.concurrency_failed")
 
     def _finish(self) -> None:
+        if self.state.excluded:
+            self.state.finalized = True
+            return
         try:
             finished_at = self._completed_at or self._aborted_at or monotonic()
             duration = max(0.0, finished_at - self.state.started_at)
@@ -420,6 +435,8 @@ class _InstrumentedWSGI:
     def __call__(
         self, environ: WSGIEnvironment, start_response: StartResponse
     ) -> Iterable[bytes]:
+        if request_state.get() is not None:
+            return self.application(environ, start_response)
         try:
             runtime = get_process_runtime()
             owned_tracing = runtime is not None and _owns_trace_provider(runtime)
@@ -439,7 +456,7 @@ class _InstrumentedWSGI:
                 )
                 observed = (
                     None
-                    if excluded
+                    if excluded and not owned_tracing
                     else _Response(
                         self,
                         runtime,
@@ -447,6 +464,7 @@ class _InstrumentedWSGI:
                         start_response,
                         owned_tracing,
                         owned_metrics,
+                        excluded=excluded,
                     )
                 )
         except Exception:
@@ -471,12 +489,7 @@ def instrument(
     """
     if isinstance(application, _InstrumentedWSGI):
         return application
-    if (
-        type(surface) is not str
-        or len(surface) > 6
-        or surface not in {"django", "mcp"}
-        or type(trusted_ingress) is not bool
-    ):
+    if not valid_boundary(surface, trusted_ingress):
         _diagnostic("http.invalid_boundary")
         return application
     return _InstrumentedWSGI(application, surface, trusted_ingress)

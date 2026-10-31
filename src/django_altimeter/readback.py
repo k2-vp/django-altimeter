@@ -228,6 +228,7 @@ def _fetch(
     deadline: float,
 ) -> tuple[object, str]:
     import requests
+    from urllib3.exceptions import HTTPError
 
     from django_altimeter.exporting import ExportProtocolError, _read_response
 
@@ -275,7 +276,8 @@ def _fetch(
             "export.deadline": "readback.deadline",
             "export.response_size": "readback.response_size",
         }.get(str(error), "readback.invalid_response")
-    except requests.RequestException:
+    except (requests.RequestException, HTTPError):
+        # The bounded body reader uses raw urllib3, outside Requests' wrapping.
         return (
             None,
             "readback.deadline" if monotonic() >= deadline else "readback.network",

@@ -1324,3 +1324,55 @@ class TestWSGIPropagation:
                 }
             assert len(internal.requests) == len(external.requests) == 1
             assert not otlp_receiver.requests
+
+
+@pytest.mark.parametrize("client", ["requests", "httpx", "httpx-async"])
+def test_posthog_session_header_is_removed_at_every_origin(otlp_receiver, client):
+    with HTTPReceiver() as internal, HTTPReceiver() as external:
+        result = _run(
+            otlp_receiver,
+            internal,
+            """
+            import requests, httpx
+            headers = {'X-PostHog-Session-ID': 'OUTBOUND_CANARY_secret',
+                       'X-Request-Id': 'business-request'}
+            def fetch(url):
+                if os.environ['CLIENT_API'] == 'requests':
+                    return requests.get(url, headers=headers, timeout=2)
+                if os.environ['CLIENT_API'] == 'httpx':
+                    with httpx.Client() as client:
+                        return client.get(url, headers=headers, timeout=2)
+                async def async_fetch():
+                    async with httpx.AsyncClient() as client:
+                        return await client.get(url, headers=headers, timeout=2)
+                return asyncio.run(async_fetch())
+            with span('outbound.parent'):
+                first = fetch(os.environ['INTERNAL_ORIGIN'] + '/safe')
+                second = fetch(os.environ['EXTERNAL_ORIGIN'] + '/safe')
+            assert shutdown().completed
+            print(json.dumps({'bodies': [first.text, second.text]}))
+            """,
+            clients="httpx" if client.startswith("httpx") else "requests",
+            CLIENT_API=client,
+            EXTERNAL_ORIGIN=external.origin,
+        )
+        assert result["bodies"] == ["safe-response", "safe-response"]
+        assert len(internal.requests) == len(external.requests) == 1
+        inside, outside = [
+            {key.lower(): value for key, value in server.requests[0].headers}
+            for server in (internal, external)
+        ]
+        for headers in (inside, outside):
+            assert "x-posthog-session-id" not in headers
+            assert headers["x-request-id"] == "business-request"
+            assert CANARY not in repr(headers)
+        children = [item for item in _spans(otlp_receiver) if item.kind == 3]
+        assert len(children) == 2
+        assert inside["traceparent"] in {
+            f"00-{item.trace_id.hex()}-{item.span_id.hex()}-01" for item in children
+        }
+        assert "traceparent" not in outside
+        assert all(
+            CANARY.encode() not in request.message.SerializeToString()
+            for request in otlp_receiver.requests
+        )

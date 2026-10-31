@@ -1567,3 +1567,206 @@ def test_owned_request_correlation_survives_foreign_scope_and_cleans_up(
         assert _attributes(spans[0])["altimeter.http.outcome"] == (
             "aborted" if abort else "completed"
         )
+
+
+@pytest.mark.parametrize("poll_after_body", [False, True])
+def test_cancelled_disconnect_poll_keeps_successful_stream_completed(
+    otlp_receiver: OTLPReceiver, poll_after_body: bool
+) -> None:
+    result = _run(
+        otlp_receiver,
+        f"        POLL_AFTER_BODY = {poll_after_body!r}\n"
+        + """
+        from django_altimeter.asgi import instrument
+        configure()
+        messages = []
+        polls = 0
+        async def poll(receive):
+            global polls
+            try:
+                # Like is_disconnected(): cancel only this receive poll, then
+                # continue the healthy application and its response stream.
+                async with asyncio.timeout(0):
+                    await receive()
+            except TimeoutError:
+                polls += 1
+        async def app(scope, receive, send):
+            if not POLL_AFTER_BODY:
+                await poll(receive)
+            await send({'type': 'http.response.start', 'status': 200,
+                        'headers': [(b'content-type', b'text/event-stream')]})
+            await send({'type': 'http.response.body', 'body': b'data: safe\\n\\n'})
+            if POLL_AFTER_BODY:
+                await poll(receive)
+        async def receive():
+            await asyncio.Future()
+        async def send(message):
+            messages.append(message)
+        observed = instrument(app, surface='mcp')
+        asyncio.run(observed(dict(SCOPE), receive, send))
+        assert observed._active == 0
+        assert shutdown().completed
+        print(json.dumps({'polls': polls, 'body': messages[-1]['body'].decode()}))
+        """,
+    )
+    assert result == {"polls": 1, "body": "data: safe\n\n"}
+    (span,) = _spans(otlp_receiver)
+    assert span.kind == 2
+    assert span.status.code == 0
+    assert _attributes(span)["altimeter.http.outcome"] == "completed"
+    assert _attributes(span)["altimeter.response_mode"] == "streaming"
+    assert _metric_count(otlp_receiver, "altimeter.http.server.requests") == 1
+    assert _metric_count(otlp_receiver, "http.server.request.duration") == 1
+
+
+@pytest.mark.parametrize("sample_rate", [0.0, 1.0])
+def test_nested_asgi_wrappers_share_one_request_owner(
+    otlp_receiver: OTLPReceiver, sample_rate: float
+) -> None:
+    result = _run(
+        otlp_receiver,
+        f"        RATE = {sample_rate!r}\n"
+        + """
+        from django_altimeter.asgi import instrument
+        from django_altimeter.http import request_state
+        configure(sample_rate=RATE)
+        entries = []
+        sent = []
+        async def app(scope, receive, send):
+            state = request_state.get()
+            entries.append([state.surface, state.concurrent_at_start, inner._active])
+            await send({'type': 'http.response.start', 'status': 200, 'headers': []})
+            await send({'type': 'http.response.body', 'body': b'safe'})
+        inner = instrument(app, surface='mcp')
+        async def router(scope, receive, send):
+            await inner(scope, receive, send)
+        outer = instrument(router)
+        async def receive():
+            return {'type': 'http.request', 'body': b''}
+        async def send(message):
+            sent.append(message['type'])
+        async def run():
+            await outer(dict(SCOPE), receive, send)
+            assert request_state.get() is None
+            assert outer._active == inner._active == 0
+            # The inner adapter still owns a standalone request afterward.
+            await inner(dict(SCOPE), receive, send)
+            assert request_state.get() is None
+            assert outer._active == inner._active == 0
+        asyncio.run(run())
+        assert shutdown().completed
+        print(json.dumps({'entries': entries, 'sent': sent}))
+        """,
+    )
+    assert result == {
+        "entries": [["django", 1, 0], ["mcp", 1, 1]],
+        "sent": ["http.response.start", "http.response.body"] * 2,
+    }
+    spans = _spans(otlp_receiver)
+    assert len(spans) == (2 if sample_rate else 0)
+    assert all(span.kind == 2 for span in spans)
+    if sample_rate:
+        assert sorted(_attributes(span)["altimeter.surface"] for span in spans) == [
+            "django",
+            "mcp",
+        ]
+    assert _metric_count(otlp_receiver, "altimeter.http.server.requests") == 2
+    assert _metric_count(otlp_receiver, "http.server.request.duration") == 2
+
+
+@pytest.mark.parametrize(
+    ("extension", "ending"),
+    [
+        ("pathsend", "complete"),
+        ("pathsend", "trailers"),
+        ("pathsend", "send_failure"),
+        ("zerocopysend", "complete"),
+        ("zerocopysend", "trailers"),
+        ("zerocopysend", "send_failure"),
+        ("zerocopysend", "unfinished"),
+    ],
+)
+def test_native_file_send_extensions_preserve_completion(
+    otlp_receiver: OTLPReceiver, extension: str, ending: str
+) -> None:
+    result = _run(
+        otlp_receiver,
+        f"        EXTENSION, ENDING = {extension!r}, {ending!r}\n"
+        + """
+        from tempfile import TemporaryFile
+        from django_altimeter.asgi import instrument
+        from django_altimeter.http import request_state
+        configure()
+        sent = []
+        returned_at = []
+        with TemporaryFile() as file:
+            file.write(b'safe')
+            file.seek(0)
+            kind = 'http.response.' + EXTENSION
+            terminal = ({'type': kind, 'path': '/CANARY_PATH/safe.txt'}
+                        if EXTENSION == 'pathsend' else
+                        {'type': kind, 'file': file, 'offset': 0, 'count': 4,
+                         'more_body': ENDING == 'unfinished'})
+            failure = OSError('CANARY_SEND_FAILURE')
+            async def app(scope, receive, send):
+                await send({'type': 'http.response.start', 'status': 200,
+                            'headers': [], 'trailers': ENDING == 'trailers'})
+                if EXTENSION == 'zerocopysend' and ENDING != 'unfinished':
+                    await send({'type': kind, 'file': file, 'count': 0,
+                                'more_body': True})
+                await asyncio.sleep(0.02)
+                await send(terminal)
+                if ENDING == 'trailers':
+                    await asyncio.sleep(0.04)
+                    await send({'type': 'http.response.trailers', 'headers': []})
+                await asyncio.sleep(0.08)
+            async def receive():
+                return {'type': 'http.request', 'body': b''}
+            async def send(message):
+                sent.append(message)
+                if message is terminal and ENDING == 'send_failure':
+                    raise failure
+                returned_at.append(time.monotonic() - request_state.get().started_at)
+            observed = instrument(app)
+            async def run():
+                try:
+                    await observed({**SCOPE, 'extensions': {kind: {}}}, receive, send)
+                except OSError as error:
+                    assert ENDING == 'send_failure' and error is failure
+                else:
+                    assert ENDING != 'send_failure'
+                assert request_state.get() is None
+                assert not trace.get_current_span().get_span_context().is_valid
+                assert observed._active == 0
+            asyncio.run(run())
+            app_returned_at = time.time_ns()
+            assert sum(message is terminal for message in sent) == 1
+            assert file.tell() == 0 and not file.closed
+            assert shutdown().completed
+            print(json.dumps({'sent': [message['type'] for message in sent],
+                              'last_send': returned_at[-1],
+                              'app_returned': app_returned_at}))
+        """,
+    )
+    expected = ["http.response.start"]
+    if extension == "zerocopysend" and ending != "unfinished":
+        expected.append("http.response.zerocopysend")
+    expected.append("http.response." + extension)
+    if ending == "trailers":
+        expected.append("http.response.trailers")
+    assert result["sent"] == expected
+    (span,) = _spans(otlp_receiver)
+    completed = ending in {"complete", "trailers"}
+    assert _attributes(span)["altimeter.http.outcome"] == (
+        "completed" if completed else "aborted"
+    )
+    assert span.status.code == (0 if completed else 2)
+    if completed:
+        assert int(result["last_send"] * 1e9) <= (
+            span.end_time_unix_nano - span.start_time_unix_nano
+        )
+        assert span.end_time_unix_nano < result["app_returned"] - 60_000_000
+    assert _metric_count(otlp_receiver, "altimeter.http.server.requests") == 1
+    assert _metric_count(otlp_receiver, "http.server.request.duration") == 1
+    for request in otlp_receiver.requests:
+        assert b"CANARY" not in request.message.SerializeToString()

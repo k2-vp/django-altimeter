@@ -7,14 +7,14 @@ from dataclasses import dataclass
 from math import isfinite
 from threading import Lock, local
 from time import time_ns
-from typing import TYPE_CHECKING, TypeGuard
+from typing import TYPE_CHECKING
 
 from opentelemetry import trace
 from opentelemetry._logs import SeverityNumber, get_logger_provider
 from opentelemetry.context import Context
 
 from django_altimeter.context import get_correlation
-from django_altimeter.privacy import is_allowed_attribute
+from django_altimeter.privacy import _text, is_allowed_attribute
 
 if TYPE_CHECKING:
     from django_altimeter.runtime import ProcessRuntime
@@ -30,14 +30,6 @@ _Scalar = str | bool | int | float
 class LoggingSetupResult:
     ok: bool = False
     codes: tuple[str, ...] = ()
-
-
-def _text(value: object, maximum: int) -> TypeGuard[str]:
-    return (
-        type(value) is str
-        and len(value) <= maximum
-        and len(value.encode("utf-8")) <= maximum
-    )
 
 
 def _internal(name: str) -> bool:

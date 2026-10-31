@@ -336,6 +336,31 @@ def _has_ingest_token(headers: dict[str, str]) -> bool:
     )
 
 
+def _is_posthog_bearer(authorization: str) -> bool:
+    return (
+        authorization.startswith("Bearer phc_")
+        and len(authorization) > 11
+        and not any(char.isspace() for char in authorization[7:])
+    )
+
+
+def _string_keyed_pairs(value: object, code: str) -> dict[str, object]:
+    """Read at most 16 (name, value) tuples with unique string names."""
+    if type(value) is not tuple or len(value) > 16:
+        raise _Invalid(code)
+    pairs: dict[str, object] = {}
+    for pair in value:
+        if (
+            type(pair) is not tuple
+            or len(pair) != 2
+            or type(pair[0]) is not str
+            or pair[0] in pairs
+        ):
+            raise _Invalid(code)
+        pairs[pair[0]] = pair[1]
+    return pairs
+
+
 def _signal(
     name: str, environ: Mapping[str, str], destinations: dict[str, object]
 ) -> SignalConfig:
@@ -413,12 +438,7 @@ def _signal(
             if "authorization" in headers and headers["authorization"] != authorization:
                 raise _Invalid("config.destination_conflict")
             headers["authorization"] = authorization
-        authorization = headers.get("authorization", "")
-        if (
-            not authorization.startswith("Bearer phc_")
-            or len(authorization) <= 11
-            or any(char.isspace() for char in authorization[7:])
-        ):
+        if not _is_posthog_bearer(headers.get("authorization", "")):
             raise _Invalid("config.invalid_auth")
     elif (
         _has_ingest_token(headers)
@@ -710,18 +730,7 @@ def validate_config(config: Config) -> ConfigResult:
             _, host, loopback = _url(signal.endpoint)
             if signal.destination not in {"none", "posthog", "collector"}:
                 raise _Invalid("config.invalid_signal")
-            if type(signal.headers) is not tuple or len(signal.headers) > 16:
-                raise _Invalid("config.invalid_headers")
-            headers: dict[str, object] = {}
-            for pair in signal.headers:
-                if (
-                    type(pair) is not tuple
-                    or len(pair) != 2
-                    or type(pair[0]) is not str
-                    or pair[0] in headers
-                ):
-                    raise _Invalid("config.invalid_headers")
-                headers[pair[0]] = pair[1]
+            headers = _string_keyed_pairs(signal.headers, "config.invalid_headers")
             checked_headers = dict(_headers(headers))
             if host in _REGIONS:
                 auth = checked_headers.get("authorization", "")
@@ -730,11 +739,7 @@ def validate_config(config: Config) -> ConfigResult:
                     or urlsplit(signal.endpoint).path != f"/i/v1/{name}"
                 ):
                     raise _Invalid("config.destination_conflict")
-                if (
-                    not auth.startswith("Bearer phc_")
-                    or len(auth) <= 11
-                    or any(char.isspace() for char in auth[7:])
-                ):
+                if not _is_posthog_bearer(auth):
                     raise _Invalid("config.invalid_auth")
             elif signal.destination == "posthog":
                 raise _Invalid("config.destination_conflict")
@@ -789,22 +794,11 @@ def validate_config(config: Config) -> ConfigResult:
         _callback(config.log_scrubber)
         _text(config.broker_namespace, 128, empty=True)
         _strings(config.queue_names, 32)
-        if (
-            type(config.queue_transport) is not tuple
-            or len(config.queue_transport) > 16
-        ):
-            raise _Invalid("config.invalid_queue_transport")
-        transport: dict[str, object] = {}
-        for transport_pair in config.queue_transport:
-            if (
-                type(transport_pair) is not tuple
-                or len(transport_pair) != 2
-                or type(transport_pair[0]) is not str
-                or transport_pair[0] in transport
-            ):
-                raise _Invalid("config.invalid_queue_transport")
-            transport[transport_pair[0]] = transport_pair[1]
-        _queue_transport(transport)
+        _queue_transport(
+            _string_keyed_pairs(
+                config.queue_transport, "config.invalid_queue_transport"
+            )
+        )
         if config.queue_observer_enabled and (
             config.role != "queue-observer"
             or not config.broker_namespace.strip()

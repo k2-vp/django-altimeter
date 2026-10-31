@@ -7,11 +7,14 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from opentelemetry.trace import Span, Status, StatusCode
+from opentelemetry.trace import Span, SpanKind, Status, StatusCode
 
 from django_altimeter.conf import Config
 
 if TYPE_CHECKING:
+    from opentelemetry.context import Context
+    from opentelemetry.trace import Tracer
+
     from django_altimeter.runtime import ProcessRuntime
 
 _ERROR_STATUS = Status(StatusCode.ERROR)
@@ -47,6 +50,33 @@ request_state: ContextVar[RequestState | None] = ContextVar(
 def get_request_state() -> RequestState | None:
     """Read this execution context's request state without touching Django."""
     return request_state.get()
+
+
+def valid_boundary(surface: object, trusted_ingress: object) -> bool:
+    """Accept only a known surface and an explicit boolean trust decision."""
+    return (
+        type(surface) is str
+        and len(surface) <= 6
+        and surface in {"django", "mcp"}
+        and type(trusted_ingress) is bool
+    )
+
+
+def start_server_span(
+    tracer: Tracer, state: RequestState, parent: Context, start_time: int
+) -> Span:
+    """Start the one SERVER span for an observed request."""
+    return tracer.start_span(
+        state.method if state.method != "_OTHER" else "HTTP",
+        context=parent,
+        kind=SpanKind.SERVER,
+        start_time=start_time,
+        attributes={
+            "http.request.method": state.method,
+            "altimeter.surface": state.surface,
+            "altimeter.http.server.concurrent_at_start": state.concurrent_at_start,
+        },
+    )
 
 
 def _diagnostic(code: str) -> None:

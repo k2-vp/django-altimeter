@@ -146,7 +146,7 @@ still leave other signals working.
 | `shutdown(*, timeout=2.0)` | Drains owned signals within one shared deadline. Returns frozen `ShutdownResult(completed, codes)`. |
 | `span(name, *, attributes=None)` | Creates a registered span, or an explicit no-op when tracing is unavailable. Pass a plain dictionary of bounded scalar values; unsupported containers are ignored before the SDK can inspect them. Application exceptions propagate unchanged. |
 | `get_correlation()` | Returns native trace/span IDs and trace flags only while this worker owns tracing; otherwise returns `None`. |
-| `enrich(subject)` | Calls the configured trusted identity resolver for an already-resolved subject. It never authenticates a request or loads a Django model. |
+| `enrich(subject)` | Calls the trusted identity resolver for an already-resolved subject only when the current recording span belongs to Altimeter. Foreign spans are untouched and do not invoke the resolver. It never authenticates a request or loads a Django model. |
 
 For a script with `DJANGO_SETTINGS_MODULE` already set, initialize Django before
 calling the public API:
@@ -169,9 +169,11 @@ finally:
 Repeated or concurrent setup with the same effective configuration installs once.
 Changing configuration after setup requires a worker restart. Each signal checks
 ownership independently: an existing third-party provider is left untouched, and
-Altimeter disables its use of that signal. Unowned tracing discloses no
-correlation or identity. Every exporting worker has a fresh UUID
-`service.instance.id`, including for delta metrics.
+Altimeter disables its use of that signal. When tracing is disabled or owned
+elsewhere, the ASGI and WSGI boundaries preserve the application's current span
+and baggage, so spans from its own tracer retain their parent. Altimeter
+discloses no correlation or identity for unowned tracing. Every exporting worker
+has a fresh UUID `service.instance.id`, including for delta metrics.
 
 Keep setup and shutdown in the application's explicit startup and cleanup
 hooks. **Gunicorn preload is unsupported.** Initialize after forking; a child
@@ -233,6 +235,10 @@ Unknown or unapproved routes omit `http.route`; raw paths, object IDs and query
 strings never replace it. `EXCLUDED_ROUTES` contains **exact static request
 paths**, checked at entry before creating any span or metric. It accepts no
 route templates, wildcards, or regular expressions.
+When Altimeter owns tracing, child spans inside an excluded request inherit a
+local unsampled context instead of creating orphan traces. Foreign tracing
+remains unchanged. WSGI applies this during application and iterable operations;
+native file-response limits are described below.
 
 Create Django before setup, then initialize telemetry in each serving worker's
 lifespan. The native wrapper looks up the owned runtime per request, so it can
@@ -295,10 +301,12 @@ install `DjangoInstrumentor` or generic OTel ASGI instrumentation on that branch
 The boundary owns one SERVER span, one request counter increment and one duration
 observation per eligible request when the corresponding signal is owned. Trace
 sampling affects spans, not request totals or histogram counts. Duration is
-monotonic application entry through the final successful body/trailer send, or
+monotonic application entry through the final successful body/file/trailer send, or
 an observed abort. It includes streamed production and send backpressure, and
 ends at that send even if application cleanup returns later. It does not measure
-client receipt. Response-ready time and
+client receipt. Native `http.response.pathsend` and final
+`http.response.zerocopysend` messages count as body completion; declared trailers
+must still finish before the response completes. Response-ready time and
 `altimeter.http.server.concurrent_at_start` are span fields, not metric dimensions.
 The concurrency count includes sampled and unsampled eligible requests in the
 same process and wrapped branch. Aborts keep an already-sent HTTP status; an
@@ -423,6 +431,8 @@ In that case, file-transfer duration, completion and later aborts are unobserved
 For native `wsgi.file_wrapper` responses served without `sendfile`, the server's
 file reads run outside the request context, so logs and spans emitted inside a
 custom file object's `read()` are not parented to the request.
+These file reads and an unhookable wrapper's `close()` also run outside
+route-exclusion suppression.
 
 The wrapper reuses the request counters, histogram buckets, route allow-list,
 sampling-independent totals and header trust rules above. The process/branch
@@ -460,6 +470,10 @@ results never become telemetry. SQLCommenter is off and SQL sent to the database
 is unchanged. Redis commands and pipelines get local child spans; no trace
 context is added to Redis commands.
 
+Failed or cancelled work marks its recorded child span as an error, including
+async cancellation. The original exception propagates unchanged; normal
+generator closure (`GeneratorExit`) does not mark an error.
+
 Use registered application spans around work that actually executes. For
 example, materialize a queryset once, then serialize those already loaded rows:
 
@@ -496,7 +510,9 @@ Origins consist of scheme, host and optional port; HTTP and HTTPS are allowed.
 Userinfo, paths, queries and wildcards are rejected. Public ingress headers do
 not authorize propagation of a remote identity or sampling decision. Baggage,
 tracestate and application correlation headers are removed at the outbound
-boundary; an approved origin receives the current owned `traceparent` only.
+boundary, including `X-PostHog-Session-ID` and `X-PostHog-Distinct-ID`, for both
+internal and third-party destinations. An approved origin receives the current
+owned `traceparent` only.
 Each redirect destination is checked again. Third-party and exporter requests
 carry no application trace context. Unrelated application headers and response
 bodies remain unchanged; raw URLs, query strings and bodies do not enter spans.
@@ -707,10 +723,13 @@ The probe runs in a short-lived isolated process with role `probe`, a fresh
 `service.instance.id`, and resource flag `altimeter.probe=true`. It sends exactly
 one record for each selected enabled signal: a span, a log record, or a metric
 point. All use the fixed name `altimeter.probe`. The metric has value `1` and
-scope `django_altimeter`. Exclude
-these tagged records from application dashboards. The probe uses a two-second
-deadline and leaves the calling process's providers untouched. With no enabled
-signal it fails with `nothing_to_probe` and sends nothing. Explicitly selecting a
+scope `django_altimeter`. Exclude these tagged records from application
+dashboards. After imports and provider initialization, the helper shares at most
+two seconds across export and drain, capped further by the configured shutdown
+timeout or a shorter `runtime.probe(timeout=...)` value. The parent watchdog
+allows eight additional seconds for cold startup and reaps the helper if the
+combined limit expires. The calling process's providers stay untouched. With no
+enabled signal it fails with `nothing_to_probe` and sends nothing. Explicitly selecting a
 disabled signal fails with `probe.signal_disabled`. Partial rejection, invalid
 responses, authentication errors, and timeouts fail the acceptance check. A
 zero-rejection warning is accepted with `export.warning`; the warning text is
@@ -740,8 +759,9 @@ OTLP acceptance alone does not establish storage or query visibility.
 
 Read-back shares one timeout across all signal queries and backoff, with at most
 six query rounds. `--timeout` defaults to 10 seconds and must be finite, greater
-than zero, and at most 30 seconds; it does not extend the probe deadline. Query
-responses are capped at 64 KiB. As with the OTLP transport below, continuous
+than zero, and at most 30 seconds; it does not change the probe's separate startup
+allowance or export/drain budget. Query responses are capped at 64 KiB. As with
+the OTLP transport below, continuous
 trickling of response header bytes is outside the pinned HTTP client's deadline
 guarantee.
 
@@ -909,6 +929,11 @@ the provider. Admission drops records only for unsupported types or exceeded
 limits, with bounded diagnostic codes. Projection applies the allow-list policy
 field by field, preserving permitted route/status/duration/correlation alongside
 removed unapproved fields. The exporter factories apply projection before sending.
+Admission inspects the whole retained record: an over-limit field or unsupported
+container drops the entire span even if projection would later remove that field.
+`BoundedSpanProcessor.local_dropped_records` counts cumulative admission losses
+before batching, separately from the session's per-export drop count. It does
+not count native batch rejection or SDK queue overflow.
 `native_span_limits()` and `native_log_limits()` supply the corresponding SDK
 limits for explicit provider construction. Call `normalize_span_name()` at an
 early instrumentation hook to reduce SQL/HTTP names to approved operations
@@ -962,6 +987,15 @@ detached response retains only status, a fixed safe reason, and valid bounded
 `Retry-After`; original server prose, request credentials, and cookies are
 discarded.
 
+The factories send only their validated `headers=` values and fixed protocol
+headers. They do not merge extra `OTEL_EXPORTER_OTLP_HEADERS` or signal-specific
+header values from the environment. Ambient OTLP `CERTIFICATE`,
+`CLIENT_CERTIFICATE` and `CLIENT_KEY` settings are ignored: TLS peer verification
+stays enabled and no client certificate is loaded. Runtime configuration can
+still select supported standard `OTEL_*` header variables when no `ALTIMETER_*`
+override is set; those values pass configuration validation before reaching
+the factory.
+
 Read the frozen `session.outcome` for the latest attempt or local no-send result.
 Its `accepted_records`, `rejected_records`, and `local_dropped_records` count
 spans, log records, or metric data points. They are separate, noncumulative
@@ -977,7 +1011,8 @@ every record was accepted or durably stored.
 | `export.warning` | A valid response reports zero rejected records and a warning. The attempt is accepted with this fixed warning code; server warning text is discarded. |
 | Fixed protocol error | Redirects, unexpected non-200 success statuses, wrong content type or encoding, malformed/truncated/oversized bodies, ambiguous framing, and invalid rejection counts fail without retry and report zero accepted records. Non-identity HTTP 200 encoding is refused before reading or decompressing its body. |
 | `export.http_error` | Ordinary 4xx/5xx bodies are discarded unread. Actual status and a valid bounded `Retry-After` remain available to the native retry code. The pinned client retries 429, 502, 503, and 504, subject to its deadline and retry budget; connection failures also use its native retry path. |
-| Local sanitizer rejection | Invalid input, excessive counts/bytes, projection failure, or zero surviving records sends nothing for that attempt and reports zero accepted records. There is no fallback to the original bytes. A native no-send path resets the outcome to `export.not_sent`. |
+| `export.local_drop` | A nonempty native batch never reached the sanitized HTTP session, including a native 1 MiB size rejection. `local_dropped_records` counts the unsent records in that batch. Earlier metric batches from the same call may already have been sent. |
+| Local sanitizer rejection | Invalid input, excessive counts/bytes, projection failure, or zero surviving records sends nothing for that attempt and reports zero accepted records. There is no fallback to the original bytes. An empty native export retains `export.not_sent`. |
 
 `Retry-After` values below one second are treated as absent, so the SDK uses
 its own exponential backoff. This includes numeric values below one and
@@ -1020,6 +1055,10 @@ thread-safe, and logging-handler errors do not change export behavior. Full
 acceptance (`export.accepted`) emits no warning. Keep this internal logger out of
 exported-log handlers to avoid feeding diagnostics back into telemetry.
 
+Span admission uses the same logger with `admission.size`, `admission.type` or
+`span.admission_error`. Each span processor independently limits each code to
+one warning per 60 seconds while continuing to count every rejected record.
+
 The closed set of warning codes is:
 
 ```text
@@ -1029,7 +1068,9 @@ export.content_type   export.projection     export.empty
 export.http_error     export.status         export.response_size
 export.rejected_count export.partial        export.warning
 export.deadline       export.connection     export.invalid
-export.failed         export.framing        metrics.timeout_unsupported
+export.failed         export.local_drop     export.framing
+metrics.timeout_unsupported
+admission.size        admission.type        span.admission_error
 ```
 
 ## Development

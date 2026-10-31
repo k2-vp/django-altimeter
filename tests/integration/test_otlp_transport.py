@@ -824,7 +824,8 @@ def test_native_no_send_resets_previous_acceptance(signal, otlp_receiver):
             )
         assert exporter.export(payload).name == "FAILURE"
         assert len(otlp_receiver.requests) == 1
-        assert session.outcome.code == "export.not_sent"
+        assert session.outcome.code == "export.local_drop"
+        assert session.outcome.local_dropped_records == 1
         assert session.outcome.accepted_records == session.outcome.rejected_records == 0
         assert exporter.export(_payload(signal)).name == "SUCCESS"
         assert session.outcome.accepted_records == 1
@@ -1787,3 +1788,124 @@ def test_retry_projection_concurrent_invocations_keep_independent_scopes(
     finally:
         for exporter in exporters:
             exporter.shutdown()
+
+
+@pytest.mark.parametrize("signal", SIGNALS)
+@pytest.mark.parametrize("specific", [False, True], ids=["generic", "signal"])
+@pytest.mark.parametrize(
+    "configured", [False, True], ids=["no-auth", "configured-auth"]
+)
+def test_native_export_ignores_ambient_headers(
+    signal, specific, configured, otlp_receiver, monkeypatch
+):
+    prefix = "OTEL_EXPORTER_OTLP" + (f"_{signal.upper()}" if specific else "")
+    monkeypatch.setenv(
+        f"{prefix}_HEADERS",
+        f"x-other-vendor-key={CANARY},authorization=Bearer ambient,"
+        f"user-agent={CANARY},x-extra-ambient={CANARY}",
+    )
+    headers = {"authorization": "Bearer configured", "x-configured": "kept"}
+    session = SanitizingSession(signal, otlp_receiver.url(signal), policy=POLICY)
+    factory = {
+        "traces": create_span_exporter,
+        "logs": create_log_exporter,
+        "metrics": create_metric_exporter,
+    }[signal]
+    exporter = factory(session, headers=headers if configured else None, timeout=1)
+    try:
+        assert exporter.export(_payload(signal)).name == "SUCCESS"
+        request = otlp_receiver.wait_for_requests()[0]
+        sent = {key.lower(): value for key, value in request.headers.items()}
+        assert "x-other-vendor-key" not in sent
+        assert "x-extra-ambient" not in sent
+        assert CANARY not in repr(sent)
+        assert sent.get("authorization") == (
+            headers["authorization"] if configured else None
+        )
+        assert sent.get("x-configured") == ("kept" if configured else None)
+        assert sent["content-type"] == "application/x-protobuf"
+        assert sent["user-agent"].startswith("OTel-OTLP-Exporter-Python/")
+        assert len(_records(request.message, signal)) == 1
+        assert session.outcome.accepted_records == 1
+    finally:
+        exporter.shutdown()
+
+
+@pytest.mark.parametrize("signal", SIGNALS)
+@pytest.mark.parametrize("specific", [False, True], ids=["generic", "signal"])
+def test_native_export_ignores_ambient_certificates(
+    signal, specific, otlp_receiver, monkeypatch, tmp_path
+):
+    prefix = "OTEL_EXPORTER_OTLP" + (f"_{signal.upper()}" if specific else "")
+    for suffix in ("CERTIFICATE", "CLIENT_CERTIFICATE", "CLIENT_KEY"):
+        monkeypatch.setenv(f"{prefix}_{suffix}", str(tmp_path / suffix))
+    exporter, session = _exporter(signal, otlp_receiver)
+    try:
+        assert exporter.export(_payload(signal)).name == "SUCCESS"
+        assert session.verify is True
+        assert session.cert is None
+        assert session.trust_env is False
+        request = otlp_receiver.wait_for_requests()[0]
+        assert len(_records(request.message, signal)) == 1
+        assert session.outcome.accepted_records == 1
+    finally:
+        exporter.shutdown()
+
+
+def test_native_metric_size_drop_reports_only_the_unsent_batch(otlp_receiver, caplog):
+    from dataclasses import replace
+
+    payload = _payload("metrics")
+    resource = payload.resource_metrics[0]
+    scope = resource.scope_metrics[0]
+    metric = scope.metrics[0]
+    point = metric.data.data_points[0]
+    large_point = replace(
+        point, attributes={f"unknown{i}": "x" * 250 for i in range(32)}
+    )
+    # One safe batch is sent before the oversized batch fails locally.
+    points = (point,) * 128 + (large_point,) * 128
+    large_payload = replace(
+        payload,
+        resource_metrics=(
+            replace(
+                resource,
+                scope_metrics=(
+                    replace(
+                        scope,
+                        metrics=(replace(metric, data=Gauge(data_points=points)),),
+                    ),
+                ),
+            ),
+        ),
+    )
+    exporter, session = _exporter("metrics", otlp_receiver)
+    try:
+        assert exporter.export(large_payload).name == "FAILURE"
+        requests = otlp_receiver.wait_for_requests()
+        assert len(requests) == 1
+        assert len(_records(requests[0].message, "metrics")) == 128
+        assert session.outcome.code == "export.local_drop"
+        assert session.outcome.local_dropped_records == 128
+        assert session.outcome.accepted_records == session.outcome.rejected_records == 0
+        assert CANARY.encode() not in requests[0].message.SerializeToString()
+        assert any(
+            r.getMessage() == "export.local_drop metrics" for r in caplog.records
+        )
+        assert exporter.export(payload).name == "SUCCESS"
+        assert session.outcome.accepted_records == 1
+        assert session.outcome.local_dropped_records == 0
+        assert len(otlp_receiver.requests) == 2
+    finally:
+        exporter.shutdown()
+
+
+@pytest.mark.parametrize("other_code", ["export.accepted", "export.not_sent"])
+@pytest.mark.parametrize("loss_first", [False, True])
+def test_local_drop_remains_the_worst_outcome(other_code, loss_first):
+    from django_altimeter.exporting import ExportOutcome, _worst_outcome
+
+    loss = ExportOutcome("export.local_drop", local_dropped_records=128)
+    other = ExportOutcome(other_code)
+    first, second = (loss, other) if loss_first else (other, loss)
+    assert _worst_outcome(first, second) is loss

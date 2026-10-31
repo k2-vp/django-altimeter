@@ -17,7 +17,7 @@ from glob import escape
 from math import isfinite
 from threading import Event, Lock, Thread, get_ident
 from time import monotonic, time_ns
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NoReturn
 from uuid import uuid4
 
 from opentelemetry import metrics, trace
@@ -26,7 +26,8 @@ from opentelemetry.metrics import NoOpMeterProvider
 from opentelemetry.trace import NoOpTracerProvider
 
 from django_altimeter import _otel_compat
-from django_altimeter.conf import Config, validate_config
+from django_altimeter.conf import Config, SignalConfig, validate_config
+from django_altimeter.privacy import PrivacyLimits, PrivacyPolicy
 
 if TYPE_CHECKING:
     import requests
@@ -35,7 +36,6 @@ if TYPE_CHECKING:
     from opentelemetry.sdk.metrics import MeterProvider
     from opentelemetry.sdk.trace import TracerProvider
 
-    from django_altimeter.conf import SignalConfig
     from django_altimeter.exporting import ExportOutcome, SanitizingSession
     from django_altimeter.headers import ResponseHeaderPolicy
     from django_altimeter.metrics import RequestMetrics
@@ -83,23 +83,22 @@ def _process_session(
             self, method: str, url: str | bytes, *args: Any, **kwargs: Any
         ) -> requests.Response:
             if os.getpid() != runtime.pid:
-                failure = ExportProtocolError("export.owner")
-                self._remember_failure(failure)
-                raise failure
+                self._refuse("export.owner")
             deadline = runtime._shutdown_deadline
             if deadline is not None:
                 remaining = deadline - monotonic()
                 if remaining <= 0 or runtime._finished.is_set():
-                    failure = ExportProtocolError("export.deadline")
-                    self._remember_failure(failure)
-                    raise failure
+                    self._refuse("export.deadline")
                 timeout = kwargs.get("timeout", runtime.config.export_timeout)
                 if type(timeout) not in (int, float):
-                    failure = ExportProtocolError("export.deadline")
-                    self._remember_failure(failure)
-                    raise failure
+                    self._refuse("export.deadline")
                 kwargs["timeout"] = min(timeout, remaining)
             return super().request(method, url, *args, **kwargs)
+
+        def _refuse(self, code: str) -> NoReturn:
+            failure = ExportProtocolError(code)
+            self._remember_failure(failure)
+            raise failure
 
     return ProcessSession(
         signal, endpoint, policy=runtime._policy, limits=runtime.config.limits
@@ -243,6 +242,7 @@ class ProcessRuntime:
 
     def _install_metrics(self) -> None:
         from opentelemetry.sdk.metrics import (
+            AlwaysOffExemplarFilter,
             Counter,
             Histogram,
             MeterProvider,
@@ -295,8 +295,6 @@ class ProcessRuntime:
             export_interval_millis=self.config.metric_export_interval_millis,
             export_timeout_millis=self._export_timeout() * 1000,
         )
-        from opentelemetry.sdk.metrics import AlwaysOffExemplarFilter
-
         provider = MeterProvider(
             resource=Resource(self._resource_attributes()),
             metric_readers=[reader],
@@ -731,13 +729,12 @@ _PROBE_SIGNALS = ("traces", "logs", "metrics")
 _PROBE_NAME = "altimeter.probe"
 _PROBE_INPUT_LIMIT = 256 * 1024
 _PROBE_OUTPUT_LIMIT = 16 * 1024
+_PROBE_STARTUP_ALLOWANCE = 8.0
 
 
 def _probe_configuration(config: Config, signals: tuple[str, ...]) -> dict[str, Any]:
     # Transfer only the deployment values needed by the existing composition.
     # Callbacks, request policy and operator/read-back credentials never cross.
-    from django_altimeter.conf import SignalConfig
-
     return {
         "service_name": config.service_name,
         "deployment_environment": config.deployment_environment,
@@ -752,9 +749,6 @@ def _probe_configuration(config: Config, signals: tuple[str, ...]) -> dict[str, 
 
 
 def _probe_config_from_json(values: dict[str, Any]) -> Config:
-    from django_altimeter.conf import SignalConfig
-    from django_altimeter.privacy import PrivacyLimits, PrivacyPolicy
-
     def signal(name: str) -> SignalConfig:
         data = values[name]
         return SignalConfig(
@@ -789,9 +783,7 @@ def _probe_config_from_json(values: dict[str, Any]) -> Config:
     )
 
 
-def _perform_probe(
-    config: Config, started_at: datetime, deadline: float
-) -> ProbeResult:
+def _perform_probe(config: Config, started_at: datetime, timeout: float) -> ProbeResult:
     from opentelemetry._logs import SeverityNumber
     from opentelemetry.context import Context
 
@@ -801,8 +793,12 @@ def _perform_probe(
         return ProbeResult(None, started_at, datetime.now(UTC), codes=validation.codes)
     runtime = ProcessRuntime(config)
     codes: list[str] = []
+    deadline = monotonic()
     try:
         initialized = runtime.initialize()
+        # Imports and provider construction cannot consume the export/drain
+        # budget. Only the helper's parent watchdog includes startup time.
+        deadline = monotonic() + min(timeout, config.shutdown_timeout, 2.0)
         codes.extend(initialized.codes)
         if monotonic() >= deadline:
             codes.append("probe.deadline")
@@ -868,7 +864,7 @@ def _probe_child() -> None:
         request = json.loads(raw)
         started = datetime.fromisoformat(request["started_at"])
         result = _perform_probe(
-            _probe_config_from_json(request["config"]), started, request["deadline"]
+            _probe_config_from_json(request["config"]), started, request["timeout"]
         )
     except Exception:
         result = ProbeResult(None, started, datetime.now(UTC), codes=("probe.failed",))
@@ -889,11 +885,13 @@ def probe(
     signals: tuple[str, ...] | None = None,
     timeout: float = 2.0,
 ) -> ProbeResult:
-    """Send one isolated safe probe per selected signal within a total budget.
+    """Send one isolated safe probe per signal with bounded startup and drain.
 
     A fresh helper owns all providers, native workers and at-fork hooks. Its
     bounded stdin contains validated values, never command-line credentials.
     No application provider or module runtime is installed in the caller.
+    The child caps export/drain at two seconds after initialization; its parent
+    allows eight additional seconds for cold startup and always reaps it.
     """
     import json
     import subprocess
@@ -914,7 +912,6 @@ def probe(
     try:
         if type(timeout) not in (int, float) or not isfinite(timeout) or timeout <= 0:
             return failure("probe.invalid_timeout")
-        deadline = monotonic() + min(timeout, 2.0)
         validation = validate_config(config)
         if validation.config is None:
             return failure(*validation.codes)
@@ -940,12 +937,13 @@ def probe(
             return failure("nothing_to_probe")
         if any(name not in enabled for name in requested):
             return failure("probe.signal_disabled")
-        deadline = min(deadline, monotonic() + config.shutdown_timeout)
+        budget = min(timeout, config.shutdown_timeout, 2.0)
+        deadline = monotonic() + _PROBE_STARTUP_ALLOWANCE + budget
         request = json.dumps(
             {
                 "config": _probe_configuration(config, requested),
                 "started_at": started.isoformat(),
-                "deadline": deadline,
+                "timeout": budget,
             },
             ensure_ascii=False,
         ).encode("utf-8")

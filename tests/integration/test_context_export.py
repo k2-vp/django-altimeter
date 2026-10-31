@@ -681,3 +681,109 @@ def test_client_boundary_keeps_parent_and_application_exception(otlp_receiver):
         CANARY.encode() not in request.message.SerializeToString()
         for request in otlp_receiver.requests
     )
+
+
+def test_enrich_ignores_foreign_span_with_owned_provider_and_exports_neighbors(
+    otlp_receiver,
+):
+    calls = _run(
+        otlp_receiver,
+        """
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import (
+            OTLPSpanExporter,
+        )
+        from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+
+        calls = []
+        def resolver(subject):
+            calls.append('resolved')
+            return Identity('opaque-person', 'opaque-tenant')
+        assert 'traces' in configure(resolver).enabled_signals
+        foreign = TracerProvider(resource=Resource({}), shutdown_on_exit=False)
+        foreign.add_span_processor(SimpleSpanProcessor(
+            OTLPSpanExporter(endpoint=sys.argv[1]),
+        ))
+        with span('work.execute'):
+            enrich(Subject())
+            with foreign.get_tracer('foreign').start_as_current_span(
+                'foreign', attributes={'http.response.status_code': 201},
+            ):
+                assert get_correlation() is None
+                enrich(Subject())
+        owned = get_owned_trace_runtime().tracer_provider.get_tracer('owned')
+        with owned.start_as_current_span('work.child'):
+            assert get_correlation() is not None
+            enrich(Subject())
+        assert get_correlation() is None
+        assert shutdown().completed
+        foreign.shutdown()
+        print(json.dumps(calls))
+        """,
+    )
+    spans = _spans(otlp_receiver)
+    assert len(spans) == 3
+    foreign = next(item for item in spans if item.name == "foreign")
+    assert _attributes(foreign) == {"http.response.status_code": 201}
+    for name in ("work.execute", "work.child"):
+        current = next(item for item in spans if item.name == name)
+        assert _attributes(current) == {
+            "posthogDistinctId": "opaque-person",
+            "altimeter.tenant_id": "opaque-tenant",
+        }
+    assert calls == ["resolved", "resolved"]
+
+
+@pytest.mark.parametrize("helper", ["span", "client_span"])
+@pytest.mark.parametrize(
+    ("exception_type", "expected_status"),
+    [
+        ("BaseException", 2),
+        ("asyncio.CancelledError", 2),
+        ("KeyboardInterrupt", 2),
+        ("GeneratorExit", 0),
+    ],
+)
+def test_base_exception_status_preserves_exception_and_safe_neighbor(
+    otlp_receiver, helper, exception_type, expected_status
+):
+    _run(
+        otlp_receiver,
+        f"""
+        from django_altimeter.context import client_span
+        assert 'traces' in configure().enabled_signals
+        class ApplicationFailure({exception_type}):
+            def __str__(self):
+                raise AssertionError('Exception prose must never be formatted')
+        failure = ApplicationFailure(CANARY)
+        with span('work.execute') as parent:
+            before = get_correlation()
+            try:
+                with {helper}('work.child'):
+                    raise failure
+            except BaseException as caught:
+                assert caught is failure
+            else:
+                raise AssertionError('Application exception was suppressed')
+            assert get_correlation() == before
+            with {helper}('work.sibling'):
+                assert get_correlation().trace_id == before.trace_id
+        assert get_correlation() is None
+        assert shutdown().completed
+        print(json.dumps(True))
+        """,
+    )
+    spans = _spans(otlp_receiver)
+    assert len(spans) == 3
+    parent = next(item for item in spans if item.name == "work.execute")
+    failed = next(item for item in spans if item.name == "work.child")
+    safe = next(item for item in spans if item.name == "work.sibling")
+    assert failed.status.code == expected_status
+    assert safe.status.code == parent.status.code == 0
+    assert failed.kind == safe.kind == (3 if helper == "client_span" else 1)
+    assert failed.parent_span_id == safe.parent_span_id == parent.span_id
+    assert failed.trace_id == safe.trace_id == parent.trace_id
+    assert all(not item.events and not item.status.message for item in spans)
+    assert all(
+        CANARY.encode() not in request.message.SerializeToString()
+        for request in otlp_receiver.requests
+    )

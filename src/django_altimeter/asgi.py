@@ -8,18 +8,27 @@ from __future__ import annotations
 
 import logging
 import os
+from asyncio import CancelledError
 from collections.abc import Awaitable, Callable
 from contextvars import Token
 from threading import Lock
 from time import monotonic, time_ns
 from typing import Any
+from uuid import uuid4
 
 from opentelemetry import context, metrics, trace
-from opentelemetry.trace import Span, SpanKind
+from opentelemetry.trace import Span
 
 from django_altimeter.context import Correlation, _mark_owned_span, _reset_owned_span
 from django_altimeter.headers import incoming_context, response_headers, response_mode
-from django_altimeter.http import RequestState, finish_request, request_state
+from django_altimeter.http import (
+    RequestState,
+    finish_request,
+    request_state,
+    start_server_span,
+    valid_boundary,
+)
+from django_altimeter.privacy import _request_method
 from django_altimeter.runtime import (
     _owns_trace_provider,
     get_owned_trace_runtime,
@@ -32,9 +41,6 @@ type Receive = Callable[[], Awaitable[Message]]
 type Send = Callable[[Message], Awaitable[None]]
 type ASGIApplication = Callable[[Scope, Receive, Send], Awaitable[None]]
 
-_METHODS = frozenset(
-    {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "CONNECT", "TRACE"}
-)
 _STATE_KEY = "django_altimeter.request_state"
 _MISSING = object()
 # OTel Context is immutable; each attached span receives a separate derived context.
@@ -46,14 +52,6 @@ def _diagnostic(code: str) -> None:
         logging.getLogger("django_altimeter.asgi").warning("%s", code)
     except Exception:
         pass  # Application logging handlers cannot change request behavior.
-
-
-def _method(value: object) -> str:
-    return (
-        value
-        if type(value) is str and len(value) <= 7 and value in _METHODS
-        else "_OTHER"
-    )
 
 
 class _InstrumentedASGI:
@@ -83,7 +81,7 @@ class _InstrumentedASGI:
             self._active -= 1
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope.get("type") != "http":
+        if scope.get("type") != "http" or request_state.get() is not None:
             await self.application(scope, receive, send)
             return
         try:
@@ -110,13 +108,33 @@ class _InstrumentedASGI:
             and len(path) <= config.limits.max_string_bytes
             and path in config.excluded_routes
         ):
-            await self.application(scope, receive, send)
+            excluded_token = None
+            try:
+                if owned_tracing:
+                    # A valid local, non-sampled parent makes owned child spans
+                    # non-recording without creating a SERVER span or counter.
+                    excluded_span = trace.NonRecordingSpan(
+                        trace.SpanContext(uuid4().int, uuid4().int >> 64, False)
+                    )
+                    excluded_token = context.attach(
+                        trace.set_span_in_context(excluded_span, _EMPTY_CONTEXT)
+                    )
+            except Exception:
+                _diagnostic("http.context_failed")
+            try:
+                await self.application(scope, receive, send)
+            finally:
+                if excluded_token is not None:
+                    try:
+                        context.detach(excluded_token)
+                    except Exception:
+                        _diagnostic("http.context_failed")
             return
 
         started_at = monotonic()
         start_time = time_ns()
         state = RequestState(
-            started_at, _method(scope.get("method")), self.surface, config
+            started_at, _request_method(scope.get("method")), self.surface, config
         )
         span: Span = trace.INVALID_SPAN
         parent = _EMPTY_CONTEXT
@@ -142,27 +160,16 @@ class _InstrumentedASGI:
                     trust_remote_parent=True,
                 )
             if owned_tracing:
-                span = runtime.tracer.start_span(
-                    state.method if state.method != "_OTHER" else "HTTP",
-                    context=parent,
-                    kind=SpanKind.SERVER,
-                    start_time=start_time,
-                    attributes={
-                        "http.request.method": state.method,
-                        "altimeter.surface": state.surface,
-                        "altimeter.http.server.concurrent_at_start": (
-                            state.concurrent_at_start
-                        ),
-                    },
-                )
+                span = start_server_span(runtime.tracer, state, parent, start_time)
         except Exception:
             _diagnostic("http.span_start_failed")
         try:
             # Even when a native start hook fails, do not disclose or adopt an
             # unrelated caller span as this request's SERVER observation.
-            trace_token = context.attach(trace.set_span_in_context(span, parent))
-            if owned_tracing and span is not trace.INVALID_SPAN:
-                owned_span_token = _mark_owned_span(span)
+            if owned_tracing:
+                trace_token = context.attach(trace.set_span_in_context(span, parent))
+                if span is not trace.INVALID_SPAN:
+                    owned_span_token = _mark_owned_span(span)
         except Exception:
             _diagnostic("http.context_failed")
 
@@ -170,6 +177,10 @@ class _InstrumentedASGI:
             nonlocal aborted_at, failed
             try:
                 message = await receive()
+            except CancelledError:
+                # Applications may cancel a disconnect poll and keep streaming.
+                # Cancellation escaping the app is observed by the outer guard.
+                raise
             except BaseException:
                 failed = True
                 if completed_at is None and aborted_at is None:
@@ -226,10 +237,13 @@ class _InstrumentedASGI:
                     expects_trailers = message.get("trailers", False) is True
                     if self.surface == "mcp":
                         state.response_mode = response_mode(message.get("headers", []))
-                final_body = (
-                    message_type == "http.response.body"
-                    and not message.get("more_body", False)
-                    and not expects_trailers
+                final_body = not expects_trailers and (
+                    message_type == "http.response.pathsend"
+                    or (
+                        message_type
+                        in {"http.response.body", "http.response.zerocopysend"}
+                        and not message.get("more_body", False)
+                    )
                 )
                 final_trailers = (
                     message_type == "http.response.trailers"
@@ -292,12 +306,7 @@ def instrument(
     """
     if isinstance(application, _InstrumentedASGI):
         return application
-    if (
-        type(surface) is not str
-        or len(surface) > 6
-        or surface not in {"django", "mcp"}
-        or type(trusted_ingress) is not bool
-    ):
+    if not valid_boundary(surface, trusted_ingress):
         _diagnostic("http.invalid_boundary")
         return application
     return _InstrumentedASGI(application, surface, trusted_ingress)

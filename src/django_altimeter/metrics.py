@@ -20,6 +20,7 @@ from django_altimeter.privacy import (
     PrivacyLimits,
     PrivacyPolicy,
     _is_allowed_attribute,
+    _request_method,
     is_valid_configuration,
 )
 
@@ -44,9 +45,6 @@ REQUEST_ATTRIBUTE_KEYS = frozenset(
         "altimeter.response_mode",
         "altimeter.overflow",
     }
-)
-_METHODS = frozenset(
-    {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "CONNECT", "TRACE"}
 )
 _OUTCOMES = frozenset({"completed", "aborted"})
 _RESPONSE_MODES = frozenset({"buffered", "streaming", "unknown"})
@@ -234,11 +232,7 @@ class RequestMetrics:
                 and response_mode in _RESPONSE_MODES
                 else "unknown"
             )
-            method = (
-                method
-                if type(method) is str and len(method) <= 7 and method in _METHODS
-                else "_OTHER"
-            )
+            method = _request_method(method)
             route = (
                 route
                 if _is_allowed_attribute(

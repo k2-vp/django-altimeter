@@ -812,3 +812,114 @@ def test_probe_reaps_helper_and_preserves_any_cancellation(
     assert helper_gone, "probe helper survived its cancelled caller"
     assert len(otlp_receiver.requests) == 1
     assert otlp_receiver.requests[0].path == "/v1/traces"
+
+
+@pytest.mark.parametrize("signal", ["traces", "logs", "metrics"])
+@pytest.mark.parametrize("startup_delay", [0.0, 2.1])
+def test_probe_startup_does_not_consume_selected_signal_export_budget(
+    otlp_receiver, tmp_path, signal, startup_delay
+):
+    wrapper = tmp_path / "delayed-python"
+    wrapper.write_text(
+        f"#!{sys.executable}\n"
+        "import os, sys, time\n"
+        f"time.sleep({startup_delay!r})\n"
+        f"os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])\n"
+    )
+    wrapper.chmod(0o700)
+    result = _run(
+        otlp_receiver,
+        f"""
+        import sys
+        sys.executable = {str(wrapper)!r}
+        started = time.monotonic()
+        result = probe(configuration(), signals=({signal!r},), timeout=2.0)
+        print(json.dumps({{'result': snapshot(result),
+                           'elapsed': time.monotonic() - started}}))
+        """,
+    )
+    assert result["result"]["ok"] is True, result
+    assert result["result"]["signals"] == [
+        {
+            "signal": signal,
+            "code": "export.accepted",
+            "accepted_records": 1,
+            "rejected_records": 0,
+            "local_dropped_records": 0,
+            "accepted": True,
+        }
+    ]
+    assert startup_delay <= result["elapsed"] < startup_delay + 2
+    (capture,) = otlp_receiver.requests
+    assert capture.path == f"/v1/{signal}"
+    assert b"altimeter.probe" in capture.message.SerializeToString()
+
+
+def test_delayed_probe_keeps_configured_drain_cap_and_reaps_helper(
+    otlp_receiver, tmp_path
+):
+    receipt = otlp_receiver.queue_response(hang=True)
+    wrapper = tmp_path / "delayed-python"
+    wrapper.write_text(
+        f"#!{sys.executable}\n"
+        "import os, sys, time\n"
+        "time.sleep(2.1)\n"
+        f"os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])\n"
+    )
+    wrapper.chmod(0o700)
+    result = _run(
+        otlp_receiver,
+        f"""
+        import sys
+        sys.executable = {str(wrapper)!r}
+        started = time.monotonic()
+        result = probe(configuration(signals=('traces',), shutdown_timeout=0.5),
+                       timeout=2.0)
+        elapsed = time.monotonic() - started
+        try:
+            os.waitpid(-1, os.WNOHANG)
+            reaped = False
+        except ChildProcessError:
+            reaped = True
+        print(json.dumps({{'result': snapshot(result), 'elapsed': elapsed,
+                           'reaped': reaped}}))
+        """,
+    )
+    assert result["result"]["ok"] is False
+    assert {"shutdown.deadline", "probe.deadline"}.intersection(
+        result["result"]["codes"]
+    )
+    assert result["reaped"] is True
+    assert 2.5 <= result["elapsed"] < 3.1
+    (capture,) = otlp_receiver.requests
+    assert capture.path == "/v1/traces"
+    assert receipt.client_closed.wait(1)
+
+
+def test_probe_startup_watchdog_reaps_stalled_interpreter(otlp_receiver, tmp_path):
+    wrapper = tmp_path / "stalled-python"
+    wrapper.write_text(f"#!{sys.executable}\nimport time\ntime.sleep(30)\n")
+    wrapper.chmod(0o700)
+    result = _run(
+        otlp_receiver,
+        f"""
+        import sys
+        sys.executable = {str(wrapper)!r}
+        started = time.monotonic()
+        result = probe(configuration(signals=('traces',)), timeout=0.5)
+        elapsed = time.monotonic() - started
+        try:
+            os.waitpid(-1, os.WNOHANG)
+            reaped = False
+        except ChildProcessError:
+            reaped = True
+        print(json.dumps({{'result': snapshot(result), 'elapsed': elapsed,
+                           'reaped': reaped}}))
+        """,
+        timeout=12,
+    )
+    assert result["result"]["ok"] is False
+    assert result["result"]["codes"] == ["probe.deadline"]
+    assert result["reaped"] is True
+    assert result["elapsed"] < 9.5
+    assert not otlp_receiver.requests

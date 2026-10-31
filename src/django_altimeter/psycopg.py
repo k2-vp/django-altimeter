@@ -6,6 +6,7 @@ add SQL comments, or instrument a connection that predates installation.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
@@ -16,6 +17,7 @@ from typing import TYPE_CHECKING, Any
 
 from opentelemetry import trace
 
+from django_altimeter.context import _diagnostic, client_span
 from django_altimeter.privacy import is_allowed_attribute, normalize_span_name
 
 if TYPE_CHECKING:
@@ -59,7 +61,6 @@ def _query_context(
     try:
         from opentelemetry.instrumentation.utils import is_instrumentation_enabled
 
-        from django_altimeter.context import client_span
         from django_altimeter.runtime import get_owned_trace_runtime
 
         if get_owned_trace_runtime() is not runtime or not is_instrumentation_enabled():
@@ -70,8 +71,6 @@ def _query_context(
             attributes={"db.system.name": "postgresql", "db.operation.name": name},
         )
     except Exception:
-        from django_altimeter.context import _diagnostic
-
         _diagnostic("driver.psycopg_span_failed")
         return nullcontext(trace.INVALID_SPAN)
 
@@ -134,16 +133,12 @@ def _instrument_connection(
         connection.server_cursor_factory = server_cursor
         connection._altimeter_runtime = runtime
     except Exception:
-        from django_altimeter.context import _diagnostic
-
         _diagnostic("driver.psycopg_connection_failed")
 
 
 def install(runtime: ProcessRuntime) -> DriverSetupResult:
     """Install once on the declared owned writer; return only fixed local codes."""
     try:
-        import os
-
         codes = (
             ("setup.psycopg2_unsupported",)
             if "psycopg2" in runtime.config.integrations

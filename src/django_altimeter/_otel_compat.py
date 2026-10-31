@@ -41,12 +41,17 @@ def metric_provider_is_unset() -> bool:
     )
 
 
+_SEMCONV_OPT_IN = "OTEL_SEMCONV_STABILITY_OPT_IN"
+
+
+def _opt_in_choices() -> set[str]:
+    configured = os.environ.get(_SEMCONV_OPT_IN, "")
+    return {value.strip() for value in configured.split(",") if value.strip()}
+
+
 def http_semantics_are_compatible() -> bool:
     """Check stable HTTP compatibility without imports or environment writes."""
-    key = "OTEL_SEMCONV_STABILITY_OPT_IN"
-    configured = os.environ.get(key, "")
-    choices = {value.strip() for value in configured.split(",") if value.strip()}
-    if "http/dup" in choices:
+    if "http/dup" in _opt_in_choices():
         return False
     module = sys.modules.get("opentelemetry.instrumentation._semconv")
     stability = getattr(module, "_OpenTelemetrySemanticConventionStability", None)
@@ -63,11 +68,7 @@ def configure_http_semantics() -> bool:
     """Select stable HTTP before contrib initialization, never reset its state."""
     if not http_semantics_are_compatible():
         return False
-    key = "OTEL_SEMCONV_STABILITY_OPT_IN"
-    choices = {
-        value.strip() for value in os.environ.get(key, "").split(",") if value.strip()
-    }
-    os.environ[key] = ",".join(sorted(choices | {"http"}))
+    os.environ[_SEMCONV_OPT_IN] = ",".join(sorted(_opt_in_choices() | {"http"}))
     return True
 
 

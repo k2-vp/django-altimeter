@@ -10,7 +10,9 @@ configuration and delivery checks. Native request instrumentation supports
 Django/Ninja under ASGI and Django/DRF under gunicorn gthread, with explicit
 worker startup. Optional database and outgoing
 client integrations add safe child spans, and an explicitly attached logging
-handler exports approved records without changing stdout. Queue instrumentation
+handler exports approved records without changing stdout. Vendored TypeScript
+helpers link board/repair readiness events to current request traces and passive
+browser resource timing. Queue instrumentation
 is not included yet. Telemetry is disabled by default.
 
 ## Install
@@ -556,6 +558,127 @@ Altimeter does not create a PostHog client or report another exception occurrenc
 See [logging attachment and correlation](docs/logging.md) for topology,
 scrubber, nonpropagating logger and post-configuration details.
 
+## Browser journeys
+
+The wheel and sdist include framework-independent TypeScript in
+`django_altimeter/browser/`, with `VERSION` matching the Python distribution.
+Vendor the pinned release's `journey.ts`, `headers.ts`, `resource_timing.ts` and
+the matching `examples/asgi.ts` or `examples/wsgi.ts` into your existing frontend.
+There is no published JavaScript package or runtime dependency on React, axios
+or an analytics SDK. Find the installed source directory with:
+
+```sh
+python -c 'from pathlib import Path; import django_altimeter; print(Path(django_altimeter.__file__).parent / "browser")'
+```
+
+Create one `beginJourney` attempt at full-load initialization or navigation
+intent. Retain it across renders and effect replay. Supply your existing
+`capture` and current `canCapture` functions, a safe release string, and the
+required roles: `board`, or up to four of `detail`, `checklist`,
+`hidden_documents`, `media` for a repair. Your query/navigation owner decides
+which current data makes the screen usable. Placeholder data does not finish a
+new navigation; a committed empty result does. Optional work after readiness
+does not reopen it.
+
+At the existing axios call, select a fresh in-memory execution key, start the
+passive ticket before HTTP, and read headers at axios resolution. For example,
+with the application's existing `api`, `capture`, `canCapture` and commit logic:
+
+```typescript
+import { beginJourney } from './vendor/altimeter/journey';
+import { readTraceHeaders } from './vendor/altimeter/headers';
+import { createResourceTiming } from './vendor/altimeter/resource_timing';
+
+const attempt = beginJourney({
+  key: navigationKey, screen: 'board', navigationType: 'spa', release,
+  roles: ['board'], capture, canCapture, signal: identityLifecycle.signal,
+});
+const timing = createResourceTiming({ attempt, canCapture, baseUrl: apiBaseUrl });
+const selection = { role: 'board' as const, requestKey: executionKey };
+attempt.selectRequest(selection);
+const ticket = timing.start({ ...selection, url: requestUrl, initiator: 'xmlhttprequest' });
+const response = await api.get(requestUrl);
+const phases = ticket.complete({ provenance: 'network', responseComplete: performance.now() });
+const link = readTraceHeaders({ headers: response.headers, provenance: 'network',
+  canCapture: () => attempt.isActive() && canCapture() });
+attempt.recordRequest({ ...selection, ...link, ...phases,
+  provenance: 'network', contributorCoverage: 'complete' });
+// Only when this execution supplies the current committed result:
+commitCurrentBoard(response.data);
+attempt.finish({ outcome: 'success', itemCount: response.data.items.length });
+```
+
+Keep the application's existing error and cancellation behavior. Record a
+selected failure response when available, then `finish({outcome: 'failure'})`;
+use `cancel('navigation' | 'superseded' | 'aborted')` for genuine departure or
+cancellation. Do not cancel on development effect replay. Success, failure and
+cancellation each emit at most one terminal event: `board_ready`, `board_failed`,
+`board_cancelled` or the corresponding `repair_*` name. Repeated completion and
+late callbacks cannot amend it. Duration uses the monotonic browser clock and
+ends at the application's committed-data decision, not a guaranteed paint.
+
+Select before recording: obsolete responses cannot select themselves. Retries
+replace that role's representative without consuming another role slot. Mark
+`contributorCoverage` as `complete`, `partial` or `unknown` according to that
+query invocation's known contributing requests. A representative from a
+multi-page request group owns only its physical request timing; preserve the
+application's existing fan-out/error policy. Coverage, cache provenance,
+sampling and backend ingestion are separate facts. Query-cache-only data uses
+`cache_only`; uncertain HTTP-cache delivery uses `cache_unverified`. Both retain
+null trace/timing rather than reuse a prior response as a new request.
+
+Consent is checked before observation and again before terminal capture. On
+revocation, account change or tenant change, call `discard()` or abort the
+attempt's lifecycle signal. Discard is permanent even after permission returns;
+start a new eligible navigation. The helpers initialize no SDK, identify no
+user and install no HTTP interceptor. Keep replay/private-route and sanitizer
+policies in the existing application. The ASGI example adds no identity hints.
+The WSGI example's optional hints require consent, app policy and an exact
+scheme/host/port match on every request. Disable overlapping SDK automatic
+header injection and use approved API routes without cross-origin redirects.
+
+Configure `ALTIMETER["FRONTEND_ORIGINS"]` with exact approved frontend origins.
+The native server boundary supplies selective `Timing-Allow-Origin` and merges
+`Origin` into `Vary`. Your API/proxy CORS policy must expose
+`X-Altimeter-Trace-Id` and `X-Altimeter-Trace-Sampled`, and permit any approved
+request headers. Preserve authenticated endpoints' `private, no-store` policy;
+never replay per-request trace headers from a shared cache. A valid nonzero
+lowercase 32-hex ID and `0`/`1` sample flag are correlation hints, not an ingestion
+receipt. Missing, unsampled and cache-derived links remain distinct.
+
+| Phase (milliseconds) | Browser boundaries |
+| --- | --- |
+| `before_request` | `fetchStart` to `requestStart` |
+| `first_byte_wait` | `requestStart` to `responseStart` |
+| `receive_after_first_byte` | `responseStart` to `responseEnd`, including possible header/interim-response work |
+| `post_transfer_until_response_complete` | `responseEnd` to axios resolution, including scheduling and transforms |
+
+These phases are not pure queueing, body-transfer or JSON-parse measurements.
+Do not subtract a full SERVER-span lifetime from first-byte wait: their endpoints
+differ. Timing requires a unique resolved URL, initiator and active monotonic
+request window. Restricted, missing, late, ambiguous, cache-uncertain or
+service-worker entries stay null; valid zero intervals remain zero. A retired
+in-flight execution makes remaining timing ambiguous because its late response
+could match a retry. Correlation still works.
+
+Each attempt holds at most four current role selections; the passive observer
+holds at most 32 pending candidates and disconnects on terminal/discard. It
+neither clears nor resizes the shared resource buffer and retains no page
+history. Already queued entries are drained before terminal capture without
+waiting. Timing-only updates fill still-null fields of the current selection
+before termination. Durations are finite, nonnegative and at most 86,400,000 ms;
+keys are at most 200 characters and release is at most 128 safe characters.
+URLs, keys, record IDs, response bodies and exception text never become journey
+properties.
+
+Enable web vitals through the existing SDK and its sanitizer allow-list when
+your application permits them. Finalized INP/CLS can arrive at page departure;
+they are separate from board/repair readiness. Retain only intended bounded
+numeric vital fields and a safe page category, removing URL and DOM attribution.
+Preserve the SDK's required public project token and distinct-ID ingestion envelope.
+The reference uses the real pinned SDK and local HTTP ingestion boundary.
+Local browser tests do not verify delivery to a live PostHog project.
+
 ## Check configuration and delivery
 
 Run the management command with your application's Django settings and
@@ -912,6 +1035,26 @@ export.failed         export.framing        metrics.timeout_unsupported
 
 Revalidate the metric timeout compatibility guard and deadline tests before
 changing the OTel version bounds.
+
+Browser checks use Bun 1.3.14 and Node 26.12.1. After Python setup and `uv build`,
+install the locked development dependencies and Chromium:
+
+```sh
+cd tests/browser
+bun install --frozen-lockfile
+bun run install:browser
+bun run typecheck
+bun run test:unit
+bun run test:e2e resource_timing.spec.ts journey_e2e.spec.ts
+```
+
+The browser tests start separate frontend/API origins, real uvicorn from an
+installed wheel and a local decoded OTLP receiver, then stop their processes.
+Rebuild after changing packaged source. Type checks cover the harness and the
+ASGI/WSGI compiler profiles (TypeScript 6.0.3 and 5.9.3). Python asset checks are
+`uv run pytest tests/integration/test_browser_asset.py`; they do not replace
+the TypeScript or real-browser tests. The development harness is not shipped in
+the wheel.
 
 ```sh
 uv sync --all-extras --dev

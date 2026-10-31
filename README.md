@@ -297,10 +297,12 @@ install `DjangoInstrumentor` or generic OTel ASGI instrumentation on that branch
 The boundary owns one SERVER span, one request counter increment and one duration
 observation per eligible request when the corresponding signal is owned. Trace
 sampling affects spans, not request totals or histogram counts. Duration is
-monotonic application entry through the final successful body/trailer send, or
+monotonic application entry through the final successful body/file/trailer send, or
 an observed abort. It includes streamed production and send backpressure, and
 ends at that send even if application cleanup returns later. It does not measure
-client receipt. Response-ready time and
+client receipt. Native `http.response.pathsend` and final
+`http.response.zerocopysend` messages count as body completion; declared trailers
+must still finish before the response completes. Response-ready time and
 `altimeter.http.server.concurrent_at_start` are span fields, not metric dimensions.
 The concurrency count includes sampled and unsampled eligible requests in the
 same process and wrapped branch. Aborts keep an already-sent HTTP status; an

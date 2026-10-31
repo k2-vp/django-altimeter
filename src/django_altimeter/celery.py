@@ -290,43 +290,46 @@ def _publish(
     dispatch_token: Token[_Dispatch | None] | None = None
     dispatch: _Dispatch | None = None
     try:
-        from django_altimeter.runtime import get_owned_trace_runtime
-        from django_altimeter.worker_metrics import worker_task_names
+        try:
+            # Shadow the enclosing dispatch before any SDK or configuration work.
+            # A nested startup failure must leave its native signal unowned.
+            dispatch_token = _ACTIVE.set(None)
+            from django_altimeter.runtime import get_owned_trace_runtime
+            from django_altimeter.worker_metrics import worker_task_names
 
-        runtime = get_owned_trace_runtime()
-        if runtime is not None and "celery" in runtime.config.integrations:
-            name = args[0] if args else kwargs.get("name")
-            names = worker_task_names(runtime.config.policy)
-            name = (
-                name
-                if type(name) is str and len(name) <= 128 and name in names
-                else "_OTHER"
-            )
-            parent = None
-            if get_correlation() is None:
-                parent = trace.set_span_in_context(
-                    trace.INVALID_SPAN, context.get_current()
+            runtime = get_owned_trace_runtime()
+            if runtime is not None and "celery" in runtime.config.integrations:
+                name = args[0] if args else kwargs.get("name")
+                names = worker_task_names(runtime.config.policy)
+                name = (
+                    name
+                    if type(name) is str and len(name) <= 128 and name in names
+                    else "_OTHER"
                 )
-            candidate = runtime.tracer.start_as_current_span(
-                "celery.publish",
-                context=parent,
-                kind=SpanKind.PRODUCER,
-                attributes={
-                    "messaging.system": "celery",
-                    "task.name": name,
-                    "queue.name": "_OTHER",
-                },
-                record_exception=False,
-                set_status_on_exception=False,
-            )
-            current = candidate.__enter__()
-            manager = candidate
-            owned_token = _mark_owned_span(current)
-            dispatch = _Dispatch(runtime, current)
-            dispatch_token = _ACTIVE.set(dispatch)
-    except Exception:
-        _diagnostic("celery.publish_start_failed")
-    try:
+                parent = None
+                if get_correlation() is None:
+                    parent = trace.set_span_in_context(
+                        trace.INVALID_SPAN, context.get_current()
+                    )
+                candidate = runtime.tracer.start_as_current_span(
+                    "celery.publish",
+                    context=parent,
+                    kind=SpanKind.PRODUCER,
+                    attributes={
+                        "messaging.system": "celery",
+                        "task.name": name,
+                        "queue.name": "_OTHER",
+                    },
+                    record_exception=False,
+                    set_status_on_exception=False,
+                )
+                current = candidate.__enter__()
+                manager = candidate
+                owned_token = _mark_owned_span(current)
+                dispatch = _Dispatch(runtime, current)
+                _ACTIVE.set(dispatch)
+        except Exception:
+            _diagnostic("celery.publish_start_failed")
         return original(*args, **kwargs)
     except BaseException:
         try:

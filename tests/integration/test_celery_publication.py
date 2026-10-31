@@ -195,6 +195,106 @@ def test_native_override_canvas_nested_and_resolved_routing(
     )
 
 
+@pytest.mark.parametrize("fail_inner_start", [False, True])
+def test_nested_startup_failure_does_not_borrow_outer_dispatch(
+    wheel, tmp_path, otlp_receiver, fail_inner_start
+):
+    with running_worker(tmp_path, wheel=wheel, receiver=otlp_receiver) as worker:
+        result = worker.execute(
+            r"""
+import json
+import os
+from celery import signals
+from opentelemetry.sdk.trace import SpanProcessor
+from opentelemetry.trace import SpanKind
+from django_altimeter import get_correlation, setup, shutdown
+from django_altimeter.runtime import get_process_runtime
+
+setup(role="web")
+fail_inner_start = json.load(sys.stdin)
+class FailInnerStart(SpanProcessor):
+    producer_starts = 0
+    def on_start(self, span, parent_context=None):
+        if span.kind == SpanKind.PRODUCER:
+            self.producer_starts += 1
+            if fail_inner_start and self.producer_starts == 2:
+                raise RuntimeError("nested-sdk-start-canary")
+processor = FailInnerStart()
+get_process_runtime().tracer_provider.add_span_processor(processor)
+captured, nested_results = {}, []
+queue = os.environ["REFERENCE_CELERY_QUEUE"]
+def nested(headers=None, **kwargs):
+    if headers["dispatch"] == "outer":
+        parent = get_correlation()
+        child = app.send_task(
+            "reference.echo", args=["nested-inner-canary"], queue=queue + ".override",
+            headers={"dispatch": "inner"},
+        )
+        assert get_correlation() == parent
+        nested_results.append(child.get(timeout=10, interval=.02))
+def capture(headers=None, routing_key=None, **kwargs):
+    captured[headers["dispatch"]] = {
+        "carrier": headers.get("django_altimeter"), "route": routing_key,
+    }
+signals.before_task_publish.connect(nested, weak=False)
+signals.before_task_publish.connect(capture, weak=False)
+outer = app.send_task(
+    "reference.echo", args=["nested-outer-canary"], headers={"dispatch": "outer"},
+)
+value = outer.get(timeout=10, interval=.02)
+assert get_correlation() is None
+assert processor.producer_starts == 2
+shutdown(timeout=2)
+print(json.dumps({"outer": value, "inner": nested_results, "captured": captured}))
+""",
+            input=fail_inner_start,
+        )
+    assert result["outer"]["payload"] == "nested-outer-canary"
+    assert [row["payload"] for row in result["inner"]] == ["nested-inner-canary"]
+    captured = result["captured"]
+    queue = worker.environment["REFERENCE_CELERY_QUEUE"]
+    assert captured["outer"]["route"] == queue
+    assert captured["inner"]["route"] == queue + ".override"
+    producers = [span for _, span in spans(otlp_receiver) if span.kind == 4]
+    assert len(producers) == (1 if fail_inner_start else 2)
+    outer_parent = captured["outer"]["carrier"]["attempt"]["traceparent"]
+    outer_span = next(
+        span for span in producers if span.span_id.hex() == outer_parent.split("-")[2]
+    )
+    consumers = [span for _, span in spans(otlp_receiver) if span.kind == 5]
+    assert len(consumers) == 2
+    outer_consumer = next(
+        span
+        for span in consumers
+        if span.span_id.hex() == result["outer"]["correlation"]["span_id"]
+    )
+    inner_consumer = next(
+        span
+        for span in consumers
+        if span.span_id.hex() == result["inner"][0]["correlation"]["span_id"]
+    )
+    assert outer_consumer.parent_span_id == outer_span.span_id
+    assert outer_consumer.trace_id == outer_span.trace_id
+    if fail_inner_start:
+        assert captured["inner"]["carrier"] is None
+        assert not inner_consumer.parent_span_id
+        assert inner_consumer.trace_id != outer_consumer.trace_id
+    else:
+        inner_parent = captured["inner"]["carrier"]["attempt"]["traceparent"]
+        assert inner_parent != outer_parent
+        inner_span = next(
+            span
+            for span in producers
+            if span.span_id.hex() == inner_parent.split("-")[2]
+        )
+        assert inner_span.parent_span_id == outer_span.span_id
+        assert inner_consumer.parent_span_id == inner_span.span_id
+        assert inner_consumer.trace_id == outer_span.trace_id
+        assert attributes(inner_span.attributes)["queue.name"] == queue + ".override"
+    assert attributes(outer_span.attributes)["queue.name"] == queue
+    assert "canary" not in str(otlp_receiver.requests).lower()
+
+
 _BROKER_FAILURE = r"""
 import json
 import socket

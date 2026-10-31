@@ -53,6 +53,15 @@ PROCESS_INSTRUMENTS = frozenset(
 _CPU_ATTRIBUTES = ({"cpu.mode": "user"}, {"cpu.mode": "system"})
 _GC_ATTRIBUTES = tuple({"altimeter.gc.generation": str(i)} for i in range(3))
 _EMPTY_ATTRIBUTES: tuple[Mapping[str, str], ...] = ({},)
+_SOURCE_DIAGNOSTICS = frozenset(
+    {
+        "process.cpu_unavailable",
+        "process.memory_unavailable",
+        "process.threads_unavailable",
+        "process.fd_unavailable",
+        "process.gc_unavailable",
+    }
+)
 type _Number = int | float
 
 
@@ -142,6 +151,7 @@ class ProcessMetrics:
         self._limits = limits
         self._lock = Lock()
         self._reported: set[str] = set()
+        self._pending: set[str] = set()
         # Four fixed keys, each retaining two CPU or three GC scalars only.
         self._baselines: dict[str, tuple[_Number, ...]] = {}
         self._previous: dict[str, tuple[_Number, ...]] = {}
@@ -171,15 +181,22 @@ class ProcessMetrics:
             PROCESS_GC_UNCOLLECTABLE, callbacks=[self._uncollectable], unit="{object}"
         )
 
-    def _report(self, code: str) -> None:
+    def report_pending(self) -> None:
+        """Deliver fixed codes only after native collection/export locks release."""
+        if os.getpid() != self._pid or not self._lock.acquire(blocking=False):
+            return
         try:
-            with self._lock:
-                if code in self._reported:
-                    return
-                self._reported.add(code)
-            logging.getLogger("django_altimeter.process").warning("%s", code)
-        except Exception:
-            pass  # Application log handlers must not break metric collection.
+            codes = tuple(sorted(self._pending))
+            self._pending.clear()
+            # Mark before calling handlers: a handler may reenter collection.
+            self._reported.update(codes)
+        finally:
+            self._lock.release()
+        for code in codes:
+            try:
+                logging.getLogger("django_altimeter.process").warning("%s", code)
+            except Exception:
+                pass  # Application handlers must not break the native reader.
 
     def _observe(
         self,
@@ -227,10 +244,12 @@ class ProcessMetrics:
                 for value, labels in zip(values, attributes, strict=True)
             )
         except Exception:
-            pass  # No source exception, value or vendor prose reaches the SDK.
+            # This callback runs under the SDK's non-reentrant collection lock.
+            # Store at most five fixed codes; never call application handlers here.
+            if code in _SOURCE_DIAGNOSTICS and code not in self._reported:
+                self._pending.add(code)
         finally:
             self._lock.release()
-        self._report(code)
         return ()
 
     def _cpu_values(self) -> tuple[_Number, ...]:

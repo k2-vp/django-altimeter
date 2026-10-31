@@ -156,6 +156,7 @@ def test_source_and_logging_failures_do_not_escape(recorder, monkeypatch, caplog
     monkeypatch.setattr(recorder._process, "num_fds", denied)
     assert recorder._fds(options) == ()
     assert recorder._fds(options) == ()
+    recorder.report_pending()
     assert [record.getMessage() for record in caplog.records] == [
         "process.fd_unavailable"
     ]
@@ -166,6 +167,7 @@ def test_source_and_logging_failures_do_not_escape(recorder, monkeypatch, caplog
         logging.getLogger("django_altimeter.process"), "warning", denied
     )
     assert recorder._threads(options) == ()
+    recorder.report_pending()
     assert recorder._memory(options)[0].value > 0
 
 
@@ -317,3 +319,73 @@ print(json.dumps({'application': 42}))
     )
     assert "123456789" not in str(otlp_receiver.requests)
     assert "process-canary" not in str(otlp_receiver.requests)
+
+
+def test_observable_defers_handlers_until_after_collection(
+    recorder, monkeypatch, caplog
+):
+    from opentelemetry.metrics import CallbackOptions
+
+    def denied():
+        raise PermissionError("source-secret-canary")
+
+    monkeypatch.setattr(recorder._process, "num_fds", denied)
+    assert recorder._fds(CallbackOptions()) == ()
+    assert caplog.records == []
+    recorder.report_pending()
+    assert [record.getMessage() for record in caplog.records] == [
+        "process.fd_unavailable"
+    ]
+    assert recorder._fds(CallbackOptions()) == ()
+    recorder.report_pending()
+    assert len(caplog.records) == 1
+    assert "canary" not in caplog.text
+
+
+def test_native_reader_delivers_diagnostic_with_reentrant_handler(otlp_receiver):
+    output = _run(
+        """
+import json, logging, os, signal
+from django_altimeter.conf import Config, SignalConfig
+from django_altimeter.runtime import setup, shutdown, get_process_runtime
+assert setup(Config(
+    enabled=True, service_name='safe', deployment_environment='test', release='v1',
+    integrations=frozenset({'process'}), metric_export_interval_millis=60000,
+    metrics=SignalConfig(True, os.environ['TEST_ENDPOINT'] + '/v1/metrics', (),
+                         'collector'),
+)).ok
+runtime = get_process_runtime()
+watchdog = []
+received = []
+def alarm(signum, frame):
+    watchdog.append('deadlock')
+    raise TimeoutError('watchdog')
+class Handler(logging.Handler):
+    def emit(self, record):
+        received.append(record.getMessage())
+        runtime.meter_provider.force_flush(timeout_millis=1000)
+logger = logging.getLogger('django_altimeter.process')
+handler = Handler()
+logger.addHandler(handler)
+signal.signal(signal.SIGALRM, alarm)
+def denied():
+    raise PermissionError('source-secret-canary')
+try:
+    logger.warning('control')
+    assert received == ['control']
+    runtime.process_metrics._process.num_fds = denied
+    signal.setitimer(signal.ITIMER_REAL, 1)
+    assert runtime.meter_provider.force_flush(timeout_millis=1000)
+    signal.setitimer(signal.ITIMER_REAL, 0)
+    assert runtime.meter_provider.force_flush(timeout_millis=1000)
+finally:
+    signal.setitimer(signal.ITIMER_REAL, 0)
+    logger.removeHandler(handler)
+assert shutdown().completed
+print(json.dumps({'received': received, 'watchdog': watchdog}))
+""",
+        otlp_receiver,
+    )
+    assert output["watchdog"] == []
+    assert output["received"] == ["control", "process.fd_unavailable"]
+    assert "source-secret-canary" not in str(otlp_receiver.requests)

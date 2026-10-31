@@ -255,6 +255,7 @@ class ProcessRuntime:
         )
         from opentelemetry.sdk.metrics.export import (
             AggregationTemporality,
+            MetricsData,
             PeriodicExportingMetricReader,
         )
         from opentelemetry.sdk.metrics.view import DropAggregation, View
@@ -313,7 +314,39 @@ class ProcessRuntime:
                 ObservableUpDownCounter: AggregationTemporality.CUMULATIVE,
             },
         )
-        reader = PeriodicExportingMetricReader(
+        reader_type = PeriodicExportingMetricReader
+        if "process" in self.config.integrations:
+            runtime = self
+
+            class ProcessMetricReader(PeriodicExportingMetricReader):
+                def _report_process_diagnostics(self) -> None:
+                    if runtime.process_metrics is not None:
+                        runtime.process_metrics.report_pending()
+
+                def _receive_metrics(
+                    self,
+                    metrics_data: MetricsData,
+                    timeout_millis: float = 10_000,
+                    **kwargs: Any,
+                ) -> None:
+                    # The SDK collection lock is released before this hook;
+                    # super also releases its export lock before diagnostics run.
+                    try:
+                        super()._receive_metrics(
+                            metrics_data, timeout_millis=timeout_millis, **kwargs
+                        )
+                    finally:
+                        self._report_process_diagnostics()
+
+                def force_flush(self, timeout_millis: float = 10_000) -> bool:
+                    try:
+                        return super().force_flush(timeout_millis=timeout_millis)
+                    finally:
+                        # Empty collections never enter _receive_metrics.
+                        self._report_process_diagnostics()
+
+            reader_type = ProcessMetricReader
+        reader = reader_type(
             exporter,
             export_interval_millis=self.config.metric_export_interval_millis,
             export_timeout_millis=self._export_timeout() * 1000,

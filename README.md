@@ -146,7 +146,7 @@ still leave other signals working.
 | `shutdown(*, timeout=2.0)` | Drains owned signals within one shared deadline. Returns frozen `ShutdownResult(completed, codes)`. |
 | `span(name, *, attributes=None)` | Creates a registered span, or an explicit no-op when tracing is unavailable. Pass a plain dictionary of bounded scalar values; unsupported containers are ignored before the SDK can inspect them. Application exceptions propagate unchanged. |
 | `get_correlation()` | Returns native trace/span IDs and trace flags only while this worker owns tracing; otherwise returns `None`. |
-| `enrich(subject)` | Calls the configured trusted identity resolver for an already-resolved subject. It never authenticates a request or loads a Django model. |
+| `enrich(subject)` | Calls the trusted identity resolver for an already-resolved subject only when the current recording span belongs to Altimeter. Foreign spans are untouched and do not invoke the resolver. It never authenticates a request or loads a Django model. |
 
 For a script with `DJANGO_SETTINGS_MODULE` already set, initialize Django before
 calling the public API:

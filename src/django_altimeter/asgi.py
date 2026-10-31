@@ -216,10 +216,13 @@ class _InstrumentedASGI:
                     expects_trailers = message.get("trailers", False) is True
                     if self.surface == "mcp":
                         state.response_mode = response_mode(message.get("headers", []))
-                final_body = (
-                    message_type == "http.response.body"
-                    and not message.get("more_body", False)
-                    and not expects_trailers
+                final_body = not expects_trailers and (
+                    message_type == "http.response.pathsend"
+                    or (
+                        message_type
+                        in {"http.response.body", "http.response.zerocopysend"}
+                        and not message.get("more_body", False)
+                    )
                 )
                 final_trailers = (
                     message_type == "http.response.trailers"

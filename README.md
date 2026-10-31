@@ -717,10 +717,13 @@ The probe runs in a short-lived isolated process with role `probe`, a fresh
 `service.instance.id`, and resource flag `altimeter.probe=true`. It sends exactly
 one record for each selected enabled signal: a span, a log record, or a metric
 point. All use the fixed name `altimeter.probe`. The metric has value `1` and
-scope `django_altimeter`. Exclude
-these tagged records from application dashboards. The probe uses a two-second
-deadline and leaves the calling process's providers untouched. With no enabled
-signal it fails with `nothing_to_probe` and sends nothing. Explicitly selecting a
+scope `django_altimeter`. Exclude these tagged records from application
+dashboards. After imports and provider initialization, the helper shares at most
+two seconds across export and drain, capped further by the configured shutdown
+timeout or a shorter `runtime.probe(timeout=...)` value. The parent watchdog
+allows eight additional seconds for cold startup and reaps the helper if the
+combined limit expires. The calling process's providers stay untouched. With no
+enabled signal it fails with `nothing_to_probe` and sends nothing. Explicitly selecting a
 disabled signal fails with `probe.signal_disabled`. Partial rejection, invalid
 responses, authentication errors, and timeouts fail the acceptance check. A
 zero-rejection warning is accepted with `export.warning`; the warning text is
@@ -750,8 +753,9 @@ OTLP acceptance alone does not establish storage or query visibility.
 
 Read-back shares one timeout across all signal queries and backoff, with at most
 six query rounds. `--timeout` defaults to 10 seconds and must be finite, greater
-than zero, and at most 30 seconds; it does not extend the probe deadline. Query
-responses are capped at 64 KiB. As with the OTLP transport below, continuous
+than zero, and at most 30 seconds; it does not change the probe's separate startup
+allowance or export/drain budget. Query responses are capped at 64 KiB. As with
+the OTLP transport below, continuous
 trickling of response header bytes is outside the pinned HTTP client's deadline
 guarantee.
 

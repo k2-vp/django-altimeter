@@ -1617,3 +1617,58 @@ def test_cancelled_disconnect_poll_keeps_successful_stream_completed(
     assert _attributes(span)["altimeter.response_mode"] == "streaming"
     assert _metric_count(otlp_receiver, "altimeter.http.server.requests") == 1
     assert _metric_count(otlp_receiver, "http.server.request.duration") == 1
+
+
+@pytest.mark.parametrize("sample_rate", [0.0, 1.0])
+def test_nested_asgi_wrappers_share_one_request_owner(
+    otlp_receiver: OTLPReceiver, sample_rate: float
+) -> None:
+    result = _run(
+        otlp_receiver,
+        f"        RATE = {sample_rate!r}\n"
+        + """
+        from django_altimeter.asgi import instrument
+        from django_altimeter.http import request_state
+        configure(sample_rate=RATE)
+        entries = []
+        sent = []
+        async def app(scope, receive, send):
+            state = request_state.get()
+            entries.append([state.surface, state.concurrent_at_start, inner._active])
+            await send({'type': 'http.response.start', 'status': 200, 'headers': []})
+            await send({'type': 'http.response.body', 'body': b'safe'})
+        inner = instrument(app, surface='mcp')
+        async def router(scope, receive, send):
+            await inner(scope, receive, send)
+        outer = instrument(router)
+        async def receive():
+            return {'type': 'http.request', 'body': b''}
+        async def send(message):
+            sent.append(message['type'])
+        async def run():
+            await outer(dict(SCOPE), receive, send)
+            assert request_state.get() is None
+            assert outer._active == inner._active == 0
+            # The inner adapter still owns a standalone request afterward.
+            await inner(dict(SCOPE), receive, send)
+            assert request_state.get() is None
+            assert outer._active == inner._active == 0
+        asyncio.run(run())
+        assert shutdown().completed
+        print(json.dumps({'entries': entries, 'sent': sent}))
+        """,
+    )
+    assert result == {
+        "entries": [["django", 1, 0], ["mcp", 1, 1]],
+        "sent": ["http.response.start", "http.response.body"] * 2,
+    }
+    spans = _spans(otlp_receiver)
+    assert len(spans) == (2 if sample_rate else 0)
+    assert all(span.kind == 2 for span in spans)
+    if sample_rate:
+        assert sorted(_attributes(span)["altimeter.surface"] for span in spans) == [
+            "django",
+            "mcp",
+        ]
+    assert _metric_count(otlp_receiver, "altimeter.http.server.requests") == 2
+    assert _metric_count(otlp_receiver, "http.server.request.duration") == 2

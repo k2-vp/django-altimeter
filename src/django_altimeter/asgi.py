@@ -80,7 +80,7 @@ class _InstrumentedASGI:
             self._active -= 1
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope.get("type") != "http":
+        if scope.get("type") != "http" or request_state.get() is not None:
             await self.application(scope, receive, send)
             return
         try:

@@ -80,6 +80,17 @@ jobs:
       - run: uv run ruff format --check .
       - run: uv run mypy src
       - run: uv build
+      - name: Install pinned collector for integration tests
+        env:
+          COLLECTOR_IMAGE: otel/opentelemetry-collector-contrib:0.164.0@sha256:340c9ca6a36617084c6661bdc4f0fe92b7cda5a805d61673ec8db375fddc522b
+        run: |
+          collector_container="altimeter-ci-collector-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ matrix.python-version }}"
+          docker create --name "$collector_container" "$COLLECTOR_IMAGE"
+          trap 'docker rm "$collector_container"' EXIT
+          docker cp "$collector_container:/otelcol-contrib" "$RUNNER_TEMP/otelcol-contrib"
+          chmod +x "$RUNNER_TEMP/otelcol-contrib"
+          "$RUNNER_TEMP/otelcol-contrib" --version
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
       - run: uv run pytest -q
         env:
           ALTIMETER_TEST_POSTGRES_DSN: host=127.0.0.1 port=${{ job.services.postgres.ports[5432] }} dbname=postgres user=postgres
@@ -105,7 +116,10 @@ jobs:
       - run: uv build
       - name: Verify ${{ matrix.profile }} image
         # Includes real Celery publication, worker lifecycle and metric/log suites.
-        # Wall-clock worker measurements remain in the explicit local image gate.
+        # Full discovery includes tests/integration/test_process_metrics.py and
+        # tests/integration/test_process_web.py in both profiles, without skips.
+        # tests/integration/test_collector_profiles.py uses the pinned real binary.
+        # Wall-clock measurements remain in the explicit local image gates.
         run: >-
           docker compose -p altimeter-ci-${{ matrix.profile }}-${{ github.run_id }}
           -f reference/compose.yaml --profile ${{ matrix.profile }} run --build --rm

@@ -290,7 +290,7 @@ def test_shutdown_reports_native_size_loss(otlp_receiver, oversized):
     import os
 
     source = """
-import json, os
+import json, logging, os
 from opentelemetry import trace
 from django_altimeter.conf import Config, SignalConfig
 from django_altimeter.runtime import setup, shutdown, get_process_runtime
@@ -301,6 +301,19 @@ config = Config(
 )
 assert setup(config).ok
 runtime = get_process_runtime()
+native_drops = []
+reported_drops = []
+class ObserveDrop(logging.Filter):
+    def filter(self, record):
+        message = record.getMessage()
+        if message.startswith("Dropping span batch:"):
+            native_drops.append(runtime._shutdown_deadline is not None)
+        elif message == "export.local_drop traces":
+            reported_drops.append(runtime._shutdown_deadline is not None)
+        return True
+observer = ObserveDrop()
+logging.getLogger("opentelemetry.exporter.otlp.proto.http.trace_exporter").addFilter(observer)
+logging.getLogger("django_altimeter.export").addFilter(observer)
 tracer = trace.get_tracer("django_altimeter")
 with tracer.start_as_current_span("GET", attributes={"http.response.status_code": 200}):
     pass
@@ -314,7 +327,8 @@ for _ in range(126):
 result = shutdown()
 outcome = runtime._sessions[0].outcome
 print(json.dumps({"completed": result.completed, "codes": result.codes,
-                  "code": outcome.code, "dropped": outcome.local_dropped_records}))
+                  "code": outcome.code, "dropped": outcome.local_dropped_records,
+                  "native_drops": native_drops, "reported_drops": reported_drops}))
 """
     environment = {
         key: value
@@ -339,6 +353,8 @@ print(json.dumps({"completed": result.completed, "codes": result.codes,
     assert result["codes"] == (["shutdown.export_failed"] if oversized else [])
     assert result["code"] == ("export.local_drop" if oversized else "export.accepted")
     assert result["dropped"] == (126 if oversized else 0)
+    assert result["native_drops"] == ([True] if oversized else [])
+    assert result["reported_drops"] == ([True] if oversized else [])
     spans = [
         span
         for request in otlp_receiver.requests

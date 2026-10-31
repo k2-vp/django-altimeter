@@ -641,3 +641,243 @@ def test_real_gthread_concurrency_is_branch_local_and_counts_unsampled_requests(
         for request in otlp_receiver.requests
         if request.path == "/v1/metrics"
     )
+
+
+_STREAMING_APP = r"""
+import json
+import logging
+import os
+import time
+from dataclasses import replace
+from threading import Barrier
+
+import requests
+from opentelemetry import trace
+from django_altimeter.conf import Config, SignalConfig
+from django_altimeter.context import get_correlation, span
+from django_altimeter.http import get_request_state
+from django_altimeter.logging import install_logging
+from django_altimeter.privacy import DEFAULT_POLICY
+from django_altimeter.runtime import setup
+from django_altimeter.wsgi import instrument
+
+logger = logging.getLogger('stream.review')
+logger.setLevel(logging.INFO)
+logger.addHandler(logging.StreamHandler())
+logger.propagate = False
+
+def signal(name):
+    return SignalConfig(True, os.environ['RECEIVER_ENDPOINT'] + '/v1/' + name,
+                        destination='collector')
+
+assert setup(Config(
+    enabled=True, service_name='streaming-context', deployment_environment='test',
+    release='v1', integrations=frozenset({'wsgi', 'requests'}),
+    traces=signal('traces'), logs=signal('logs'), metrics=signal('metrics'),
+    sample_rate=float(os.environ['STREAM_SAMPLE_RATE']), export_timeout=0.5,
+    excluded_routes=frozenset({'/health/'}),
+    policy=replace(DEFAULT_POLICY,
+        span_names=DEFAULT_POLICY.span_names | {'stream.work'},
+        scope_names=DEFAULT_POLICY.scope_names | {'stream.review'},
+        log_bodies=frozenset({'stream.chunk', 'stream.write', 'stream.close'}),
+        attribute_values=frozenset({('http.route', '/stream/')})),
+)).ok
+assert install_logging(routes=('stream.review',)).ok
+barrier = Barrier(4)
+
+def emit(stage):
+    current = get_correlation()
+    logger.info('stream.' + stage)
+    logger.warning('CANARY_STREAM_LOG')
+    with requests.get(os.environ['STREAM_UPSTREAM'] + '/' + stage +
+                      '?secret=CANARY_STREAM_QUERY', timeout=2) as response:
+        assert response.status_code == 200
+        assert response.content == b'safe-response'
+    return {
+        'trace': current.trace_id if current else None,
+        'current': current.span_id if current else None,
+        'native': format(trace.get_current_span().get_span_context().span_id, '016x'),
+    }
+
+def produce(manual, write):
+    barrier.wait(timeout=4)
+    try:
+        for index in range(2):
+            row = emit('chunk')
+            row.update(index=index,
+                       enclosing=format(manual.get_span_context().span_id, '016x'))
+            # Native write is called while the manual span is already current.
+            # Its outer observer emits a log and client call at that exact point.
+            write(b'')
+            yield (json.dumps(row) + '\n').encode()
+            time.sleep(0.01)
+    finally:
+        emit('close')
+
+def app(environ, start_response):
+    if environ['PATH_INFO'] == '/health/':
+        start_response('200 OK', [('Content-Type', 'application/json')])
+        return [b'{"ok":true}']
+    state = get_request_state()
+    state.route = '/stream/'
+    state.response_mode = 'streaming'
+    state.response_ready_at = time.monotonic()
+    if os.environ['STREAM_SPAN_START'] == 'app':
+        manager = span('stream.work')
+        manual = manager.__enter__()
+    else:
+        manager = manual = None
+    write = start_response('200 OK', [('Content-Type', 'application/x-ndjson'),
+                                     ('Cache-Control', 'private, no-store')])
+    def chunks():
+        if manager is None:
+            with span('stream.work') as current:
+                yield from produce(current, write)
+        else:
+            try:
+                yield from produce(manual, write)
+            finally:
+                manager.__exit__(None, None, None)
+    return chunks()
+
+observed = instrument(app)
+
+def outside():
+    assert get_request_state() is None
+    assert get_correlation() is None
+    assert not trace.get_current_span().get_span_context().is_valid
+
+class Outside:
+    def __init__(self, iterable):
+        self.iterable = iterable
+        self.iterator = iter(iterable)
+        outside()
+    def __iter__(self):
+        return self
+    def __next__(self):
+        outside()
+        try:
+            return next(self.iterator)
+        finally:
+            outside()
+    def close(self):
+        outside()
+        try:
+            close = getattr(self.iterable, 'close', None)
+            if close is not None:
+                close()
+        finally:
+            outside()
+
+def application(environ, start_response):
+    outside()
+    def forwarded(status, headers, exc_info=None):
+        write = start_response(status, headers, exc_info)
+        def forwarded_write(data):
+            emit('write')
+            return write(data)
+        return forwarded_write
+    try:
+        return Outside(observed(environ, forwarded))
+    finally:
+        outside()
+"""
+
+
+@pytest.fixture(scope="module")
+def streaming_wheel(tmp_path_factory):
+    from support.gunicorn_server import install_wheel
+
+    return install_wheel(
+        tmp_path_factory.mktemp("wsgi-streaming-wheel"), extras=("requests",)
+    )
+
+
+@pytest.mark.parametrize("sample_rate", ["1", "0"])
+@pytest.mark.parametrize("span_start", ["app", "generator"])
+def test_manual_span_survives_wsgi_yields_and_parents_logs_and_http_children(
+    tmp_path, streaming_wheel, otlp_receiver, sample_rate, span_start
+):
+    from collections import Counter
+
+    from support.gunicorn_server import running_server
+    from support.http_receiver import HTTPReceiver
+
+    (tmp_path / "streaming_app.py").write_text(_STREAMING_APP)
+    with HTTPReceiver() as upstream:
+        with running_server(
+            tmp_path / "server",
+            wheel=streaming_wheel,
+            receiver=otlp_receiver,
+            application="streaming_app:application",
+            module_path=tmp_path,
+            threads=4,
+            extra_env={
+                "STREAM_SPAN_START": span_start,
+                "STREAM_SAMPLE_RATE": sample_rate,
+                "STREAM_UPSTREAM": upstream.origin,
+            },
+        ) as server:
+            with ThreadPoolExecutor(max_workers=4) as clients:
+                responses = list(
+                    clients.map(lambda _: server.request("/stream/"), range(4))
+                )
+            assert server.request("/health/")[0] == 200
+        assert len(upstream.requests) == 20
+    by_trace = {}
+    for status, _, body in responses:
+        assert status == 200, body
+        rows = [json.loads(line) for line in body.splitlines()]
+        assert [row["index"] for row in rows] == [0, 1]
+        assert len({row["enclosing"] for row in rows}) == 1
+        assert len({row["trace"] for row in rows}) == 1
+        assert all(row["current"] == row["native"] == row["enclosing"] for row in rows)
+        assert rows[0]["trace"] is not None
+        by_trace[rows[0]["trace"]] = rows[0]["enclosing"]
+    assert len(by_trace) == 4
+    logs = [
+        record
+        for request in otlp_receiver.requests
+        if request.path == "/v1/logs"
+        for resource in request.message.resource_logs
+        for scope in resource.scope_logs
+        for record in scope.log_records
+    ]
+    assert Counter(
+        (record.trace_id.hex(), record.span_id.hex(), record.body.string_value)
+        for record in logs
+    ) == Counter(
+        {
+            (trace_id, manual_id, body): count
+            for trace_id, manual_id in by_trace.items()
+            for body, count in (
+                ("stream.chunk", 2),
+                ("stream.write", 2),
+                ("stream.close", 1),
+            )
+        }
+    )
+    assert all(record.flags & 1 == int(sample_rate) for record in logs)
+    spans = _spans(otlp_receiver)
+    if sample_rate == "1":
+        assert len(spans) == 28
+        for trace_id, manual_id in by_trace.items():
+            related = [span for span in spans if span.trace_id.hex() == trace_id]
+            (server_span,) = [span for span in related if span.kind == 2]
+            (manual,) = [span for span in related if span.kind == 1]
+            children = [span for span in related if span.kind == 3]
+            assert manual.name == "stream.work" and manual.span_id.hex() == manual_id
+            assert manual.parent_span_id == server_span.span_id
+            assert len(children) == 5
+            assert all(child.parent_span_id == manual.span_id for child in children)
+            assert all(child.name == "GET" for child in children)
+            assert _attributes(server_span)["altimeter.http.outcome"] == "completed"
+    else:
+        assert spans == []
+    assert _metric_count(otlp_receiver, "altimeter.http.server.requests") == 4
+    assert _metric_count(otlp_receiver, "http.server.request.duration") == 4
+    assert "CANARY_STREAM_LOG" in server.output
+    assert all(
+        b"CANARY" not in request.message.SerializeToString()
+        for request in otlp_receiver.requests
+    )

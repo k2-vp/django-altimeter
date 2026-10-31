@@ -22,7 +22,7 @@ from opentelemetry import context, metrics, trace
 from opentelemetry.trace import Span, SpanKind
 
 from django_altimeter.context import (
-    _mark_owned_span,
+    _OWNED_SPAN,
     _reset_owned_span,
     get_correlation,
 )
@@ -82,6 +82,8 @@ class _Response:
         self._owned_metrics = owned_metrics
         self._span: Span = trace.INVALID_SPAN
         self._parent = _EMPTY_CONTEXT
+        self._application_context: context.Context | None = None
+        self._application_owned_span: Span | None = None
         self._closed = False
         self._failed = False
         self._completed_at: float | None = None
@@ -132,21 +134,38 @@ class _Response:
 
     @contextmanager
     def _active_context(self) -> Iterator[None]:
+        # write() can be called inside app/next/close while a manual span is
+        # current. Keep that live scope; the enclosing operation saves it.
+        if request_state.get() is self.state:
+            yield
+            return
         state_token: Token[RequestState | None] | None = None
         trace_token: Token[context.Context] | None = None
         owned_token: Token[Span | None] | None = None
         try:
             state_token = request_state.set(self.state)
-            trace_token = context.attach(
-                trace.set_span_in_context(self._span, self._parent)
-            )
-            if self._owned_tracing and self._span is not trace.INVALID_SPAN:
-                owned_token = _mark_owned_span(self._span)
+            application_context = self._application_context
+            owned_span = self._application_owned_span
+            if application_context is None:
+                application_context = trace.set_span_in_context(
+                    self._span, self._parent
+                )
+                owned_span = self._span if self._owned_tracing else None
+            trace_token = context.attach(application_context)
+            owned_token = _OWNED_SPAN.set(owned_span)
         except Exception:
             _diagnostic("http.context_failed")
         try:
             yield
         finally:
+            if trace_token is not None:
+                try:
+                    # A generator may hold a span open across yield. Preserve
+                    # its exact ownership marker too; foreign spans stay foreign.
+                    self._application_context = context.get_current()
+                    self._application_owned_span = _OWNED_SPAN.get()
+                except Exception:
+                    _diagnostic("http.context_failed")
             _reset_owned_span(owned_token)
             if trace_token is not None:
                 try:
@@ -304,6 +323,8 @@ class _Response:
         finally:
             # Break application write-callable cycles without touching its objects.
             self._body = self._iterator = None
+            self._application_context = None
+            self._application_owned_span = None
 
     def __del__(self) -> None:
         # An abandoned iterable has no safe export/close boundary. Release only

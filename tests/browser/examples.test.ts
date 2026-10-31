@@ -1,3 +1,7 @@
+import { spawnSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { beginBoardNavigation, boardCommitted } from '../../src/django_altimeter/browser/examples/asgi';
 import { beginRepairNavigation, repairCommitted, sessionHintHeaders } from '../../src/django_altimeter/browser/examples/wsgi';
@@ -42,4 +46,48 @@ describe('existing identity header policy', () => {
     expect(sessionHintHeaders(permission, () => ({ sessionId: 'bad\r\nheader', distinctId: 'person' }))).toEqual({});
     expect(sessionHintHeaders(permission, () => { throw new Error('CANARY'); })).toEqual({});
   });
+});
+
+describe('README axios integration', () => {
+  it.each([
+    ['5.9.3', 'typescript', 'tsconfig.wsgi.json'],
+    ['6.0.3', 'typescript-asgi', 'tsconfig.asgi.json'],
+  ])('compiles the verbatim snippet with TypeScript %s', (_version, compiler, profile) => {
+    const root = resolve(import.meta.dirname, '../..');
+    const readme = readFileSync(join(root, 'README.md'), 'utf8');
+    const snippets = [...readme.matchAll(/```typescript\n([\s\S]*?)\n```/g)]
+      .map(match => match[1]).filter(source => source.includes('const attempt = beginJourney('));
+    expect(snippets).toHaveLength(1);
+    const workspace = mkdtempSync(join(tmpdir(), 'altimeter-readme-'));
+    try {
+      // Resolve the documented vendor imports to shipped source without editing
+      // the snippet. Axios comes from the real pinned package, not a stand-in.
+      mkdirSync(join(workspace, 'vendor'));
+      symlinkSync(join(root, 'src/django_altimeter/browser'), join(workspace, 'vendor/altimeter'), 'dir');
+      symlinkSync(resolve(import.meta.dirname, 'node_modules'), join(workspace, 'node_modules'), 'dir');
+      const applicationTypes = `
+import type { AxiosInstance } from 'axios';
+import type { JourneyOptions } from './vendor/altimeter/journey';
+declare const api: AxiosInstance;
+declare const navigationKey: string, executionKey: string, release: string;
+declare const apiBaseUrl: string, requestUrl: string;
+declare const identityLifecycle: AbortController;
+declare const capture: JourneyOptions['capture'];
+declare const canCapture: JourneyOptions['canCapture'];
+declare function commitCurrentBoard(data: unknown): void;
+`;
+      writeFileSync(join(workspace, 'readme.ts'), applicationTypes + snippets[0]);
+      writeFileSync(join(workspace, 'tsconfig.json'), JSON.stringify({
+        extends: resolve(import.meta.dirname, profile), include: ['./readme.ts'],
+      }));
+      const result = spawnSync(process.execPath, [
+        resolve(import.meta.dirname, 'node_modules', compiler, 'bin/tsc'),
+        '-p', join(workspace, 'tsconfig.json'),
+      ], { cwd: workspace, encoding: 'utf8', timeout: 60_000 });
+      expect(result.error).toBeUndefined();
+      expect(result.status, result.stdout + result.stderr).toBe(0);
+    } finally {
+      rmSync(workspace, { recursive: true, force: true });
+    }
+  }, 65_000);
 });

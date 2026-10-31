@@ -599,7 +599,8 @@ attempt.selectRequest(selection);
 const ticket = timing.start({ ...selection, url: requestUrl, initiator: 'xmlhttprequest' });
 const response = await api.get(requestUrl);
 const phases = ticket.complete({ provenance: 'network', responseComplete: performance.now() });
-const link = readTraceHeaders({ headers: response.headers, provenance: 'network',
+const link = readTraceHeaders({
+  headers: { get: name => response.headers[name.toLowerCase()] }, provenance: 'network',
   canCapture: () => attempt.isActive() && canCapture() });
 attempt.recordRequest({ ...selection, ...link, ...phases,
   provenance: 'network', contributorCoverage: 'complete' });

@@ -10,7 +10,7 @@ it is a payload estimate, not a measurement of Python heap usage.
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -532,13 +532,14 @@ class ExportProtocolError(Exception):
 
 def _record_count(message: Message, signal: Signal, ceiling: int) -> int:
     """Bound every container before walking even a decoded, byte-bounded batch."""
-    groups = getattr(message, f"resource_{signal if signal != 'traces' else 'spans'}")
+    suffix = "spans" if signal == "traces" else signal
+    groups = getattr(message, f"resource_{suffix}")
     if len(groups) > ceiling:
         raise ExportProtocolError("export.batch_count")
     scopes_left = instruments_left = ceiling
     count = 0
     for group in groups:
-        scopes = getattr(group, f"scope_{signal if signal != 'traces' else 'spans'}")
+        scopes = getattr(group, f"scope_{suffix}")
         if len(scopes) > scopes_left:
             raise ExportProtocolError("export.batch_count")
         scopes_left -= len(scopes)
@@ -598,6 +599,11 @@ def _remaining(deadline: float) -> float:
     if remaining <= 0:
         raise ExportProtocolError("export.deadline")
     return remaining
+
+
+def _is_protobuf(headers: Mapping[str, str]) -> bool:
+    content_type = headers.get("Content-Type", "").split(";", 1)[0]
+    return content_type.strip().lower() == "application/x-protobuf"
 
 
 def _read_response(response: requests.Response, ceiling: int, deadline: float) -> bytes:
@@ -796,6 +802,26 @@ class SanitizingSession(requests.Session):
         except Exception:
             pass  # Diagnostic/logging failure must not change export behavior.
 
+    def _report_outcome(self, code: str, local_dropped_records: int = 0) -> None:
+        self._outcome = ExportOutcome(code, local_dropped_records=local_dropped_records)
+        self._emit_diagnostic()
+
+    def _export_in_scope[B, R](self, native_export: Callable[[B], R], batch: B) -> R:
+        """Run one native span or log export in a fresh projection scope."""
+        caller_exception = exception()
+        self._outcome = ExportOutcome()
+        failures_token = self._failures.set(())
+        projection_scope = _ProjectionScope()
+        projection_token = self._projection_scope.set(projection_scope)
+        try:
+            return native_export(batch)
+        finally:
+            projection_scope.close()
+            self._projection_scope.reset(projection_token)
+            self._clear_failure_frames(caller_exception)
+            self._failures.reset(failures_token)
+            self._export_completed()
+
     def _project_for_attempt(self, data: bytes) -> tuple[bytes, int, int]:
         signal, policy, limits = self.signal, self.policy, self.limits
         scope = self._projection_scope.get()
@@ -864,10 +890,7 @@ class SanitizingSession(requests.Session):
             _remaining(deadline)
             status = response.status_code
             if 400 <= status <= 599:
-                self._outcome = ExportOutcome(
-                    "export.http_error", local_dropped_records=dropped
-                )
-                self._emit_diagnostic()
+                self._report_outcome("export.http_error", dropped)
                 return _safe_response(
                     status, _safe_retry_after(response.headers.get("Retry-After"))
                 )
@@ -878,13 +901,7 @@ class SanitizingSession(requests.Session):
                 != "identity"
             ):
                 raise ExportProtocolError("export.encoding")
-            if (
-                response.headers.get("Content-Type", "")
-                .split(";", 1)[0]
-                .strip()
-                .lower()
-                != "application/x-protobuf"
-            ):
+            if not _is_protobuf(response.headers):
                 raise ExportProtocolError("export.content_type")
             body = _read_response(response, self.limits.max_response_bytes, deadline)
             if self.signal == "traces":
@@ -949,10 +966,7 @@ class SanitizingSession(requests.Session):
             if method != "POST" or url != self.endpoint:
                 raise ExportProtocolError("export.destination")
             headers = requests.structures.CaseInsensitiveDict(kwargs.get("headers"))
-            if (
-                headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
-                != "application/x-protobuf"
-            ):
+            if not _is_protobuf(headers):
                 raise ExportProtocolError("export.content_type")
             if headers.get("Content-Encoding", "identity").lower() != "identity":
                 raise ExportProtocolError("export.encoding")
@@ -989,35 +1003,25 @@ class SanitizingSession(requests.Session):
             )
         except ExportProtocolError as error:
             self._remember_failure(error)
-            self._outcome = ExportOutcome(
-                str(error), local_dropped_records=self._outcome.local_dropped_records
-            )
-            self._emit_diagnostic()
+            self._report_outcome(str(error), self._outcome.local_dropped_records)
             raise
         except (requests.ConnectionError, requests.Timeout, ReadTimeoutError, SSLError):
             if monotonic() >= deadline:
-                self._outcome = ExportOutcome(
-                    "export.deadline",
-                    local_dropped_records=self._outcome.local_dropped_records,
+                self._report_outcome(
+                    "export.deadline", self._outcome.local_dropped_records
                 )
-                self._emit_diagnostic()
                 failure = ExportProtocolError("export.deadline")
                 self._remember_failure(failure)
                 raise failure from None
-            self._outcome = ExportOutcome(
-                "export.connection",
-                local_dropped_records=self._outcome.local_dropped_records,
+            self._report_outcome(
+                "export.connection", self._outcome.local_dropped_records
             )
-            self._emit_diagnostic()
             connection_failure = requests.ConnectionError("export.connection")
             self._remember_failure(connection_failure)
             raise connection_failure from None
         except Exception:
             code = "export.deadline" if monotonic() >= deadline else "export.invalid"
-            self._outcome = ExportOutcome(
-                code, local_dropped_records=self._outcome.local_dropped_records
-            )
-            self._emit_diagnostic()
+            self._report_outcome(code, self._outcome.local_dropped_records)
             failure = ExportProtocolError(code)
             self._remember_failure(failure)
             raise failure from None
@@ -1038,19 +1042,7 @@ def create_span_exporter(
 
     class _SanitizingSpanExporter(OTLPSpanExporter):
         def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
-            caller_exception = exception()
-            session._outcome = ExportOutcome()
-            failures_token = session._failures.set(())
-            projection_scope = _ProjectionScope()
-            projection_token = session._projection_scope.set(projection_scope)
-            try:
-                return super().export(spans)
-            finally:
-                projection_scope.close()
-                session._projection_scope.reset(projection_token)
-                session._clear_failure_frames(caller_exception)
-                session._failures.reset(failures_token)
-                session._export_completed()
+            return session._export_in_scope(super().export, spans)
 
     return _SanitizingSpanExporter(
         endpoint=session.endpoint,
@@ -1078,19 +1070,7 @@ def create_log_exporter(
 
     class _SanitizingLogExporter(OTLPLogExporter):
         def export(self, batch: Sequence[ReadableLogRecord]) -> LogRecordExportResult:
-            caller_exception = exception()
-            session._outcome = ExportOutcome()
-            failures_token = session._failures.set(())
-            projection_scope = _ProjectionScope()
-            projection_token = session._projection_scope.set(projection_scope)
-            try:
-                return super().export(batch)
-            finally:
-                projection_scope.close()
-                session._projection_scope.reset(projection_token)
-                session._clear_failure_frames(caller_exception)
-                session._failures.reset(failures_token)
-                session._export_completed()
+            return session._export_in_scope(super().export, batch)
 
     return _SanitizingLogExporter(
         endpoint=session.endpoint,
@@ -1136,8 +1116,7 @@ def create_metric_exporter(
             self._export_lock = Lock()
             self._timeout_supported = self._native_timeout() is not None
             if not self._timeout_supported:
-                session._outcome = ExportOutcome("metrics.timeout_unsupported")
-                session._emit_diagnostic()
+                session._report_outcome("metrics.timeout_unsupported")
 
         def _native_timeout(self) -> float | int | None:
             value = getattr(getattr(self, "_client", None), "_timeout", None)
@@ -1162,18 +1141,15 @@ def create_metric_exporter(
                 and type(timeout_millis) is not int
                 and type(timeout_millis) is not float
             ):
-                session._outcome = ExportOutcome("export.deadline")
-                session._emit_diagnostic()
+                session._report_outcome("export.deadline")
                 return MetricExportResult.FAILURE
             budget = timeout if timeout_millis is None else timeout_millis / 1000
             if not isfinite(budget) or budget <= 0:
-                session._outcome = ExportOutcome("export.deadline")
-                session._emit_diagnostic()
+                session._report_outcome("export.deadline")
                 return MetricExportResult.FAILURE
             deadline = monotonic() + min(timeout, budget)
             if not self._export_lock.acquire(timeout=max(0, deadline - monotonic())):
-                session._outcome = ExportOutcome("export.deadline")
-                session._emit_diagnostic()
+                session._report_outcome("export.deadline")
                 return MetricExportResult.FAILURE
             token = session._deadline.set(deadline)
             failures_token = session._failures.set(())

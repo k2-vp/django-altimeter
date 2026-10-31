@@ -643,6 +643,126 @@ def test_real_gthread_concurrency_is_branch_local_and_counts_unsampled_requests(
     )
 
 
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize("failure_point", [None, "iterator", "close"])
+def test_nested_wsgi_adapters_keep_the_outer_request_owner(
+    tmp_path, protocol_wheel, otlp_receiver, nested, failure_point
+):
+    result = _direct(
+        protocol_wheel,
+        otlp_receiver,
+        tmp_path,
+        f"\nNESTED, FAILURE_POINT = {nested!r}, {failure_point!r}\n"
+        + r"""
+from django_altimeter.runtime import shutdown
+from django_altimeter.wsgi import instrument
+
+failure = RuntimeError('CANARY_NESTED_WSGI')
+calls = closes = iterations = 0
+surfaces = []
+written = []
+write_result = object()
+class Response:
+    def __iter__(self):
+        global iterations
+        iterations += 1
+        self.sent = False
+        return self
+    def __next__(self):
+        surfaces.append(get_request_state().surface)
+        if self.sent:
+            if FAILURE_POINT == 'iterator':
+                raise failure
+            raise StopIteration
+        self.sent = True
+        return b'safe'
+    def close(self):
+        global closes
+        closes += 1
+        surfaces.append(get_request_state().surface)
+        if FAILURE_POINT == 'close':
+            raise failure
+body = Response()
+def app(environ, start_response):
+    global calls
+    calls += 1
+    surfaces.append(get_request_state().surface)
+    write = start_response('200 OK', [('Cache-Control', 'private')])
+    assert write(b'prefix') is write_result
+    return body
+def start(status, headers, exc_info=None):
+    assert status == '200 OK'
+    def write(data):
+        written.append(data.decode())
+        return write_result
+    return write
+inner = instrument(app, surface='mcp')
+def router(environ, start_response):
+    return inner(environ, start_response)
+outer = instrument(router if NESTED else app, surface='django')
+environ = {'REQUEST_METHOD': 'GET', 'PATH_INFO': '/normal'}
+response = outer(environ, start)
+assert get_request_state() is None and get_correlation() is None
+chunks = []
+try:
+    for chunk in response:
+        chunks.append(chunk.decode())
+        assert get_request_state() is None and get_correlation() is None
+except RuntimeError as error:
+    assert FAILURE_POINT == 'iterator' and error is failure
+else:
+    assert FAILURE_POINT != 'iterator'
+try:
+    response.close()
+except RuntimeError as error:
+    assert FAILURE_POINT == 'close' and error is failure
+else:
+    assert FAILURE_POINT != 'close'
+response.close()
+assert get_request_state() is None and get_correlation() is None
+assert outer._active == inner._active == 0
+assert shutdown().completed
+print(json.dumps({'calls': calls, 'closes': closes, 'iterations': iterations,
+                  'chunks': chunks, 'written': written, 'surfaces': surfaces}))
+""",
+    )
+    assert result["calls"] == result["closes"] == result["iterations"] == 1
+    assert result["chunks"] == ["safe"]
+    assert result["written"] == ["prefix"]
+    (span,) = _spans(otlp_receiver)
+    assert span.kind == 2
+    assert _attributes(span)["altimeter.surface"] == "django"
+    assert _attributes(span)["altimeter.http.outcome"] == (
+        "aborted" if failure_point == "iterator" else "completed"
+    )
+    assert span.status.code == (0 if failure_point is None else 2)
+    assert result["surfaces"] == ["django"] * 4
+    assert _metric_count(otlp_receiver, "altimeter.http.server.requests") == 1
+    assert _metric_count(otlp_receiver, "http.server.request.duration") == 1
+    points = [
+        point
+        for request in otlp_receiver.requests
+        if request.path == "/v1/metrics"
+        for resource in request.message.resource_metrics
+        for scope in resource.scope_metrics
+        for metric in scope.metrics
+        if metric.name
+        in {"altimeter.http.server.requests", "http.server.request.duration"}
+        for point in (
+            metric.sum.data_points
+            if metric.HasField("sum")
+            else metric.histogram.data_points
+        )
+    ]
+    assert points and all(
+        _attributes(point)["altimeter.surface"] == "django" for point in points
+    )
+    assert all(
+        b"CANARY" not in request.message.SerializeToString()
+        for request in otlp_receiver.requests
+    )
+
+
 _STREAMING_APP = r"""
 import json
 import logging

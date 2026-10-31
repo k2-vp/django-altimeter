@@ -435,6 +435,8 @@ class _InstrumentedWSGI:
     def __call__(
         self, environ: WSGIEnvironment, start_response: StartResponse
     ) -> Iterable[bytes]:
+        if request_state.get() is not None:
+            return self.application(environ, start_response)
         try:
             runtime = get_process_runtime()
             owned_tracing = runtime is not None and _owns_trace_provider(runtime)

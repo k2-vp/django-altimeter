@@ -4,18 +4,25 @@ Duration ends at iterator exhaustion or an observed abort. The WSGI server must
 call close(), including after exhaustion: native response completion precedes
 application close errors in gunicorn. Servers that abandon an unfinished iterable
 without closing it are unsupported. No context remains attached between calls.
+
+Native file wrappers keep their identity and the server's sendfile path. Their
+observation ends when the server calls close(), before application close work.
+If an instance cannot accept a close hook, it is returned untouched and the
+observation ends at app return with http.file_wrapper_unobserved. That fallback
+cannot observe file-transfer duration, completion or subsequent aborts.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import sys
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from contextvars import Token
 from threading import Lock
 from time import monotonic, time_ns
-from typing import Any
+from typing import Any, cast
 from wsgiref.types import StartResponse, WSGIApplication, WSGIEnvironment
 
 from opentelemetry import context, metrics, trace
@@ -178,12 +185,16 @@ class _Response:
                 except Exception:
                     _diagnostic("http.context_failed")
 
-    def invoke(self, application: WSGIApplication) -> _Response:
+    def invoke(self, application: WSGIApplication) -> Iterable[bytes]:
         self._begin()
         try:
             with self._active_context():
-                self._body = application(self._environ, self._response_start)
-                self._iterator = iter(self._body)
+                body = application(self._environ, self._response_start)
+                self._body = body
+                factory = self._environ.get("wsgi.file_wrapper")
+                native_file = isinstance(factory, type) and isinstance(body, factory)
+                if not native_file:
+                    self._iterator = iter(body)
         except BaseException:
             self._abort()
             try:
@@ -192,7 +203,50 @@ class _Response:
                 # A second close error cannot replace the original app/iter error.
                 _diagnostic("http.close_failed")
             raise
+        if native_file:
+            return self._observe_file(body)
         return self
+
+    def _observe_file(self, body: Iterable[bytes]) -> Iterable[bytes]:
+        # The server dispatches sendfile by this exact object's native type.
+        # Never interpose an iterable or force a read to observe its lifetime.
+        try:
+            original_close: Any = getattr(body, "close", _MISSING)
+            owner: _Response | None = self
+
+            def close_file() -> Any:
+                nonlocal owner, original_close
+                if owner is None:
+                    return None
+                current, owner = owner, None
+                current._closed = True
+                try:
+                    with current._active_context():
+                        # Gunicorn calls close from its transfer's finally block.
+                        # Observe an active failure without reading its contents.
+                        if sys.exception() is not None:
+                            current._abort()
+                        else:
+                            current._completed_at = monotonic()
+                        current._finish()
+                        if original_close is not _MISSING:
+                            return original_close()
+                        return None
+                finally:
+                    original_close = _MISSING
+                    current._release_references()
+
+            cast(Any, body).close = close_file
+        except Exception:
+            _diagnostic("http.file_wrapper_unobserved")
+            self._closed = True
+            self._completed_at = monotonic()
+            try:
+                with self._active_context():
+                    self._finish()
+            finally:
+                self._release_references()
+        return body
 
     def _response_start(
         self,
@@ -321,10 +375,13 @@ class _Response:
                 finally:
                     self._finish()
         finally:
-            # Break application write-callable cycles without touching its objects.
-            self._body = self._iterator = None
-            self._application_context = None
-            self._application_owned_span = None
+            self._release_references()
+
+    def _release_references(self) -> None:
+        # Break application write-callable cycles without touching its objects.
+        self._body = self._iterator = None
+        self._application_context = None
+        self._application_owned_span = None
 
     def __del__(self) -> None:
         # An abandoned iterable has no safe export/close boundary. Release only

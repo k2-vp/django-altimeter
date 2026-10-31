@@ -881,3 +881,298 @@ def test_manual_span_survives_wsgi_yields_and_parents_logs_and_http_children(
         b"CANARY" not in request.message.SerializeToString()
         for request in otlp_receiver.requests
     )
+
+
+_FILE_BODY = b"file-CANARY_FILE_BODY\n" * 4096
+_FILE_APP = r"""
+import json
+import os
+import tempfile
+import time
+from dataclasses import replace
+from threading import Lock
+
+from django.conf import settings
+settings.configure(SECRET_KEY='test-only-file-response', ROOT_URLCONF=__name__,
+                   ALLOWED_HOSTS=['*'], INSTALLED_APPS=[], DEBUG=False,
+                   MIDDLEWARE=['django_altimeter.django.RequestMetadataMiddleware'])
+from django.core.wsgi import get_wsgi_application
+from django.http import FileResponse, JsonResponse
+from django.urls import path
+from django_altimeter.conf import Config, SignalConfig
+from django_altimeter.context import get_correlation
+from django_altimeter.http import get_request_state
+from django_altimeter.privacy import DEFAULT_POLICY
+from django_altimeter.runtime import setup
+from django_altimeter.wsgi import instrument
+
+BODY = b'file-CANARY_FILE_BODY\n' * 4096
+lock = Lock()
+def record(event, **extra):
+    current = get_correlation()
+    state = get_request_state()
+    with lock, open(os.environ['FILE_EVENTS'], 'a') as output:
+        output.write(json.dumps(dict(event=event, time_ns=time.time_ns(),
+            trace=current.trace_id if current else None,
+            finalized=state.finalized if state else None, **extra)) + '\n')
+
+class AuditedFile:
+    def __init__(self, failing, method):
+        self.file = tempfile.TemporaryFile()
+        self.file.write(BODY)
+        self.file.seek(0)
+        self.failing, self.method = failing, method
+    def fileno(self):
+        return self.file.fileno()
+    def tell(self):
+        return self.file.tell()
+    def seek(self, *args):
+        return self.file.seek(*args)
+    def read(self, count=-1):
+        record('read', method=self.method, failing=self.failing)
+        if self.failing:
+            raise RuntimeError('CANARY_FILE_READ')
+        return self.file.read(count)
+    def close(self):
+        record('close', method=self.method, failing=self.failing)
+        self.file.close()
+
+class ReadOnlyWrapper:
+    __slots__ = ('filelike', 'blksize')
+    def __init__(self, filelike, blksize=8192):
+        self.filelike, self.blksize = filelike, blksize
+    def __getitem__(self, index):
+        data = self.filelike.read(self.blksize)
+        if data:
+            return data
+        raise IndexError
+    def close(self):
+        self.filelike.close()
+
+def health(request):
+    assert get_correlation() is None
+    return JsonResponse({'ok': True})
+
+def file_response(request):
+    source = AuditedFile(request.GET.get('failing') == '1', request.method)
+    result = FileResponse(source, content_type='application/octet-stream')
+    result['Cache-Control'] = 'private, no-store'
+    return result
+
+urlpatterns = [path('health/', health), path('file/', file_response)]
+django_app = get_wsgi_application()
+mode = os.environ['FILE_MODE']
+def signal(name):
+    return SignalConfig(True, os.environ['RECEIVER_ENDPOINT'] + '/v1/' + name,
+                        destination='collector')
+assert setup(Config(
+    enabled=mode != 'disabled',
+    service_name='' if mode == 'invalid' else 'file-response',
+    deployment_environment='test', release='v1',
+    integrations=frozenset({'wsgi', 'django'}), traces=signal('traces'),
+    metrics=signal('metrics'), export_timeout=0.5,
+    excluded_routes=frozenset({'/health/'}),
+    policy=replace(DEFAULT_POLICY,
+        attribute_values=frozenset({('http.route', 'file/')})),
+)).ok == (mode == 'enabled')
+
+def captured(environ, start_response):
+    result = django_app(environ, start_response)
+    if environ['PATH_INFO'] == '/file/':
+        environ['test.original_file_wrapper'] = result
+    return result
+
+observed = instrument(captured)
+def application(environ, start_response):
+    if os.environ['FILE_WRAPPER'] == 'readonly':
+        environ['wsgi.file_wrapper'] = ReadOnlyWrapper
+    result = observed(environ, start_response)
+    if environ['PATH_INFO'] == '/file/':
+        record('returned', same=result is environ.pop('test.original_file_wrapper'),
+               native=isinstance(result, environ['wsgi.file_wrapper']))
+        # Keep a visible gap between app return and server close. Native file
+        # duration must include it; the unhookable fallback explicitly cannot.
+        time.sleep(0.04)
+    assert get_correlation() is None
+    assert get_request_state() is None
+    return result
+"""
+
+
+@pytest.mark.parametrize("sendfile", ["yes", "no"])
+@pytest.mark.parametrize("wrapper", ["native", "readonly"])
+def test_django_file_response_preserves_native_sendfile_get_and_head(
+    tmp_path, protocol_wheel, sendfile, wrapper
+):
+    from support.gunicorn_server import running_server
+
+    results = {}
+    for mode in ("disabled", "invalid", "enabled"):
+        workspace = tmp_path / mode
+        workspace.mkdir()
+        (workspace / "file_app.py").write_text(_FILE_APP)
+        event_path = workspace / "events.jsonl"
+        responses = {}
+        with OTLPReceiver() as receiver:
+            with running_server(
+                workspace / "server",
+                wheel=protocol_wheel,
+                receiver=receiver,
+                application="file_app:application",
+                module_path=workspace,
+                threads=1,
+                extra_env={
+                    "FILE_MODE": mode,
+                    "FILE_WRAPPER": wrapper,
+                    "FILE_EVENTS": str(event_path),
+                    "SENDFILE": sendfile,
+                },
+            ) as server:
+                for method in ("GET", "HEAD"):
+                    for failing in (False, True):
+                        # Gunicorn's native file path can send bytes for HEAD.
+                        # Drain to EOF so this parity client does not abort an
+                        # otherwise successful transfer after receiving headers.
+                        with socket.create_connection(
+                            ("127.0.0.1", server.port), timeout=5
+                        ) as connection:
+                            connection.sendall(
+                                (
+                                    f"{method} /file/?failing={int(failing)} "
+                                    "HTTP/1.1\r\n"
+                                    "Host: localhost\r\nConnection: close\r\n\r\n"
+                                ).encode()
+                            )
+                            chunks = []
+                            while chunk := connection.recv(65536):
+                                chunks.append(chunk)
+                        head, separator, wire_body = b"".join(chunks).partition(
+                            b"\r\n\r\n"
+                        )
+                        assert separator
+                        status_line, *header_lines = head.decode("latin-1").split(
+                            "\r\n"
+                        )
+                        headers = dict(
+                            (name.lower(), value.strip())
+                            for name, value in (
+                                line.split(":", 1) for line in header_lines
+                            )
+                        )
+                        responses[method, failing] = (
+                            int(status_line.split()[1]),
+                            b"" if method == "HEAD" else wire_body,
+                            headers.get("content-length"),
+                            headers.get("cache-control"),
+                            wire_body,
+                        )
+                assert server.request("/health/")[0] == 200
+            events = [json.loads(line) for line in event_path.read_text().splitlines()]
+            closes = [event for event in events if event["event"] == "close"]
+            returned = [event for event in events if event["event"] == "returned"]
+            assert len(closes) == len(returned) == 4
+            assert all(event["same"] and event["native"] for event in returned)
+            assert all(event["trace"] is None for event in returned)
+            if sendfile == "yes":
+                assert not any(event["event"] == "read" for event in events)
+            else:
+                assert sum(event["event"] == "read" for event in events) >= 4
+            for (method, failing), (status, body, _, _, _) in responses.items():
+                expected = 500 if failing and sendfile == "no" else 200
+                assert status == expected, (mode, method, failing, responses)
+                if method == "HEAD":
+                    assert body == b""
+                elif expected == 200:
+                    assert body == _FILE_BODY
+            spans = _spans(receiver)
+            if mode == "enabled":
+                assert len(spans) == 4
+                assert all(span.kind == 2 for span in spans)
+                assert _metric_count(receiver, "altimeter.http.server.requests") == 4
+                assert _metric_count(receiver, "http.server.request.duration") == 4
+                for span, app_return, closed in zip(
+                    spans, returned, closes, strict=True
+                ):
+                    assert _attributes(span)["http.route"] == "file/"
+                    if wrapper == "native":
+                        assert (
+                            span.end_time_unix_nano
+                            >= app_return["time_ns"] + 30_000_000
+                        )
+                        assert span.end_time_unix_nano <= closed["time_ns"]
+                        assert closed["finalized"] is True
+                        assert _attributes(span)["altimeter.http.outcome"] == (
+                            "aborted"
+                            if closed["failing"] and sendfile == "no"
+                            else "completed"
+                        ), (wrapper, sendfile, closed, app_return, _attributes(span))
+                    else:
+                        assert span.end_time_unix_nano <= app_return["time_ns"]
+                        assert closed["trace"] is None
+                assert ("http.file_wrapper_unobserved" in server.output) == (
+                    wrapper == "readonly"
+                )
+            else:
+                assert receiver.requests == ()
+            assert all(
+                b"CANARY" not in request.message.SerializeToString()
+                for request in receiver.requests
+            )
+        results[mode] = responses
+    assert results["enabled"] == results["disabled"] == results["invalid"]
+
+
+def test_native_file_close_finalizes_once_before_preserving_original_exception(
+    tmp_path, protocol_wheel, otlp_receiver
+):
+    result = _direct(
+        protocol_wheel,
+        otlp_receiver,
+        tmp_path,
+        r"""
+from gunicorn.http.wsgi import FileWrapper
+from django_altimeter.wsgi import instrument
+from django_altimeter.runtime import shutdown
+
+failure = RuntimeError('CANARY_FILE_CLOSE')
+closes = 0
+class File:
+    def read(self, count=-1):
+        raise AssertionError('Native file path must not read during wrapping')
+    def close(self):
+        global closes
+        closes += 1
+        state = get_request_state()
+        assert state is not None and state.finalized
+        raise failure
+body = FileWrapper(File())
+def app(environ, start_response):
+    start_response('200 OK', [])
+    return body
+def start(status, headers, exc_info=None):
+    return lambda data: None
+response = instrument(app)({'REQUEST_METHOD': 'GET', 'PATH_INFO': '/normal',
+                            'wsgi.file_wrapper': FileWrapper}, start)
+assert response is body
+assert get_request_state() is None and get_correlation() is None
+try:
+    response.close()
+except RuntimeError as error:
+    assert error is failure
+else:
+    raise AssertionError('Native close exception was lost')
+response.close()
+assert closes == 1
+assert get_request_state() is None and get_correlation() is None
+assert shutdown().completed
+print(json.dumps({'closes': closes}))
+""",
+    )
+    assert result == {"closes": 1}
+    assert len(_spans(otlp_receiver)) == 1
+    assert _metric_count(otlp_receiver, "altimeter.http.server.requests") == 1
+    assert _metric_count(otlp_receiver, "http.server.request.duration") == 1
+    assert all(
+        b"CANARY" not in request.message.SerializeToString()
+        for request in otlp_receiver.requests
+    )

@@ -929,6 +929,11 @@ the provider. Admission drops records only for unsupported types or exceeded
 limits, with bounded diagnostic codes. Projection applies the allow-list policy
 field by field, preserving permitted route/status/duration/correlation alongside
 removed unapproved fields. The exporter factories apply projection before sending.
+Admission inspects the whole retained record: an over-limit field or unsupported
+container drops the entire span even if projection would later remove that field.
+`BoundedSpanProcessor.local_dropped_records` counts cumulative admission losses
+before batching, separately from the session's per-export drop count. It does
+not count native batch rejection or SDK queue overflow.
 `native_span_limits()` and `native_log_limits()` supply the corresponding SDK
 limits for explicit provider construction. Call `normalize_span_name()` at an
 early instrumentation hook to reduce SQL/HTTP names to approved operations
@@ -1050,6 +1055,10 @@ thread-safe, and logging-handler errors do not change export behavior. Full
 acceptance (`export.accepted`) emits no warning. Keep this internal logger out of
 exported-log handlers to avoid feeding diagnostics back into telemetry.
 
+Span admission uses the same logger with `admission.size`, `admission.type` or
+`span.admission_error`. Each span processor independently limits each code to
+one warning per 60 seconds while continuing to count every rejected record.
+
 The closed set of warning codes is:
 
 ```text
@@ -1061,6 +1070,7 @@ export.rejected_count export.partial        export.warning
 export.deadline       export.connection     export.invalid
 export.failed         export.local_drop     export.framing
 metrics.timeout_unsupported
+admission.size        admission.type        span.admission_error
 ```
 
 ## Development

@@ -1,6 +1,9 @@
 # Build from the repository root after `uv build`; never copy src into this image.
 ARG PYTHON_VERSION=3.13
+# The 0.164.0 distribution contains contrib components v0.164.1.
+FROM otel/opentelemetry-collector-contrib:0.164.0@sha256:340c9ca6a36617084c6661bdc4f0fe92b7cda5a805d61673ec8db375fddc522b AS collector
 FROM python:${PYTHON_VERSION}-slim
+COPY --from=collector /otelcol-contrib /usr/local/bin/otelcol-contrib
 
 ARG PYTHON_VERSION
 ARG DJANGO_VERSION=6.0.9
@@ -44,7 +47,7 @@ subprocess.run(
           if os.environ['ALTIMETER_REFERENCE_ASGI'] == '1' else []),
         *(['gunicorn==23.0.0', 'djangorestframework==3.16.1']
           if os.environ['ALTIMETER_REFERENCE_WSGI'] == '1' else []),
-        f"{wheels[0]}[celery,psycopg,httpx,requests,redis,structlog]",
+        f"{wheels[0]}[celery,psycopg,httpx,requests,redis,structlog,process]",
     ],
     check=True,
 )
@@ -53,5 +56,6 @@ PY
 # Only test configuration and tests accompany the installed wheel.
 COPY pyproject.toml /verify/
 COPY tests /verify/tests/
+COPY deploy/collector.yaml /verify/deploy/collector.yaml
 COPY reference/altimeter_reference /verify/reference/altimeter_reference
 CMD ["python", "-m", "pytest", "tests/integration/test_wheel.py"]

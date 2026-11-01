@@ -13,7 +13,8 @@ client integrations add safe child spans, and an explicitly attached logging
 handler exports approved records without changing stdout. Vendored TypeScript
 helpers link board/repair readiness events to current request traces and passive
 browser resource timing. Optional Celery instrumentation observes publication,
-execution attempts and worker metrics. Telemetry is disabled by default.
+execution attempts and worker metrics. Optional process metrics describe each
+executing process. Telemetry is disabled by default.
 
 ## Install
 
@@ -572,6 +573,73 @@ passing a native span or looking up context later in a reporting thread.
 Altimeter does not create a PostHog client or report another exception occurrence.
 See [logging attachment and correlation](docs/logging.md) for topology,
 scrubber, nonpropagating logger and post-configuration details.
+
+## Process metrics
+
+Install the optional dependency and add `process` to the integrations enabled
+for your application. Keep the existing runtime destinations and resource
+identity settings:
+
+```sh
+uv pip install '.[process]'
+export ALTIMETER_INTEGRATIONS=asgi,django,process
+```
+
+For gunicorn gthread, use `wsgi,django,process`. The extra pins psutil 7.2.2.
+Call the normal serving-process `setup()`; collection requires an owned,
+enabled metrics provider. The existing metric reader collects observations at
+`ALTIMETER_METRIC_EXPORT_INTERVAL_MILLIS`; this integration creates no additional
+polling thread. Importing the package does not import psutil or start collection.
+
+The scope is `django_altimeter`. Only these seven instruments are enabled:
+
+| Instrument | Unit | Exported value and dimensions |
+| --- | --- | --- |
+| `process.cpu.time` | `s` | Delta CPU seconds, `cpu.mode=user\|system`; excludes child CPU |
+| `process.memory.usage` | `By` | Current resident memory (RSS), no dimensions |
+| `process.thread.count` | `{thread}` | Current thread count, no dimensions |
+| `process.unix.file_descriptor.count` | `{file_descriptor}` | Current open descriptor count when available, no dimensions |
+| `altimeter.process.gc.collections` | `{collection}` | Delta collection count, `altimeter.gc.generation=0\|1\|2` |
+| `altimeter.process.gc.collected` | `{object}` | Delta collected-object count, the same three generations |
+| `altimeter.process.gc.uncollectable` | `{object}` | Delta uncollectable-object count, the same three generations |
+
+CPU and GC counters start at their first successful observation, excluding
+earlier or inherited totals. Current-value instruments use native observable
+up/down counters: OTLP cumulative, non-monotonic sums that represent snapshots.
+Use the latest aligned snapshot per writer; do not add successive samples.
+Sum CPU or GC deltas over the selected time window, retaining each writer's
+`service.instance.id` until aggregation. Every initialized child has its own
+writer ID; an inherited parent runtime does not collect in the child.
+
+CPU seconds are not a utilization percentage. Divide user plus system CPU
+seconds by the actual elapsed wall seconds to obtain busy cores. A normalized
+utilization additionally divides by an explicitly chosen core capacity: two
+CPU seconds over one wall second mean two busy cores, or 50% of four cores.
+Altimeter does not infer that capacity from container or host settings.
+
+Thread and descriptor snapshots can be summed across distinct current writers
+to count their process resources. Summed RSS can double-count shared pages and
+is not a physical-memory or container-memory total. A new child or writer ID
+does not prove a crash or OOM.
+
+The integration admits at most 14 fixed series per writer: two CPU modes,
+three current-value series and nine GC series. Values are bounded scalars;
+there are no request, task, tenant or session dimensions, object scans, host-wide
+`system.*` defaults, cloud polling or host mounts. Unavailable or denied readings
+are omitted, with fixed `process.*` diagnostics. Missing or broken psutil leaves
+existing request instrumentation, traces, logs and HTTP metrics working;
+startup reports `setup.process_unavailable` or `setup.process_failed`.
+
+To disable only process collection, remove `process` and restart the serving
+processes, preserving the other integrations:
+
+```sh
+export ALTIMETER_INTEGRATIONS=asgi,django
+```
+
+For optional database and container context, see the
+[collector configuration](docs/collector.md), including its source-access and
+availability boundaries.
 
 ## Celery workers and beat
 
@@ -1187,6 +1255,48 @@ admission.size        admission.type        span.admission_error
 
 Revalidate the metric timeout compatibility guard and deadline tests before
 changing the OTel version bounds.
+
+Process checks use the built wheel, real processes/forks and decoded OTLP in
+both reference images. The web checks also remove or damage the optional
+dependency in private test environments to verify application behavior:
+
+```sh
+uv build
+docker compose -p <unique-process-asgi> -f reference/compose.yaml --profile asgi run --build --rm verify-asgi python -m pytest tests/integration/test_process_metrics.py tests/integration/test_process_web.py
+docker compose -p <unique-process-asgi> -f reference/compose.yaml --profile asgi down --remove-orphans
+docker compose -p <unique-process-wsgi> -f reference/compose.yaml --profile wsgi run --build --rm verify-wsgi python -m pytest tests/integration/test_process_metrics.py tests/integration/test_process_web.py
+docker compose -p <unique-process-wsgi> -f reference/compose.yaml --profile wsgi down --remove-orphans
+```
+
+CI includes these files in each image's full test suite. Run process-collection
+overhead measurements explicitly in both local images:
+
+```sh
+docker compose -p <unique-process-perf-asgi> -f reference/compose.yaml --profile asgi run --build --rm verify-asgi python -m pytest -m performance -s tests/performance/test_process_overhead.py
+docker compose -p <unique-process-perf-asgi> -f reference/compose.yaml --profile asgi down --remove-orphans
+docker compose -p <unique-process-perf-wsgi> -f reference/compose.yaml --profile wsgi run --build --rm verify-wsgi python -m pytest -m performance -s tests/performance/test_process_overhead.py
+docker compose -p <unique-process-perf-wsgi> -f reference/compose.yaml --profile wsgi down --remove-orphans
+```
+
+Both measurement modes retain web telemetry; only process collection changes.
+The workload, balanced repetitions, latency budget and validity checks are
+declared in `tests/performance/test_process_overhead.py`. Rebuild after source
+changes and run the matching cleanup command even after failure.
+
+Verify the optional collector configuration with the pinned real binary and
+isolated sources in each image:
+
+```sh
+uv build
+docker compose -p <unique-collector-asgi> -f reference/compose.yaml --profile asgi run --build --rm verify-asgi python -m pytest tests/integration/test_collector_profiles.py
+docker compose -p <unique-collector-asgi> -f reference/compose.yaml --profile asgi down --remove-orphans
+docker compose -p <unique-collector-wsgi> -f reference/compose.yaml --profile wsgi run --build --rm verify-wsgi python -m pytest tests/integration/test_collector_profiles.py
+docker compose -p <unique-collector-wsgi> -f reference/compose.yaml --profile wsgi down --remove-orphans
+```
+
+Full Linux host test runs also need `otelcol-contrib` on `PATH`, from the image
+pinned in `reference/Dockerfile`. CI copies that binary from the same pinned
+image before running pytest; it does not start a background collector service.
 
 Celery checks install the built wheel and run real workers, beat and a local
 OTLP receiver against isolated Redis broker/backend databases and UUID key

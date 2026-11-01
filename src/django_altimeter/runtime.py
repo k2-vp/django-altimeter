@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     from django_altimeter.exporting import ExportOutcome, SanitizingSession
     from django_altimeter.headers import ResponseHeaderPolicy
     from django_altimeter.metrics import RequestMetrics
+    from django_altimeter.process import ProcessMetrics
     from django_altimeter.worker_metrics import WorkerMetrics
 
 
@@ -120,6 +121,7 @@ class ProcessRuntime:
         self.meter_provider: metrics.MeterProvider = NoOpMeterProvider()
         self.request_metrics: RequestMetrics | None = None
         self.worker_metrics: WorkerMetrics | None = None
+        self.process_metrics: ProcessMetrics | None = None
         self.response_header_policy: ResponseHeaderPolicy | None = None
         self._trace_provider: TracerProvider | None = None
         self._log_provider: LoggerProvider | None = None
@@ -249,9 +251,11 @@ class ProcessRuntime:
             Histogram,
             MeterProvider,
             ObservableCounter,
+            ObservableUpDownCounter,
         )
         from opentelemetry.sdk.metrics.export import (
             AggregationTemporality,
+            MetricsData,
             PeriodicExportingMetricReader,
         )
         from opentelemetry.sdk.metrics.view import DropAggregation, View
@@ -284,6 +288,14 @@ class ProcessRuntime:
 
             views.extend(worker_metric_views())
             bounded_instruments |= WORKER_INSTRUMENTS
+        if "process" in self.config.integrations:
+            from django_altimeter.process import (
+                PROCESS_INSTRUMENTS,
+                process_metric_views,
+            )
+
+            views.extend(process_metric_views())
+            bounded_instruments |= PROCESS_INSTRUMENTS
         views.extend(
             View(meter_name=scope, instrument_name=escape(name), attribute_keys=set())
             for scope, name in sorted(
@@ -299,9 +311,42 @@ class ProcessRuntime:
                 Counter: AggregationTemporality.DELTA,
                 Histogram: AggregationTemporality.DELTA,
                 ObservableCounter: AggregationTemporality.DELTA,
+                ObservableUpDownCounter: AggregationTemporality.CUMULATIVE,
             },
         )
-        reader = PeriodicExportingMetricReader(
+        reader_type = PeriodicExportingMetricReader
+        if "process" in self.config.integrations:
+            runtime = self
+
+            class ProcessMetricReader(PeriodicExportingMetricReader):
+                def _report_process_diagnostics(self) -> None:
+                    if runtime.process_metrics is not None:
+                        runtime.process_metrics.report_pending()
+
+                def _receive_metrics(
+                    self,
+                    metrics_data: MetricsData,
+                    timeout_millis: float = 10_000,
+                    **kwargs: Any,
+                ) -> None:
+                    # The SDK collection lock is released before this hook;
+                    # super also releases its export lock before diagnostics run.
+                    try:
+                        super()._receive_metrics(
+                            metrics_data, timeout_millis=timeout_millis, **kwargs
+                        )
+                    finally:
+                        self._report_process_diagnostics()
+
+                def force_flush(self, timeout_millis: float = 10_000) -> bool:
+                    try:
+                        return super().force_flush(timeout_millis=timeout_millis)
+                    finally:
+                        # Empty collections never enter _receive_metrics.
+                        self._report_process_diagnostics()
+
+            reader_type = ProcessMetricReader
+        reader = reader_type(
             exporter,
             export_interval_millis=self.config.metric_export_interval_millis,
             export_timeout_millis=self._export_timeout() * 1000,
@@ -393,6 +438,10 @@ class ProcessRuntime:
                 task_names=worker_task_names(self.config.policy),
                 queue_names=self.config.queue_names,
             )
+        if "process" in self.config.integrations:
+            from django_altimeter.process import process_metric_policy
+
+            policy = process_metric_policy(policy)
         self._policy = replace(
             policy,
             attribute_values=policy.attribute_values
@@ -452,6 +501,17 @@ class ProcessRuntime:
                     codes.extend(install_clients(self))
                 except Exception:
                     codes.append("setup.clients_failed")
+        if "metrics" in enabled and "process" in self.config.integrations:
+            try:
+                from django_altimeter.process import ProcessMetrics
+
+                self.process_metrics = ProcessMetrics(
+                    self.meter_provider, policy=self._policy, limits=self.config.limits
+                )
+            except ImportError:
+                codes.append("setup.process_unavailable")
+            except Exception:
+                codes.append("setup.process_failed")
         self.result = SetupResult(tuple(enabled), tuple(codes))
         # Start once at setup, not at atexit. Even unsuccessful partial
         # construction can leave native workers that need bounded cleanup.

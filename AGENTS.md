@@ -66,6 +66,24 @@ once `pyproject.toml` exists:
 - Predeclared Celery measurements, local ASGI image only after `uv build`:
   `docker compose -p <unique-celery-perf> -f reference/compose.yaml --profile asgi run --build --rm verify-asgi python -m pytest -m performance -s tests/performance/test_worker_overhead.py`
   then `docker compose -p <unique-celery-perf> -f reference/compose.yaml --profile asgi down --remove-orphans`
+- Process-resource and optional-source web checks, after `uv build`:
+  `docker compose -p <unique-process-asgi> -f reference/compose.yaml --profile asgi run --build --rm verify-asgi python -m pytest tests/integration/test_process_metrics.py tests/integration/test_process_web.py`
+  then `docker compose -p <unique-process-asgi> -f reference/compose.yaml --profile asgi down --remove-orphans`
+  `docker compose -p <unique-process-wsgi> -f reference/compose.yaml --profile wsgi run --build --rm verify-wsgi python -m pytest tests/integration/test_process_metrics.py tests/integration/test_process_web.py`
+  then `docker compose -p <unique-process-wsgi> -f reference/compose.yaml --profile wsgi down --remove-orphans`
+- Predeclared process-collection overhead, local matching images after `uv build`:
+  `docker compose -p <unique-process-perf-asgi> -f reference/compose.yaml --profile asgi run --build --rm verify-asgi python -m pytest -m performance -s tests/performance/test_process_overhead.py`
+  then `docker compose -p <unique-process-perf-asgi> -f reference/compose.yaml --profile asgi down --remove-orphans`
+  `docker compose -p <unique-process-perf-wsgi> -f reference/compose.yaml --profile wsgi run --build --rm verify-wsgi python -m pytest -m performance -s tests/performance/test_process_overhead.py`
+  then `docker compose -p <unique-process-perf-wsgi> -f reference/compose.yaml --profile wsgi down --remove-orphans`
+- Optional collector configuration, after `uv build`; source boundaries and
+  parameters are documented in [docs/collector.md](docs/collector.md):
+  `docker compose -p <unique-collector-asgi> -f reference/compose.yaml --profile asgi run --build --rm verify-asgi python -m pytest tests/integration/test_collector_profiles.py`
+  then `docker compose -p <unique-collector-asgi> -f reference/compose.yaml --profile asgi down --remove-orphans`
+  `docker compose -p <unique-collector-wsgi> -f reference/compose.yaml --profile wsgi run --build --rm verify-wsgi python -m pytest tests/integration/test_collector_profiles.py`
+  then `docker compose -p <unique-collector-wsgi> -f reference/compose.yaml --profile wsgi down --remove-orphans`
+  Full Linux host suites require `otelcol-contrib` from the image pinned in
+  `reference/Dockerfile` on `PATH`; CI installs it before pytest.
 - Browser unit tests: `cd tests/browser && bun run test:unit`
 - Browser TypeScript checks (harness plus ASGI/WSGI compiler profiles):
   `cd tests/browser && bun run typecheck`

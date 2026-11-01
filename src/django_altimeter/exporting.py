@@ -374,6 +374,9 @@ class BoundedSpanProcessor(SpanProcessor):
         self._local_dropped_records = 0
         self._drop_lock = Lock()
         self._drop_diagnostics: dict[str, float] = {}
+        self._pending_diagnostics, self._report_diagnostics = _defer_export_diagnostics(
+            exporter
+        )
         self._delegate = BatchSpanProcessor(
             exporter,
             max_queue_size=limits.max_queue_size,
@@ -407,12 +410,16 @@ class BoundedSpanProcessor(SpanProcessor):
             pass  # A diagnostic handler cannot break the application span.
 
     def on_start(self, span: Span, parent_context: Context | None = None) -> None:
+        if self._pending_diagnostics:
+            self._report_diagnostics()
         try:
             self._delegate.on_start(span, parent_context=parent_context)
         except Exception:
             self.last_diagnostic = "span.start_error"
 
     def on_end(self, span: ReadableSpan) -> None:
+        if self._pending_diagnostics:
+            self._report_diagnostics()
         try:
             _span_size(span, self._limits)
             self._delegate.on_end(span)
@@ -427,12 +434,18 @@ class BoundedSpanProcessor(SpanProcessor):
         except Exception:
             self.last_diagnostic = "span.flush_error"
             return False
+        finally:
+            if self._pending_diagnostics:
+                self._report_diagnostics()
 
     def shutdown(self) -> None:
         try:
             cast(SpanProcessor, self._delegate).shutdown()
         except Exception:
             self.last_diagnostic = "span.shutdown_error"
+        finally:
+            if self._pending_diagnostics:
+                self._report_diagnostics()
 
 
 def bounded_log_processor(
@@ -455,6 +468,9 @@ def bounded_log_processor(
         def __init__(self) -> None:
             self._limits = limits
             self.last_diagnostic: str | None = None
+            self._pending_diagnostics, self._report_diagnostics = (
+                _defer_export_diagnostics(exporter)
+            )
             self._delegate = BatchLogRecordProcessor(
                 exporter,
                 max_queue_size=limits.max_queue_size,
@@ -464,6 +480,8 @@ def bounded_log_processor(
             )
 
         def on_emit(self, log_record: ReadWriteLogRecord) -> None:
+            if self._pending_diagnostics:
+                self._report_diagnostics()
             try:
                 _log_size(log_record, self._limits)
                 self._delegate.on_emit(log_record)
@@ -478,12 +496,18 @@ def bounded_log_processor(
             except Exception:
                 self.last_diagnostic = "log.flush_error"
                 return False
+            finally:
+                if self._pending_diagnostics:
+                    self._report_diagnostics()
 
         def shutdown(self) -> None:
             try:
                 cast(LogRecordProcessor, self._delegate).shutdown()
             except Exception:
                 self.last_diagnostic = "log.shutdown_error"
+            finally:
+                if self._pending_diagnostics:
+                    self._report_diagnostics()
 
     return _BoundedLogRecordProcessor()
 
@@ -764,6 +788,9 @@ class SanitizingSession(requests.Session):
         self._outcome = ExportOutcome()
         self._diagnostic_times: dict[str, float] = {}
         self._diagnostic_lock = Lock()
+        self._pending_diagnostics: dict[str, None] = {}
+        self._diagnostics_deferred = False
+        self._reporting_diagnostics = False
         self._deadline: ContextVar[float | None] = ContextVar(
             "altimeter_export_deadline", default=None
         )
@@ -827,24 +854,52 @@ class SanitizingSession(requests.Session):
     def _export_completed(self, outcome: ExportOutcome | None = None) -> None:
         """Finish native export with its worst terminal batch, after retries."""
         self._emit_diagnostic()
+        if not self._diagnostics_deferred and self._projection_scope.get() is None:
+            self.report_pending()
 
     def _emit_diagnostic(self) -> None:
-        # One fixed signal per session, and a closed code set bounds this map.
-        # Publish the timestamp before logging, outside the lock, so handlers
-        # cannot cause deadlock or recursive emission of the same diagnostic.
+        # Retain fixed codes only; native callers still hold their export locks.
         try:
             code = self._outcome.code
             if code not in _DIAGNOSTIC_CODES:
                 return
             with self._diagnostic_lock:
-                now = monotonic()
                 last = self._diagnostic_times.get(code)
-                if last is not None and now - last < 60:
-                    return
-                self._diagnostic_times[code] = now
-            _DIAGNOSTIC_LOGGER.warning("%s %s", code, self.signal)
+                if last is None or monotonic() - last >= 60:
+                    self._pending_diagnostics[code] = None
+            if not self._diagnostics_deferred and self._projection_scope.get() is None:
+                self.report_pending()
         except Exception:
-            pass  # Diagnostic/logging failure must not change export behavior.
+            pass  # Diagnostic failure must not change export behavior.
+
+    def report_pending(self) -> None:
+        """Deliver queued codes only at a boundary outside native export locks.
+
+        Batch workers have no public completion hook. Their owner drains here
+        on the next processor call, flush or shutdown. The pending dict is shared
+        with processors so their empty request path is one unlocked flag read.
+        """
+        try:
+            with self._diagnostic_lock:
+                if self._reporting_diagnostics or not self._pending_diagnostics:
+                    return
+                codes = tuple(self._pending_diagnostics)
+                self._pending_diagnostics.clear()
+                now = monotonic()
+                for code in codes:
+                    self._diagnostic_times[code] = now
+                self._reporting_diagnostics = True
+            try:
+                for code in codes:
+                    try:
+                        _DIAGNOSTIC_LOGGER.warning("%s %s", code, self.signal)
+                    except Exception:
+                        pass  # Application handlers cannot change export behavior.
+            finally:
+                with self._diagnostic_lock:
+                    self._reporting_diagnostics = False
+        except Exception:
+            pass  # Fixed diagnostics are best effort, including during teardown.
 
     def _report_outcome(self, code: str, local_dropped_records: int = 0) -> None:
         self._outcome = ExportOutcome(code, local_dropped_records=local_dropped_records)
@@ -1107,6 +1162,17 @@ class SanitizingSession(requests.Session):
             raise failure from None
 
 
+def _defer_export_diagnostics(
+    exporter: object,
+) -> tuple[dict[str, None], Callable[[], None]]:
+    """Bind our processors/readers without changing arbitrary native exporters."""
+    session = getattr(exporter, "_altimeter_session", None)
+    if isinstance(session, SanitizingSession):
+        session._diagnostics_deferred = True
+        return session._pending_diagnostics, session.report_pending
+    return {}, lambda: None
+
+
 def create_span_exporter(
     session: SanitizingSession,
     *,
@@ -1121,6 +1187,8 @@ def create_span_exporter(
         raise ValueError("span exporter requires trace session")
 
     class _SanitizingSpanExporter(OTLPSpanExporter):
+        _altimeter_session = session
+
         def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
             return session._export_in_scope(
                 super().export,
@@ -1156,6 +1224,8 @@ def create_log_exporter(
         raise ValueError("log exporter requires log session")
 
     class _SanitizingLogExporter(OTLPLogExporter):
+        _altimeter_session = session
+
         def export(self, batch: Sequence[ReadableLogRecord]) -> LogRecordExportResult:
             return session._export_in_scope(
                 super().export,
@@ -1194,6 +1264,8 @@ def create_metric_exporter(
     from opentelemetry.sdk.metrics.export import MetricExportResult
 
     class _DeadlineMetricExporter(OTLPMetricExporter):
+        _altimeter_session = session
+
         def __init__(self) -> None:
             super().__init__(
                 endpoint=session.endpoint,

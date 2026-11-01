@@ -1598,8 +1598,6 @@ def test_retry_projection_copied_contexts_release_bytes(
     from contextvars import copy_context
     from weakref import ref
 
-    from django_altimeter.exporting import _DIAGNOSTIC_LOGGER
-
     exporter, session = _counted_exporter(signal, otlp_receiver, timeout=7)
     loop = asyncio.new_event_loop()
     direct_contexts = []
@@ -1627,7 +1625,10 @@ def test_retry_projection_copied_contexts_release_bytes(
             loop.call_soon_threadsafe(observe_callback)
 
     handler = Capture()
-    _DIAGNOSTIC_LOGGER.addHandler(handler)
+    # Native logging still occurs inside export; our diagnostic now waits until
+    # completion. Keep exercising a copied context with a live retry cache.
+    logger = exporter._client._logger
+    logger.addHandler(handler)
     if result_kind == "protocol_failure":
         otlp_receiver.queue_response(body=b"\xff")
         expected_requests = 1
@@ -1671,7 +1672,7 @@ def test_retry_projection_copied_contexts_release_bytes(
             for request in otlp_receiver.requests
         )
     finally:
-        _DIAGNOSTIC_LOGGER.removeHandler(handler)
+        logger.removeHandler(handler)
         handler.close()
         exporter.shutdown()
         loop.close()
@@ -1909,3 +1910,165 @@ def test_local_drop_remains_the_worst_outcome(other_code, loss_first):
     other = ExportOutcome(other_code)
     first, second = (loss, other) if loss_first else (other, loss)
     assert _worst_outcome(first, second) is loss
+
+
+@pytest.fixture(scope="module")
+def diagnostic_wheel(tmp_path_factory):
+    from support.uvicorn_server import install_wheel
+
+    return install_wheel(
+        tmp_path_factory.mktemp("export-diagnostic-wheel"), server_dependencies=()
+    )
+
+
+@pytest.mark.parametrize(
+    ("signal", "delivery"),
+    [
+        ("traces", "flush"),
+        ("logs", "flush"),
+        ("metrics", "flush"),
+        ("traces", "on_start"),
+        ("traces", "on_end"),
+        ("logs", "on_emit"),
+        ("metrics", "periodic"),
+    ],
+)
+@pytest.mark.parametrize("reentrant", [False, True], ids=["normal", "force-flush"])
+def test_export_diagnostic_handler_runs_outside_native_locks(
+    signal, delivery, reentrant, diagnostic_wheel, otlp_receiver, tmp_path
+):
+    """Installed wheel, real native processors/reader and HTTP; no lock mocks."""
+    import json
+    import os
+    import subprocess
+
+    source = r"""
+import importlib.metadata
+import json
+import logging
+import os
+from pathlib import Path
+import sys
+import time
+from threading import Event, get_ident
+
+import django_altimeter
+from django_altimeter.conf import Config, SignalConfig
+from django_altimeter.privacy import PrivacyPolicy
+from django_altimeter.runtime import get_process_runtime, setup, shutdown
+
+assert Path(django_altimeter.__file__).resolve().is_relative_to(Path(sys.prefix))
+direct = json.loads(importlib.metadata.distribution('django-altimeter').read_text(
+    'direct_url.json'))
+assert direct['archive_info']['hashes']['sha256'] == os.environ['WHEEL_SHA256']
+assert not direct.get('dir_info', {}).get('editable', False)
+signal = os.environ['SIGNAL']
+delivery = os.environ['DELIVERY']
+interval = 60000 if delivery == 'flush' else 20
+config = Config(enabled=True, service_name='diagnostic-test',
+    deployment_environment='test', release='v1',
+    batch_schedule_delay_millis=interval, metric_export_interval_millis=interval,
+    export_timeout=0.2,
+    policy=PrivacyPolicy(log_bodies=frozenset({'request.complete'}),
+        metric_instruments=frozenset({('django_altimeter', 'diagnostic.calls')})),
+    **{signal: SignalConfig(True, os.environ['ENDPOINT'], (), 'collector')})
+assert setup(config).ok
+runtime = get_process_runtime()
+if signal == 'traces':
+    provider = runtime.tracer_provider
+    held = (provider.get_tracer('django_altimeter').start_span('GET')
+            if delivery == 'on_end' else None)
+    def emit():
+        with provider.get_tracer('django_altimeter').start_as_current_span('GET'):
+            pass
+elif signal == 'logs':
+    from opentelemetry._logs import LogRecord, SeverityNumber
+    provider = runtime.logger_provider
+    def emit():
+        provider.get_logger('django_altimeter').emit(LogRecord(
+            body='request.complete', severity_number=SeverityNumber.INFO))
+else:
+    provider = runtime.meter_provider
+    counter = provider.get_meter('django_altimeter').create_counter(
+        'diagnostic.calls', unit='1')
+    def emit():
+        counter.add(1)
+records = []
+flushes = []
+delivery_threads = []
+delivered = Event()
+calling_thread = get_ident()
+class Handler(logging.Handler):
+    def emit(self, record):
+        records.append(record.getMessage())
+        delivery_threads.append(get_ident())
+        if os.environ['REENTRANT'] == '1':
+            emit()  # Ensure the nested flush has work, even for a batch processor.
+            flushes.append(provider.force_flush(timeout_millis=200))
+        delivered.set()
+handler = Handler()
+logger = logging.getLogger('django_altimeter.export')
+logger.addHandler(handler)
+try:
+    started = time.monotonic()
+    emit()
+    if delivery == 'flush':
+        assert provider.force_flush(timeout_millis=200)
+    elif delivery == 'periodic':
+        assert delivered.wait(2)
+    else:
+        session = runtime._sessions[0]
+        deadline = time.monotonic() + 2
+        while not session._pending_diagnostics and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert session._pending_diagnostics
+        assert records == []  # A native batch worker must only queue the code.
+    if delivery == 'on_end':
+        held.end()
+    else:
+        emit()
+    assert provider.force_flush(timeout_millis=200)
+    # Restore a successful outcome before the bounded runtime shutdown.
+    emit()
+    assert provider.force_flush(timeout_millis=200)
+    elapsed = time.monotonic() - started
+finally:
+    logger.removeHandler(handler)
+    handler.close()
+assert shutdown().completed
+assert len(delivery_threads) == 1
+assert (delivery_threads[0] == calling_thread) == (delivery != 'periodic')
+print(json.dumps({'records': records, 'flushes': flushes, 'elapsed': elapsed}))
+"""
+    # Repeat the same real failure to prove rate limiting, then recover safely.
+    otlp_receiver.queue_response(status=400, reason=CANARY, body=CANARY.encode())
+    if reentrant:
+        otlp_receiver.queue_response()
+    otlp_receiver.queue_response(status=400, reason=CANARY, body=CANARY.encode())
+    process = subprocess.run(
+        [str(diagnostic_wheel.python), "-I", "-c", source],
+        cwd=tmp_path,
+        env={
+            "PATH": os.environ.get("PATH", ""),
+            "WHEEL_SHA256": diagnostic_wheel.sha256,
+            "SIGNAL": signal,
+            "DELIVERY": delivery,
+            "ENDPOINT": otlp_receiver.url(signal),
+            "REENTRANT": "1" if reentrant else "0",
+        },
+        text=True,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+    print(process.stderr, end="")
+    assert process.returncode == 0, process.stdout + process.stderr
+    result = json.loads(process.stdout.splitlines()[-1])
+    assert result["records"] == [f"export.http_error {signal}"]
+    assert result["flushes"] == ([True] if reentrant else [])
+    assert result["elapsed"] < 2
+    assert len(otlp_receiver.requests) == (4 if reentrant else 3)
+    assert CANARY not in process.stdout + process.stderr
+    for request in otlp_receiver.requests:
+        assert CANARY.encode() not in request.message.SerializeToString()
+        assert request.message.ByteSize() > 0

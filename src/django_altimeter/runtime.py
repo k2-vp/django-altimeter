@@ -261,7 +261,10 @@ class ProcessRuntime:
         from opentelemetry.sdk.metrics.view import DropAggregation, View
         from opentelemetry.sdk.resources import Resource
 
-        from django_altimeter.exporting import create_metric_exporter
+        from django_altimeter.exporting import (
+            _defer_export_diagnostics,
+            create_metric_exporter,
+        )
         from django_altimeter.metrics import (
             REQUEST_INSTRUMENTS,
             RequestMetrics,
@@ -314,39 +317,39 @@ class ProcessRuntime:
                 ObservableUpDownCounter: AggregationTemporality.CUMULATIVE,
             },
         )
-        reader_type = PeriodicExportingMetricReader
-        if "process" in self.config.integrations:
-            runtime = self
+        pending_diagnostics, report_diagnostics = _defer_export_diagnostics(exporter)
+        runtime = self
 
-            class ProcessMetricReader(PeriodicExportingMetricReader):
-                def _report_process_diagnostics(self) -> None:
-                    if runtime.process_metrics is not None:
-                        runtime.process_metrics.report_pending()
+        class RuntimeMetricReader(PeriodicExportingMetricReader):
+            def _report_diagnostics(self) -> None:
+                if pending_diagnostics:
+                    report_diagnostics()
+                if runtime.process_metrics is not None:
+                    runtime.process_metrics.report_pending()
 
-                def _receive_metrics(
-                    self,
-                    metrics_data: MetricsData,
-                    timeout_millis: float = 10_000,
-                    **kwargs: Any,
-                ) -> None:
-                    # The SDK collection lock is released before this hook;
-                    # super also releases its export lock before diagnostics run.
-                    try:
-                        super()._receive_metrics(
-                            metrics_data, timeout_millis=timeout_millis, **kwargs
-                        )
-                    finally:
-                        self._report_process_diagnostics()
+            def _receive_metrics(
+                self,
+                metrics_data: MetricsData,
+                timeout_millis: float = 10_000,
+                **kwargs: Any,
+            ) -> None:
+                # Collection has already released its lock; super releases the
+                # native export lock before any application log handler runs.
+                try:
+                    super()._receive_metrics(
+                        metrics_data, timeout_millis=timeout_millis, **kwargs
+                    )
+                finally:
+                    self._report_diagnostics()
 
-                def force_flush(self, timeout_millis: float = 10_000) -> bool:
-                    try:
-                        return super().force_flush(timeout_millis=timeout_millis)
-                    finally:
-                        # Empty collections never enter _receive_metrics.
-                        self._report_process_diagnostics()
+            def force_flush(self, timeout_millis: float = 10_000) -> bool:
+                try:
+                    return super().force_flush(timeout_millis=timeout_millis)
+                finally:
+                    # Empty collections never enter _receive_metrics.
+                    self._report_diagnostics()
 
-            reader_type = ProcessMetricReader
-        reader = reader_type(
+        reader = RuntimeMetricReader(
             exporter,
             export_interval_millis=self.config.metric_export_interval_millis,
             export_timeout_millis=self._export_timeout() * 1000,

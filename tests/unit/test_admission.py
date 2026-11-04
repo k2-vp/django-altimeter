@@ -1,6 +1,7 @@
 """Unit evidence for admission before the native SDK batch queues."""
 
 from collections.abc import Iterator
+from dataclasses import replace
 
 import pytest
 from opentelemetry._logs import LogRecord, SeverityNumber
@@ -14,7 +15,12 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from opentelemetry.trace import Link, SpanContext, Status, StatusCode, TraceFlags
 
 from django_altimeter.exporting import BoundedSpanProcessor, bounded_log_processor
-from django_altimeter.privacy import PrivacyPolicy, project_logs, project_traces
+from django_altimeter.privacy import (
+    PrivacyPolicy,
+    normalize_span_name,
+    project_logs,
+    project_traces,
+)
 
 POLICY = PrivacyPolicy(
     span_names=frozenset({"request"}),
@@ -113,6 +119,47 @@ def test_span_bounds_then_projection_preserve_safe_positive(
         }
     assert safe.name == "request"
     assert safe.attributes == {"http.response.status_code": 200}
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [("http.route", "/boards/{board_id}"), ("server.address", "api.example.test")],
+)
+def test_readable_http_names_survive_admission_and_wire_projection(
+    span_pipeline, key, value
+):
+    processor, exporter = span_pipeline
+    policy = replace(POLICY, attribute_values=frozenset({(key, value)}))
+    name = f"DELETE {value}"
+    attributes = {key: value, "server.port": 443}
+    safe = span(name=normalize_span_name(name, policy=policy), attributes=attributes)
+    unsafe = span(
+        name=f"DELETE /raw/{CANARY}", attributes={key: CANARY, "server.port": 65536}
+    )
+    processor.on_end(unsafe)
+    processor.on_end(safe)
+    assert processor.force_flush()
+    records = exporter.get_finished_spans()
+    assert records == (unsafe, safe)
+    assert records[-1].name == name
+    result = project_traces(encode_spans(records), policy=policy)
+    projected = result.resource_spans[0].scope_spans[0].spans
+    assert [item.name for item in projected] == ["DELETE", name]
+    assert {
+        item.key: item.value.string_value
+        for item in projected[-1].attributes
+        if item.key != "server.port"
+    } == {key: value}
+    assert (
+        next(
+            item.value.int_value
+            for item in projected[-1].attributes
+            if item.key == "server.port"
+        )
+        == 443
+    )
+    assert not projected[0].attributes
+    assert CANARY.encode() not in result.SerializeToString()
 
 
 @pytest.fixture

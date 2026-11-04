@@ -327,6 +327,110 @@ def test_early_names_never_derive_free_text_from_sql_or_url(name, expected):
     assert normalize_span_name("SELECT", policy=POLICY) == "SELECT"
 
 
+@pytest.mark.parametrize(
+    "key,value", [("http.route", "/items/{id}"), ("server.address", "api.example.test")]
+)
+@pytest.mark.parametrize("method", ["GET", "POST", "DELETE", "HTTP", "_OTHER"])
+def test_readable_http_names_require_exact_approved_value(key, value, method):
+    policy = replace(POLICY, attribute_values=frozenset({(key, value)}))
+    safe = f"{method} {value}"
+    unsafe = f"{method} {value}/{CANARY}?secret={CANARY}"
+    # Registering an HTTP-shaped name cannot bypass its route/host approval.
+    policy = replace(policy, span_names=policy.span_names | {unsafe})
+    expected = "SPAN" if method == "HTTP" else method
+    assert normalize_span_name(safe, policy=policy) == safe
+    assert normalize_span_name(unsafe, policy=policy) == expected
+    request = ExportTraceServiceRequest()
+    scope = request.resource_spans.add().scope_spans.add()
+    scope.spans.add(name=safe)
+    scope.spans.add(name=unsafe)
+    result = project_traces(request, policy=policy)
+    assert [s.name for s in result.resource_spans[0].scope_spans[0].spans] == [
+        safe,
+        expected,
+    ]
+    assert CANARY.encode() not in result.SerializeToString()
+
+
+@pytest.mark.parametrize(
+    "name,expected",
+    [
+        ("GET /items/{id}/", "GET"),
+        ("GET  /items/{id}", "GET"),
+        ("GET\t/items/{id}", "GET"),
+        ("get /items/{id}", "GET"),
+        ("POST API.EXAMPLE.TEST", "POST"),
+        ("POST https://api.example.test", "POST"),
+        ("PATCH api.example.test:443", "PATCH"),
+        ("GET unapproved.example.test", "GET"),
+        ("CUSTOM /items/{id}", "SPAN"),
+    ],
+)
+def test_readable_http_names_do_not_infer_approval(name, expected):
+    policy = replace(
+        POLICY,
+        attribute_values=POLICY.attribute_values
+        | {("server.address", "api.example.test")},
+    )
+    assert normalize_span_name(name, policy=policy) == expected
+    assert (
+        normalize_span_name("GET api.example.test", policy=policy)
+        == "GET api.example.test"
+    )
+
+
+@pytest.mark.parametrize(
+    "key,value,allowed",
+    [
+        ("server.address", "api.example.test", True),
+        ("server.address", CANARY, False),
+        ("server.address", "API.EXAMPLE.TEST", False),
+        ("server.address", "https://api.example.test", False),
+        ("server.address", ["api.example.test"], False),
+        ("server.port", 1, True),
+        ("server.port", 443, True),
+        ("server.port", 65535, True),
+        ("server.port", 0, False),
+        ("server.port", -1, False),
+        ("server.port", 65536, False),
+        ("server.port", True, False),
+        ("server.port", "443", False),
+        ("server.port", 443.0, False),
+    ],
+)
+def test_server_destination_admission_is_exact_and_bounded(key, value, allowed):
+    policy = replace(
+        POLICY, attribute_values=frozenset({("server.address", "api.example.test")})
+    )
+    assert is_allowed_attribute(key, value, policy=policy) is allowed
+    assert is_allowed_attribute("server.address", "api.example.test", policy=policy)
+    assert is_allowed_attribute("server.port", 443, policy=policy)
+    assert not is_allowed_attribute(key, value, policy=policy, resource=True)
+
+
+def test_server_destination_projection_keeps_approved_host_and_port_only():
+    policy = replace(
+        POLICY, attribute_values=frozenset({("server.address", "api.example.test")})
+    )
+    request = ExportTraceServiceRequest()
+    scope = request.resource_spans.add().scope_spans.add()
+    for host, port in (("api.example.test", 443), (CANARY, 65536)):
+        span = scope.spans.add(name=f"GET {host}")
+        span.attributes.extend(
+            [attribute("server.address", host), attribute("server.port", port)]
+        )
+    result = project_traces(request, policy=policy)
+    safe, rejected = result.resource_spans[0].scope_spans[0].spans
+    assert safe.name == "GET api.example.test"
+    assert list(safe.attributes) == [
+        attribute("server.address", "api.example.test"),
+        attribute("server.port", 443),
+    ]
+    assert rejected.name == "GET"
+    assert not rejected.attributes
+    assert CANARY.encode() not in result.SerializeToString()
+
+
 def test_unknown_database_statement_becomes_db_not_statement_text():
     request = trace_request()
     span = request.resource_spans[0].scope_spans[0].spans[0]

@@ -189,6 +189,7 @@ _STRING_KEYS = frozenset(
         "http.route",
         "http.method",
         "http.request.method",
+        "server.address",
         "http.response.status_class",
         "altimeter.http.outcome",
         "db.system",
@@ -221,7 +222,7 @@ _RECORD_KEYS = (
     _STRING_KEYS
     | _STATUS_KEYS
     | _DURATION_KEYS
-    | {"trace_id", "span_id", "altimeter.overflow"}
+    | {"trace_id", "span_id", "server.port", "altimeter.overflow"}
 )
 _IDENTITY_RECORD_KEYS = _RECORD_KEYS | _IDENTITY_KEYS
 _RESOURCE_ATTRIBUTE_KEYS = _RESOURCE_KEYS | {"process.pid", "altimeter.probe"}
@@ -282,6 +283,8 @@ def _allowed_attribute(
         return _text(value, min(200, limits.max_string_bytes)) and bool(value.strip())
     if key in _STATUS_KEYS:
         return type(value) is int and 100 <= value <= 599
+    if key == "server.port":
+        return type(value) is int and 1 <= value <= 65535
     if key == "altimeter.http.server.concurrent_at_start":
         return type(value) is int and 1 <= value <= 2**63 - 1
     if key in _DURATION_KEYS or key == "altimeter.http.response_ready.duration":
@@ -365,7 +368,7 @@ def normalize_span_name(
     policy: PrivacyPolicy = DEFAULT_POLICY,
     limits: PrivacyLimits = DEFAULT_LIMITS,
 ) -> str:
-    """Reduce a bounded SQL/HTTP name to a constant or an exact registered name.
+    """Keep approved HTTP names; reduce other names to safe or registered tokens.
 
     Never parse SQL literals/comments or URLs. Oversized strings are rejected
     before hashing, splitting or encoding. Unknown names become SPAN.
@@ -386,15 +389,29 @@ def _normalize_span_name(
         if not _text(name, limits.max_string_bytes):
             return "SPAN"
         first = name.split(None, 1)[0].upper() if name.strip() else ""
+        method, separator, destination = name.partition(" ")
+        if (
+            separator
+            and (method in _HTTP_METHODS or method == "HTTP")
+            and (
+                _allowed_attribute("http.route", destination, policy, limits, False)
+                or _allowed_attribute(
+                    "server.address", destination, policy, limits, False
+                )
+            )
+        ):
+            return name
         # SQL's exclusion is unconditional, even if accidentally registered.
         if first in _DB_OPERATIONS:
             return first
         if name.lstrip().startswith(("/*", "--")):
             return "DB"
-        if name in policy.span_names or name in _SAFE_NAMES:
-            return name
         if first in _HTTP_METHODS:
             return first
+        if first == "HTTP" and name != "HTTP":
+            return "SPAN"
+        if name in policy.span_names or name in _SAFE_NAMES:
+            return name
         return "SPAN"
     except Exception:
         return "SPAN"

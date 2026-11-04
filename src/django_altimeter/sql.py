@@ -228,6 +228,18 @@ def _collapse(tokens: list[str]) -> list[str]:
     return result
 
 
+def _top_level_keyword(tokens: list[str], keyword: str) -> int | None:
+    depth = 0
+    for index, token in enumerate(tokens):
+        if token == "(":
+            depth += 1
+        elif token == ")":
+            depth -= 1
+        elif depth == 0 and token.upper() == keyword:
+            return index
+    return None
+
+
 def _summary(tokens: list[str], operation: str) -> str:
     marker = {
         "SELECT": "FROM",
@@ -237,16 +249,10 @@ def _summary(tokens: list[str], operation: str) -> str:
     }.get(operation)
     if marker is None:
         return operation
-    depth = 0
-    start = len(tokens)
-    for index, token in enumerate(tokens):
-        if token == "(":
-            depth += 1
-        elif token == ")":
-            depth -= 1
-        elif depth == 0 and token.upper() == marker:
-            start = index + 1
-            break
+    position = _top_level_keyword(tokens, marker)
+    if position is None:
+        return operation
+    start = position + 1
     parts = []
     while start < len(tokens):
         for name in tokens[start].split("."):
@@ -275,6 +281,16 @@ def _identifier_token(value: str) -> bool:
     return value[0].isalpha() or value[0] in '_"'
 
 
+def _elide_select_list(tokens: list[str]) -> list[str]:
+    if tokens[0].upper() != "SELECT":
+        return tokens
+    position = _top_level_keyword(tokens, "FROM")
+    start = 2 if len(tokens) > 1 and tokens[1].upper() == "DISTINCT" else 1
+    if position is None or position <= start or tokens[start:position] == ["..."]:
+        return tokens
+    return tokens[:start] + ["..."] + tokens[position:]
+
+
 def _render(tokens: list[str], maximum: int) -> str:
     output: list[str] = []
     previous = ""
@@ -300,6 +316,11 @@ def _render(tokens: list[str], maximum: int) -> str:
     joined = "".join(output)
     if len(joined.encode("utf-8")) <= maximum:
         return joined
+    # Keep the target near the start of wide-model queries before applying the
+    # byte cutoff. An already-elided list is unchanged, so this recurses once.
+    elided = _elide_select_list(tokens)
+    if elided is not tokens:
+        return _render(elided, maximum)
     size = 0
     for index, part in enumerate(output):
         size += len(part.encode("utf-8"))

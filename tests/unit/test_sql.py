@@ -366,16 +366,34 @@ def test_verification_cache_byte_limit_and_larger_output_budgets_are_independent
     ) == before
 
 
+@pytest.mark.parametrize("modifier", ["", "DISTINCT "])
+@pytest.mark.parametrize(
+    "expression", ["", 'EXTRACT(YEAR FROM "cart_item"."created"), ']
+)
+def test_wide_select_elides_columns_before_truncating_the_target(modifier, expression):
+    columns = ", ".join(f'"cart_item"."column_{index}"' for index in range(80))
+    query = f'SELECT {modifier}{expression}{columns} FROM "cart_item" WHERE id = %s'
+    result = sanitize(query, 80)
+    assert result == SanitizedQuery(
+        f'SELECT {modifier}... FROM "cart_item" WHERE id = %s',
+        "SELECT cart_item",
+        "SELECT",
+    )
+    assert sanitized_query_text(result.text, max_text_bytes=80) == result
+
+
 def test_all_truncation_points_remain_fixed_points_at_token_boundaries():
     query = (
         'SELECT "café", %s::text, sum(amount) FROM cart_item '
         "WHERE id IN (1, 2, 3) AND value = 'SQL_CANARY'"
     )
     full = sanitize(query).text
+    elided = "SELECT ... FROM cart_item WHERE id IN (?, ...) AND value = ?"
     for maximum in range(1, len(full.encode("utf-8")) + 1):
         result = sanitize_query(query, max_text_bytes=maximum)
         if result is not None:
-            assert full.startswith(result.text)
+            expected = full if maximum == len(full.encode("utf-8")) else elided
+            assert expected.startswith(result.text)
             assert sanitize(result.text, maximum).text == result.text
     assert sanitize_query("SELECT 1", max_text_bytes=0) is None
 

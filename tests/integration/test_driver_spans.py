@@ -236,7 +236,7 @@ class TestReadableQueries:
                 admin.execute("INSERT INTO cart_item VALUES (1)")
             query = "SELECT " + ", ".join(
                 "'SQL_CANARY_long' AS column_" + str(index) for index in range(180)
-            ) + " FROM cart_item"
+            ) + " FROM cart_item WHERE " + " AND ".join(["id = 1"] * 300)
             config = replace(config, limits=replace(
                 config.limits, max_query_text_bytes={maximum},
             ))

@@ -50,7 +50,6 @@ def sanitize(query, maximum=2048):
         "0xAB_CD",
         "TRUE",
         "false",
-        "NULL",
     ],
 )
 def test_every_literal_is_a_placeholder_with_identifiers_preserved(literal):
@@ -108,6 +107,7 @@ def test_expression_lists_and_values_columns_are_not_collapsed():
         ('SELECT 1 FROM "private table"', "SELECT"),
         ('SELECT 1 FROM "a""b"', "SELECT"),
         ('SELECT 1 FROM "a"""', "SELECT"),
+        ('SELECT 1 FROM "SELECT"', "SELECT SELECT"),
         ('SELECT 1 FROM "public.cart_item"', "SELECT"),
         ("SELECT 1 FROM " + "a" * 129, "SELECT"),
         ("SELECT 1 FROM (SELECT 1) AS subquery", "SELECT"),
@@ -145,7 +145,6 @@ def test_summary_uses_only_a_bounded_identifier(query, summary):
         "SELECT 123abc",
         "SELECT 1 */",
         "SELECT \ud800",
-        'SELECT U&"unsupported"',
         "SELECT 'ambiguous\\' SQL_CANARY'",
         "SELECT " + "a" * MAX_QUERY_CHARS,
     ],
@@ -169,6 +168,83 @@ def test_unknown_objects_are_never_adapted_or_scanned():
 
     for query in (Hostile(), HostileString("SELECT 1")):
         assert sanitize_query(query, max_text_bytes=2048) is None
+
+
+def test_unicode_escaped_identifiers_stay_identifiers_without_decoding_values():
+    result = sanitize(
+        'SELECT U&"na\\006de" FROM U&"cart_item" WHERE value = \'secret\''
+    )
+    assert result.text == 'SELECT U&"na\\006de" FROM U&"cart_item" WHERE value = ?'
+    assert result.summary == "SELECT cart_item"
+
+
+@pytest.mark.parametrize(
+    "function", ["EXTRACT(YEAR", "SUBSTRING(value", "TRIM(value", "OVERLAY(value"]
+)
+def test_summary_ignores_from_inside_expressions(function):
+    result = sanitize(
+        f'SELECT {function} FROM "shop_order"."created") AS y FROM "shop_order"'
+    )
+    assert result.summary == "SELECT shop_order"
+
+
+@pytest.mark.parametrize(
+    "keyword",
+    [
+        "WHERE",
+        "AND",
+        "OR",
+        "NOT",
+        "ON",
+        "JOIN",
+        "FROM",
+        "SELECT",
+        "WHEN",
+        "THEN",
+        "ELSE",
+        "BY",
+        "HAVING",
+        "USING",
+        "RETURNING",
+    ],
+)
+def test_parenthesized_keyword_expressions_remain_readable(keyword):
+    assert sanitize(f"SELECT x {keyword}(value = 1)").text == (
+        f"SELECT x {keyword} (value = ?)"
+    )
+    assert sanitize("SELECT count(*) FROM cart_item").text == (
+        "SELECT count(*) FROM cart_item"
+    )
+
+
+def test_null_remains_a_keyword_and_boolean_values_are_removed():
+    assert (
+        sanitize(
+            "SELECT NULL, TRUE FROM cart_item "
+            "WHERE value IS NOT NULL AND enabled = FALSE"
+        ).text
+        == "SELECT NULL, ? FROM cart_item WHERE value IS NOT NULL AND enabled = ?"
+    )
+
+
+def test_parameters_adjacent_to_operators_remain_parameters():
+    assert sanitize("SELECT 1+%s, 2*%(value)s").text == "SELECT ? + %s, ? * %(value)s"
+
+
+def test_cache_admits_many_small_queries_but_does_not_retain_large_queries():
+    from django_altimeter.sql import _sanitize
+
+    _sanitize.cache_clear()
+    for index in range(1024):
+        sanitize(f"SELECT {index}")
+    assert _sanitize.cache_info().currsize == 1024
+    before = _sanitize.cache_info()
+    for index in range(10):
+        result = sanitize_query(
+            "SELECT 1 /* " + "a" * 4096 + str(index) + " */", max_text_bytes=2048
+        )
+        assert result is not None and result.text == "SELECT ?"
+    assert _sanitize.cache_info() == before
 
 
 def test_all_truncation_points_remain_fixed_points_at_token_boundaries():

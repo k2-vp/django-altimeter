@@ -1,9 +1,10 @@
-"""Bounded PostgreSQL query descriptions, independent of driver and privacy policy.
+"""Bounded PostgreSQL descriptions, independent of driver and privacy policy.
 
 This lexer removes values; it neither validates nor executes SQL. Identifiers are
 visible and must never contain application data. Unsupported or ambiguous input
-has no description. At most 128 raw queries of 16,384 characters are retained in
-the process-local LRU cache; nothing is persisted. Never pass adapted parameters.
+has no description. The process-local LRU retains at most 1,024 raw queries, each
+at most 4,096 characters (16 KiB of UTF-8); larger inputs are never cached. The
+input ceiling is 16,384 characters. Nothing is persisted or adapted.
 """
 
 import re
@@ -31,26 +32,60 @@ DB_OPERATIONS = frozenset(
     }
 )
 MAX_QUERY_CHARS = 16_384
-_IDENTIFIER = re.compile(r"[^\W\d][\w$]*", re.UNICODE)
+_MAX_CACHED_QUERY_CHARS = 4096
 _SUMMARY_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_$]*\Z")
-_PARAMETER = re.compile(r"%(?:[sbt%]|\([A-Za-z_][A-Za-z0-9_]*\)[sbt])|\$[0-9]+")
-_DOLLAR_QUOTE = re.compile(r"\$(?:[^\W\d]\w*)?\$", re.UNICODE)
-_STRING_PREFIX = re.compile(r"(?i:E|N|B|X|U&)'")
-_NEWLINE = re.compile(r"[\r\n]")
-_NUMBER = re.compile(
+_PARAMETER = r"%(?:[sbt%]|\([A-Za-z_][A-Za-z0-9_]*\)[sbt])|\$[0-9]+"
+_PARAMETER_TOKEN = re.compile(_PARAMETER)
+_NUMBER = (
     r"(?:0[xX][0-9a-fA-F](?:_?[0-9a-fA-F])*"
     r"|0[oO][0-7](?:_?[0-7])*|0[bB][01](?:_?[01])*"
     r"|(?:[0-9](?:_?[0-9])*(?:\.(?:[0-9](?:_?[0-9])*)?)?"
-    r"|\.[0-9](?:_?[0-9])*)(?:[eE][+-]?[0-9](?:_?[0-9])*)?)"
+    r"|\.[0-9](?:_?[0-9])*)(?:[eE][+-]?[0-9](?:_?[0-9])*)?)(?![\w$])"
 )
-_OPERATORS = frozenset("+-*/<>=~!@#%^&|`?")
-_PAREN_KEYWORDS = frozenset({"IN", "VALUES", "AS", "OVER", "FILTER", "EXISTS"})
-
-
-@dataclass(frozen=True)
-class _Token:
-    text: str
-    kind: str
+_QUOTED_IDENTIFIER = r'(?:[uU]&)?"[^"]*(?:""[^"]*)*"'
+# Every alternative consumes a complete lexical token. The final alternative
+# catches unclosed quotes/comments, nested comments and unsupported characters.
+# Operator matching stops before comments and adjacent DB-API placeholders.
+_LEXER = re.compile(
+    rf"(?:(?P<quoted>{_QUOTED_IDENTIFIER}(?:\.{_QUOTED_IDENTIFIER})*)"
+    r"|(?P<space>[ \t\n\r\f\v]+)"
+    r"|(?P<symbol>\.\.\.|::|:=|[(),;\[\]]|\.(?![0-9]))"
+    r"|(?P<word>(?![eEnNbBxX]'|[uU]&['\"])[^\W\d][\w$]*)"
+    r"|(?P<comment>--[^\r\n]*|/\*(?:[^*/]|/(?!\*)|\*(?!/))*\*/)"
+    r"|(?P<literal>[eE]'(?:''|\\[\s\S]|[^'\\])*'"
+    r"|[uU]&'(?:''|[^'])*'"
+    r"|[nNbBxX]?'(?:''|[^'\\])*'"
+    r"|\$(?P<tag>[^\W\d]\w*|)\$[\s\S]*?\$(?P=tag)\$)"
+    rf"|(?P<parameter>{_PARAMETER})"
+    rf"|(?P<number>{_NUMBER})"
+    r"|(?P<operator>(?:(?!--|/\*|\*/|%[sbt%]|%\()[+\-*/<>=~!@#%^&|\x60?])+)"
+    r"|(?P<invalid>[\s\S]))[ \t\n\r\f\v]*"
+)
+_PAREN_KEYWORDS = frozenset(
+    {
+        "IN",
+        "VALUES",
+        "AS",
+        "OVER",
+        "FILTER",
+        "EXISTS",
+        "WHERE",
+        "AND",
+        "OR",
+        "NOT",
+        "ON",
+        "JOIN",
+        "FROM",
+        "SELECT",
+        "WHEN",
+        "THEN",
+        "ELSE",
+        "BY",
+        "HAVING",
+        "USING",
+        "RETURNING",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -80,31 +115,13 @@ def sanitize_query(query: object, *, max_text_bytes: int) -> SanitizedQuery | No
         or max_text_bytes <= 0
     ):
         return None
-    return _sanitize(query, min(max_text_bytes, MAX_QUERY_CHARS * 4))
+    maximum = min(max_text_bytes, MAX_QUERY_CHARS * 4)
+    if len(query) <= _MAX_CACHED_QUERY_CHARS:
+        return _sanitize(query, maximum)
+    return _describe(query, maximum)
 
 
-def _quoted_end(query: str, start: int, *, escapes: bool = False) -> int | None:
-    quote = query[start]
-    position = start + 1
-    while position < len(query):
-        char = query[position]
-        if char == quote:
-            if position + 1 < len(query) and query[position + 1] == quote:
-                position += 2
-                continue
-            return position + 1
-        if char == "\\" and quote == "'":
-            if escapes:
-                position += 2
-                continue
-            # Without connection settings, ordinary backslash strings have two
-            # possible quote boundaries. Decline rather than guess which applies.
-            return None
-        position += 1
-    return None
-
-
-def _tokens(query: str) -> list[_Token] | None:
+def _tokens(query: str) -> list[str] | None:
     if "\0" in query:
         return None
     try:
@@ -112,164 +129,71 @@ def _tokens(query: str) -> list[_Token] | None:
     except UnicodeEncodeError:
         return None
     tokens = []
-    position = 0
-    while position < len(query):
-        char = query[position]
-        if char in " \t\n\r\f":
-            position += 1
+    for match in _LEXER.finditer(query):
+        kind = match.lastgroup
+        if kind in {"space", "comment"}:
             continue
-        if query.startswith("--", position):
-            newline = _NEWLINE.search(query, position + 2)
-            position = newline.end() if newline else len(query)
-            continue
-        if query.startswith("/*", position):
-            end = query.find("*/", position + 2)
-            if end == -1 or query.find("/*", position + 2, end) != -1:
-                return None
-            position = end + 2
-            continue
-        if query.startswith("*/", position):
+        if kind is None or kind == "invalid":
             return None
-        prefix = _STRING_PREFIX.match(query, position)
-        if char == "'" or prefix:
-            start = position + len(prefix[0]) - 1 if prefix else position
-            # U& strings use ordinary quote doubling, with Unicode escapes that
-            # cannot escape a quote. Treat their backslashes conservatively as E
-            # escapes: this can omit text, but cannot expose their contents.
-            escapes = bool(prefix and prefix[0][0].upper() in {"E", "U"})
-            quote_end = _quoted_end(query, start, escapes=escapes)
-            if quote_end is None:
-                return None
-            tokens.append(_Token("?", "parameter"))
-            position = quote_end
-            continue
-        # Unicode-escaped identifiers require decoding UESCAPE clauses; no guess.
-        if query[position : position + 3].upper() == 'U&"':
-            return None
-        if char == '"':
-            quote_end = _quoted_end(query, position)
-            if quote_end is None:
-                return None
-            tokens.append(_Token(query[position:quote_end], "identifier"))
-            position = quote_end
-            continue
-        dollar = _DOLLAR_QUOTE.match(query, position) if char == "$" else None
-        if dollar:
-            end = query.find(dollar[0], dollar.end())
-            if end == -1:
-                return None
-            tokens.append(_Token("?", "parameter"))
-            position = end + len(dollar[0])
-            continue
-        parameter = _PARAMETER.match(query, position)
-        if parameter:
-            tokens.append(_Token(parameter[0], "parameter"))
-            position = parameter.end()
-            continue
-        number = _NUMBER.match(query, position)
-        if number:
-            position = number.end()
-            if position < len(query) and (
-                query[position].isalnum() or query[position] in "_$"
-            ):
-                return None
-            tokens.append(_Token("?", "parameter"))
-            continue
-        identifier = _IDENTIFIER.match(query, position)
-        if identifier:
-            text = identifier[0]
-            tokens.append(
-                _Token("?", "parameter")
-                if text.upper() in {"TRUE", "FALSE", "NULL"}
-                else _Token(text, "word")
-            )
-            position = identifier.end()
-            continue
-        special = next(
-            (
-                value
-                for value in ("...", "::", ":=")
-                if query.startswith(value, position)
-            ),
-            None,
-        )
-        if special:
-            tokens.append(_Token(special, "symbol"))
-            position += len(special)
-            continue
-        if char in "(),.;[]":
-            tokens.append(_Token(char, "symbol"))
-            position += 1
-            continue
-        if char in _OPERATORS:
-            end = position + 1
-            while end < len(query) and query[end] in _OPERATORS:
-                if query.startswith(("--", "/*", "*/"), end):
-                    break
-                end += 1
-            text = query[position:end]
-            tokens.append(_Token(text, "parameter" if text == "?" else "symbol"))
-            position = end
-            continue
-        return None
+        text = match[kind]
+        if kind in {"literal", "number"} or (
+            kind == "word" and text.upper() in {"TRUE", "FALSE"}
+        ):
+            text = "?"
+        tokens.append(text)
     return tokens
 
 
-def _placeholder_row(tokens: list[_Token], start: int) -> int | None:
+def _placeholder_row(tokens: list[str], start: int) -> int | None:
     """Return the closing parenthesis of a row made only of bind/value markers."""
-    if start >= len(tokens) or tokens[start].text != "(":
+    if start >= len(tokens) or tokens[start] != "(":
         return None
     position = start + 1
-    while position < len(tokens) and tokens[position].kind == "parameter":
+    while position < len(tokens) and (
+        tokens[position] == "?" or _PARAMETER_TOKEN.fullmatch(tokens[position])
+    ):
         position += 1
-        if position < len(tokens) and tokens[position].text == ")":
+        if position < len(tokens) and tokens[position] == ")":
             return position
-        if position >= len(tokens) or tokens[position].text != ",":
+        if position >= len(tokens) or tokens[position] != ",":
             return None
         position += 1
     return None
 
 
-def _collapse(tokens: list[_Token]) -> list[_Token]:
-    result = []
-    position = 0
-    while position < len(tokens):
-        token = tokens[position]
-        result.append(token)
-        position += 1
-        if token.kind != "word" or token.text.upper() not in {"IN", "VALUES"}:
+def _collapse(tokens: list[str]) -> list[str]:
+    result: list[str] = []
+    copied = 0
+    for index, token in enumerate(tokens):
+        if index < copied or token.upper() not in {"IN", "VALUES"}:
             continue
-        end = _placeholder_row(tokens, position)
+        start = index + 1
+        end = _placeholder_row(tokens, start)
         if end is None:
             continue
-        row = tokens[position : end + 1]
-        if token.text.upper() == "IN" and len(row) > 3:
-            result.extend(
-                [
-                    row[0],
-                    row[1],
-                    _Token(",", "symbol"),
-                    _Token("...", "symbol"),
-                    row[-1],
-                ]
-            )
-            position = end + 1
-        elif token.text.upper() == "VALUES":
-            result.extend(row)
-            position = end + 1
-            repeated = False
-            while position < len(tokens) and tokens[position].text == ",":
-                following = _placeholder_row(tokens, position + 1)
-                if following is None or tokens[position + 1 : following + 1] != row:
+        row = tokens[start : end + 1]
+        if token.upper() == "IN" and len(row) > 3:
+            result.extend(tokens[copied:start])
+            result.extend(["(", row[1], ",", "...", ")"])
+            copied = end + 1
+        elif token.upper() == "VALUES":
+            following = end + 1
+            while following < len(tokens) and tokens[following] == ",":
+                row_end = _placeholder_row(tokens, following + 1)
+                if row_end is None or tokens[following + 1 : row_end + 1] != row:
                     break
-                repeated = True
-                position = following + 1
-            if repeated:
-                result.extend([_Token(",", "symbol"), _Token("...", "symbol")])
+                following = row_end + 1
+            if following > end + 1:
+                result.extend(tokens[copied : end + 1])
+                result.extend([",", "..."])
+                copied = following
+    if copied == 0:
+        return tokens
+    result.extend(tokens[copied:])
     return result
 
 
-def _summary(tokens: list[_Token], operation: str) -> str:
+def _summary(tokens: list[str], operation: str) -> str:
     marker = {
         "SELECT": "FROM",
         "DELETE": "FROM",
@@ -278,34 +202,32 @@ def _summary(tokens: list[_Token], operation: str) -> str:
     }.get(operation)
     if marker is None:
         return operation
-    start = next(
-        (
-            index + 1
-            for index, token in enumerate(tokens)
-            if token.kind == "word" and token.text.upper() == marker
-        ),
-        len(tokens),
-    )
+    depth = 0
+    start = len(tokens)
+    for index, token in enumerate(tokens):
+        if token == "(":
+            depth += 1
+        elif token == ")":
+            depth -= 1
+        elif depth == 0 and token.upper() == marker:
+            start = index + 1
+            break
     parts = []
     while start < len(tokens):
-        token = tokens[start]
-        if token.kind not in {"word", "identifier"}:
-            return operation
-        name = (
-            token.text[1:-1].replace('""', '"')
-            if token.kind == "identifier"
-            else token.text
-        )
-        if not _SUMMARY_IDENTIFIER.fullmatch(name) or name.upper() in {
-            "SELECT",
-            "ONLY",
-            "LATERAL",
-            "VALUES",
-        }:
-            return operation
-        parts.append(name)
+        for name in tokens[start].split("."):
+            quoted = name.endswith('"') and (
+                name.startswith('"') or name[:3].upper() == 'U&"'
+            )
+            if quoted:
+                start_quote = 3 if name[:3].upper() == 'U&"' else 1
+                name = name[start_quote:-1].replace('""', '"')
+            if not _SUMMARY_IDENTIFIER.fullmatch(name) or (
+                not quoted and name.upper() in {"SELECT", "ONLY", "LATERAL", "VALUES"}
+            ):
+                return operation
+            parts.append(name)
         start += 1
-        if start >= len(tokens) or tokens[start].text != ".":
+        if start >= len(tokens) or tokens[start] != ".":
             break
         start += 1
         if len(parts) == 2 or start >= len(tokens):
@@ -314,43 +236,56 @@ def _summary(tokens: list[_Token], operation: str) -> str:
     return f"{operation} {target}" if is_query_identifier(target) else operation
 
 
-def _render(tokens: list[_Token], maximum: int) -> str:
+def _identifier_token(value: str) -> bool:
+    return value[0].isalpha() or value[0] in '_"'
+
+
+def _render(tokens: list[str], maximum: int) -> str:
     output: list[str] = []
-    size = 0
     previous = ""
-    previous_kind = ""
-    for token in tokens:
-        text = token.text
+    for text in tokens:
         space = (
             bool(output)
             and text not in {",", ")", "]", ";", "::"}
             and previous not in {"(", "[", "::"}
         )
-        if (text == "." and previous_kind in {"word", "identifier"}) or (
-            previous == "." and token.kind in {"word", "identifier"}
+        if (text == "." and _identifier_token(previous)) or (
+            previous == "." and _identifier_token(text)
         ):
             space = False
-        if text == "(" and previous.upper() not in _PAREN_KEYWORDS:
+        if (
+            text == "("
+            and previous
+            and previous.upper() not in _PAREN_KEYWORDS
+            and _identifier_token(previous)
+        ):
             space = False
-        addition = (" " if space else "") + text
-        size += len(addition.encode("utf-8"))
-        if size > maximum:
-            break
-        output.append(addition)
+        output.append((" " if space else "") + text)
         previous = text
-        previous_kind = token.kind
-    return "".join(output)
+    joined = "".join(output)
+    if len(joined.encode("utf-8")) <= maximum:
+        return joined
+    size = 0
+    for index, part in enumerate(output):
+        size += len(part.encode("utf-8"))
+        if size > maximum:
+            return "".join(output[:index])
+    return joined
 
 
-@lru_cache(maxsize=128)
-def _sanitize(query: str, maximum: int) -> SanitizedQuery | None:
+def _describe(query: str, maximum: int) -> SanitizedQuery | None:
     tokens = _tokens(query)
-    if not tokens or tokens[0].kind != "word":
+    if not tokens:
         return None
-    operation = tokens[0].text.upper()
+    operation = tokens[0].upper()
     if operation not in DB_OPERATIONS:
         return None
     text = _render(_collapse(tokens), maximum)
     return (
         SanitizedQuery(text, _summary(tokens, operation), operation) if text else None
     )
+
+
+@lru_cache(maxsize=1024)
+def _sanitize(query: str, maximum: int) -> SanitizedQuery | None:
+    return _describe(query, maximum)

@@ -2,9 +2,12 @@
 
 This lexer removes values; it neither validates nor executes SQL. Identifiers are
 visible and must never contain application data. Unsupported or ambiguous input
-has no description. The process-local LRU retains at most 1,024 raw queries, each
-at most 4,096 characters (16 KiB of UTF-8); larger inputs are never cached. The
-input ceiling is 16,384 characters. Nothing is persisted or adapted.
+has no description. Process-local LRUs retain up to 1,024 small raw queries
+(4,096 characters each) and 32 large raw queries (16,384 characters each): at
+most 16 MiB and 2 MiB of UTF-8 keys. Cached result text is at most 2,048 bytes
+per entry. A separate 512-entry verification cache holds candidate texts of at most
+2,048 UTF-8 bytes each (1 MiB of keys); it cannot evict raw queries. These are
+payload bounds, excluding Python object overhead. Nothing is persisted/adapted.
 """
 
 import re
@@ -32,9 +35,10 @@ DB_OPERATIONS = frozenset(
     }
 )
 MAX_QUERY_CHARS = 16_384
-_MAX_CACHED_QUERY_CHARS = 4096
+_MAX_SMALL_QUERY_CHARS = 4096
+_MAX_CACHED_TEXT_BYTES = 2048
 _SUMMARY_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_$]*\Z")
-_PARAMETER = r"%(?:[sbt%]|\([A-Za-z_][A-Za-z0-9_]*\)[sbt])|\$[0-9]+"
+_PARAMETER = r"%(?:[sbt%]|\([A-Za-z_][A-Za-z0-9_]*\)[sbt])|\$[0-9]+(?![\w$])"
 _PARAMETER_TOKEN = re.compile(_PARAMETER)
 _NUMBER = (
     r"(?:0[xX][0-9a-fA-F](?:_?[0-9a-fA-F])*"
@@ -116,9 +120,36 @@ def sanitize_query(query: object, *, max_text_bytes: int) -> SanitizedQuery | No
     ):
         return None
     maximum = min(max_text_bytes, MAX_QUERY_CHARS * 4)
-    if len(query) <= _MAX_CACHED_QUERY_CHARS:
+    if maximum > _MAX_CACHED_TEXT_BYTES:
+        return _describe(query, maximum)
+    if len(query) <= _MAX_SMALL_QUERY_CHARS:
         return _sanitize(query, maximum)
-    return _describe(query, maximum)
+    return _sanitize_large(query, maximum)
+
+
+def sanitized_query_text(
+    query: object, *, max_text_bytes: int
+) -> SanitizedQuery | None:
+    """Verify an already-sanitized description without using the raw-query caches."""
+    if (
+        type(query) is not str
+        or not query
+        or len(query) > MAX_QUERY_CHARS
+        or type(max_text_bytes) is not int
+        or max_text_bytes <= 0
+        or len(query) > max_text_bytes
+    ):
+        return None
+    try:
+        size = len(query.encode("utf-8"))
+    except UnicodeEncodeError:
+        return None
+    if size > max_text_bytes:
+        return None
+    maximum = min(max_text_bytes, MAX_QUERY_CHARS * 4)
+    if size <= _MAX_CACHED_TEXT_BYTES:
+        return _verify(query, maximum)
+    return _fixed_point(query, maximum)
 
 
 def _tokens(query: str) -> list[str] | None:
@@ -136,6 +167,10 @@ def _tokens(query: str) -> list[str] | None:
         if kind is None or kind == "invalid":
             return None
         text = match[kind]
+        if kind == "parameter" and text[0] == "$":
+            # Check length before conversion: never parse an unbounded integer.
+            if len(text) > 6 or text[1] == "0" or int(text[1:]) > 65535:
+                return None
         if kind in {"literal", "number"} or (
             kind == "word" and text.upper() in {"TRUE", "FALSE"}
         ):
@@ -289,3 +324,21 @@ def _describe(query: str, maximum: int) -> SanitizedQuery | None:
 @lru_cache(maxsize=1024)
 def _sanitize(query: str, maximum: int) -> SanitizedQuery | None:
     return _describe(query, maximum)
+
+
+@lru_cache(maxsize=32)
+def _sanitize_large(query: str, maximum: int) -> SanitizedQuery | None:
+    return _describe(query, maximum)
+
+
+def _fixed_point(query: str, maximum: int) -> SanitizedQuery | None:
+    result = _describe(query, maximum)
+    if result is None or result.text != query:
+        return None
+    # Reuse the cache key's text instead of retaining an identical string copy.
+    return SanitizedQuery(query, result.summary, result.operation)
+
+
+@lru_cache(maxsize=512)
+def _verify(query: str, maximum: int) -> SanitizedQuery | None:
+    return _fixed_point(query, maximum)

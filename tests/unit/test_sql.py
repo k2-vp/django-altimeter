@@ -11,6 +11,7 @@ from django_altimeter.sql import (
     SanitizedQuery,
     is_query_identifier,
     sanitize_query,
+    sanitized_query_text,
 )
 
 
@@ -73,6 +74,34 @@ def test_bind_placeholders_survive_without_reading_parameters(placeholder):
     assert sanitize(f"SELECT {placeholder} FROM cart_item").text == (
         f"SELECT {placeholder} FROM cart_item"
     )
+
+
+@pytest.mark.parametrize(
+    "parameter",
+    [
+        "$0",
+        "$00",
+        "$01",
+        "$0001",
+        "$65536",
+        "$99999",
+        "$100000",
+        "$4111111111111111",
+        "$" + "9" * 10_000,
+        "$1abc",
+        "$1_0",
+    ],
+)
+def test_numbered_parameters_reject_out_of_range_or_ambiguous_indices(parameter):
+    from django_altimeter.privacy import is_allowed_attribute
+
+    query = f"SELECT {parameter} FROM cart_item"
+    assert sanitize_query(query, max_text_bytes=2048) is None
+    assert not is_allowed_attribute("db.query.text", query)
+    for valid in ("$1", "$9", "$10", "$9999", "$10000", "$65534", "$65535"):
+        positive = f"SELECT {valid} FROM cart_item"
+        assert sanitize(positive).text == positive
+        assert is_allowed_attribute("db.query.text", positive)
 
 
 @pytest.mark.parametrize("count", [2, 3, 10, 100])
@@ -168,6 +197,7 @@ def test_unknown_objects_are_never_adapted_or_scanned():
 
     for query in (Hostile(), HostileString("SELECT 1")):
         assert sanitize_query(query, max_text_bytes=2048) is None
+        assert sanitized_query_text(query, max_text_bytes=2048) is None
 
 
 def test_unicode_escaped_identifiers_stay_identifiers_without_decoding_values():
@@ -231,7 +261,7 @@ def test_parameters_adjacent_to_operators_remain_parameters():
     assert sanitize("SELECT 1+%s, 2*%(value)s").text == "SELECT ? + %s, ? * %(value)s"
 
 
-def test_cache_admits_many_small_queries_but_does_not_retain_large_queries():
+def test_small_query_cache_is_separate_from_large_inputs():
     from django_altimeter.sql import _sanitize
 
     _sanitize.cache_clear()
@@ -245,6 +275,95 @@ def test_cache_admits_many_small_queries_but_does_not_retain_large_queries():
         )
         assert result is not None and result.text == "SELECT ?"
     assert _sanitize.cache_info() == before
+
+
+def test_large_query_cache_reuses_results_and_evicts_at_its_own_bound():
+    queries = [
+        "INSERT INTO cart_item (id, value) VALUES "
+        + ", ".join(["(%s, %s)"] * 1500)
+        + f" /* cache case {index} */"
+        for index in range(33)
+    ]
+    small_query = "SELECT 'SQL_CANARY_small_cache' FROM cart_item"
+    small = sanitize_query(small_query, max_text_bytes=2048)
+    retained = [sanitize_query(query, max_text_bytes=2048) for query in queries[:32]]
+    for query, result in zip(queries[:32], retained, strict=True):
+        assert result is not None
+        assert result.text == "INSERT INTO cart_item(id, value) VALUES (%s, %s), ..."
+        assert sanitize_query(query, max_text_bytes=2048) is result
+    assert sanitize_query(queries[32], max_text_bytes=2048) is not None
+    assert sanitize_query(queries[0], max_text_bytes=2048) is not retained[0]
+    assert sanitize_query(small_query, max_text_bytes=2048) is small
+
+
+def test_privacy_verification_does_not_evict_raw_query_results():
+    from django_altimeter.privacy import is_allowed_attribute
+
+    small_query = "SELECT 'SQL_CANARY_cache_isolation' FROM cart_item"
+    large_query = (
+        "SELECT * FROM cart_item WHERE id IN (" + ", ".join(["%s"] * 3000) + ")"
+    )
+    small = sanitize_query(small_query, max_text_bytes=2048)
+    large = sanitize_query(large_query, max_text_bytes=2048)
+    assert small is not None and large is not None
+    for index in range(1100):
+        assert is_allowed_attribute(
+            "db.query.text", f"SELECT column_{index} FROM cart_item"
+        )
+        assert not is_allowed_attribute("db.query.text", f"SELECT 'SQL_CANARY_{index}'")
+    assert sanitize_query(small_query, max_text_bytes=2048) is small
+    assert sanitize_query(large_query, max_text_bytes=2048) is large
+
+
+def test_verification_cache_is_bounded_and_raw_queries_cannot_evict_it():
+    texts = [f"SELECT verified_column_{index} FROM cart_item" for index in range(513)]
+    retained = [sanitized_query_text(text, max_text_bytes=2048) for text in texts[:512]]
+    for text, result in zip(texts[:512], retained, strict=True):
+        assert result is not None and result.text == text
+        assert sanitized_query_text(text, max_text_bytes=2048) is result
+    for index in range(1100):
+        assert sanitize_query(f"SELECT {index} FROM cart_item", max_text_bytes=2048)
+    assert sanitized_query_text(texts[0], max_text_bytes=2048) is retained[0]
+    # Touching the first entry made the second entry the least recently used.
+    assert sanitized_query_text(texts[512], max_text_bytes=2048) is not None
+    assert sanitized_query_text(texts[1], max_text_bytes=2048) is not retained[1]
+
+
+def test_cached_queries_and_verification_still_obey_each_call_budget():
+    query = "SELECT 'SQL_CANARY_cached_budget' FROM cart_item"
+    full = sanitize_query(query, max_text_bytes=2048)
+    assert full is not None and full.text == "SELECT ? FROM cart_item"
+    assert sanitize_query(query, max_text_bytes=6) == SanitizedQuery(
+        "SELECT", "SELECT cart_item", "SELECT"
+    )
+    verified = sanitized_query_text(full.text, max_text_bytes=2048)
+    assert verified == full
+    assert sanitized_query_text(full.text, max_text_bytes=len(full.text) - 1) is None
+    assert sanitized_query_text(full.text, max_text_bytes=2048) is verified
+
+
+def test_verification_cache_byte_limit_and_larger_output_budgets_are_independent():
+    from django_altimeter.sql import _sanitize, _sanitize_large, _verify
+
+    # Below the character ceiling, but above the verification cache's byte ceiling.
+    text = 'SELECT "' + "é" * 1100 + '"'
+    before = (
+        _sanitize.cache_info(),
+        _sanitize_large.cache_info(),
+        _verify.cache_info(),
+    )
+    first = sanitized_query_text(text, max_text_bytes=3000)
+    second = sanitized_query_text(text, max_text_bytes=3000)
+    assert first is not None and first == second and first is not second
+    assert sanitized_query_text(text, max_text_bytes=2048) is None
+    described = sanitize_query(text, max_text_bytes=3000)
+    assert described is not None and described.text == text
+    assert len(described.text.encode("utf-8")) > 2048
+    assert (
+        _sanitize.cache_info(),
+        _sanitize_large.cache_info(),
+        _verify.cache_info(),
+    ) == before
 
 
 def test_all_truncation_points_remain_fixed_points_at_token_boundaries():

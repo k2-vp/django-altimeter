@@ -113,6 +113,9 @@ def _finish_span(
                 0.0, min(duration, ready_at - state.started_at)
             )
         span.set_attributes(attributes)
+        if state.route is not None:
+            method = state.method if state.method != "_OTHER" else "HTTP"
+            span.update_name(f"{method} {state.route}")
         if failed or outcome == "aborted" or (status is not None and status >= 500):
             span.set_status(_ERROR_STATUS)
         if failed and outcome == "completed":

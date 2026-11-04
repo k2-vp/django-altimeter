@@ -39,6 +39,9 @@ from opentelemetry.proto.metrics.v1.metrics_pb2 import (
 from opentelemetry.proto.resource.v1.resource_pb2 import Resource
 from opentelemetry.proto.trace.v1.trace_pb2 import Span, Status
 
+from django_altimeter.sql import DB_OPERATIONS as _DB_OPERATIONS
+from django_altimeter.sql import is_query_identifier, sanitize_query
+
 if TYPE_CHECKING:
     from google.protobuf.internal.containers import RepeatedCompositeFieldContainer
 
@@ -51,6 +54,7 @@ class PrivacyLimits:
     max_resource_attributes: int = 16
     max_key_bytes: int = 128
     max_string_bytes: int = 256
+    max_query_text_bytes: int = 2048
     max_events: int = 8
     max_links: int = 4
     max_depth: int = 2
@@ -124,26 +128,6 @@ _HTTP_METHODS = frozenset(
         "CONNECT",
         "TRACE",
         "_OTHER",
-    }
-)
-_DB_OPERATIONS = frozenset(
-    {
-        "SELECT",
-        "INSERT",
-        "UPDATE",
-        "DELETE",
-        "CREATE",
-        "ALTER",
-        "DROP",
-        "TRUNCATE",
-        "BEGIN",
-        "COMMIT",
-        "ROLLBACK",
-        "SAVEPOINT",
-        "RELEASE",
-        "EXPLAIN",
-        "WITH",
-        "CALL",
     }
 )
 _REDIS_OPERATIONS = frozenset({"GET", "SET", "DEL", "PING", "PIPELINE"})
@@ -222,7 +206,7 @@ _RECORD_KEYS = (
     _STRING_KEYS
     | _STATUS_KEYS
     | _DURATION_KEYS
-    | {"trace_id", "span_id", "server.port", "altimeter.overflow"}
+    | {"trace_id", "span_id", "server.port", "db.query.text", "altimeter.overflow"}
 )
 _IDENTITY_RECORD_KEYS = _RECORD_KEYS | _IDENTITY_KEYS
 _RESOURCE_ATTRIBUTE_KEYS = _RESOURCE_KEYS | {"process.pid", "altimeter.probe"}
@@ -295,6 +279,11 @@ def _allowed_attribute(
         return False
     if key == "altimeter.overflow":
         return type(value) is bool
+    if key == "db.query.text":
+        if not _text(value, limits.max_query_text_bytes):
+            return False
+        sanitized = sanitize_query(value, max_text_bytes=limits.max_query_text_bytes)
+        return sanitized is not None and sanitized.text == value
     if not _text(value, limits.max_string_bytes):
         return False
     if key in {"trace_id", "span_id"}:
@@ -368,7 +357,7 @@ def normalize_span_name(
     policy: PrivacyPolicy = DEFAULT_POLICY,
     limits: PrivacyLimits = DEFAULT_LIMITS,
 ) -> str:
-    """Keep approved HTTP names; reduce other names to safe or registered tokens.
+    """Keep approved HTTP names and bounded DB summaries, or reduce to safe tokens.
 
     Never parse SQL literals/comments or URLs. Oversized strings are rejected
     before hashing, splitting or encoding. Unknown names become SPAN.
@@ -401,8 +390,11 @@ def _normalize_span_name(
             )
         ):
             return name
-        # SQL's exclusion is unconditional, even if accidentally registered.
+        # Registration cannot admit a query; only a bounded identifier may follow
+        # an exact operation token. The sanitizer owns that identifier grammar.
         if first in _DB_OPERATIONS:
+            if method == first and separator and is_query_identifier(destination):
+                return name
             return first
         if name.lstrip().startswith(("/*", "--")):
             return "DB"

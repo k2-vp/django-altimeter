@@ -16,6 +16,7 @@ from opentelemetry.trace import Link, SpanContext, Status, StatusCode, TraceFlag
 
 from django_altimeter.exporting import BoundedSpanProcessor, bounded_log_processor
 from django_altimeter.privacy import (
+    DEFAULT_LIMITS,
     PrivacyPolicy,
     normalize_span_name,
     project_logs,
@@ -160,6 +161,136 @@ def test_readable_http_names_survive_admission_and_wire_projection(
     )
     assert not projected[0].attributes
     assert CANARY.encode() not in result.SerializeToString()
+
+
+@pytest.mark.parametrize("maximum", [2048, 512])
+def test_query_text_survives_native_span_limits_and_admission(maximum):
+    from opentelemetry.sdk.trace import TracerProvider
+
+    from django_altimeter.exporting import native_span_limits
+
+    limits = replace(DEFAULT_LIMITS, max_query_text_bytes=maximum)
+    query = "SELECT " + "x" * (maximum - len("SELECT "))
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider(
+        resource=Resource({}), span_limits=native_span_limits(limits)
+    )
+    processor = BoundedSpanProcessor(
+        exporter, limits=limits, schedule_delay_millis=60_000
+    )
+    provider.add_span_processor(processor)
+    try:
+        with provider.get_tracer("django_altimeter").start_as_current_span(
+            "SELECT"
+        ) as active:
+            active.set_attribute("db.query.text", query)
+        assert provider.force_flush()
+        records = exporter.get_finished_spans()
+        assert len(records) == 1
+        assert records[0].attributes["db.query.text"] == query
+        result = project_traces(encode_spans(records), limits=limits)
+        projected = result.resource_spans[0].scope_spans[0].spans[0]
+        assert {item.key: item.value.string_value for item in projected.attributes} == {
+            "db.query.text": query
+        }
+    finally:
+        provider.shutdown()
+
+
+@pytest.mark.parametrize(
+    "string_limit,query_limit", [(256, 2048), (16, 64), (256, 128)]
+)
+def test_non_query_native_attribute_keeps_existing_truncation_and_safe_span(
+    string_limit, query_limit
+):
+    from opentelemetry.sdk.trace import TracerProvider
+
+    from django_altimeter.exporting import native_span_limits
+
+    limits = replace(
+        DEFAULT_LIMITS, max_string_bytes=string_limit, max_query_text_bytes=query_limit
+    )
+    truncated = "/" + "x" * (string_limit - 1)
+    policy = replace(
+        POLICY, attribute_values=POLICY.attribute_values | {("http.route", truncated)}
+    )
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider(
+        resource=Resource({}), span_limits=native_span_limits(limits)
+    )
+    processor = BoundedSpanProcessor(
+        exporter, limits=limits, schedule_delay_millis=60_000
+    )
+    provider.add_span_processor(processor)
+    try:
+        with provider.get_tracer("django_altimeter").start_as_current_span(
+            "GET"
+        ) as active:
+            active.set_attribute("http.response.status_code", 200)
+            active.set_attribute("http.route", truncated + CANARY)
+            original = dict(active.attributes)
+        assert provider.force_flush()
+        records = exporter.get_finished_spans()
+        assert len(records) == 1
+        assert records[0].attributes == {
+            "http.response.status_code": 200,
+            "http.route": truncated,
+        }
+        assert processor.local_dropped_records == 0
+        assert dict(active.attributes) == original
+        result = project_traces(encode_spans(records), policy=policy, limits=limits)
+        projected = result.resource_spans[0].scope_spans[0].spans[0]
+        assert projected.name == "GET"
+        assert {item.key for item in projected.attributes} == {
+            "http.response.status_code",
+            "http.route",
+        }
+        assert CANARY.encode() not in result.SerializeToString()
+    finally:
+        provider.shutdown()
+
+
+def test_query_text_admission_uses_per_key_limits(span_pipeline):
+    processor, exporter = span_pipeline
+    query = "SELECT " + "x" * 1017
+    safe = span(attributes={"db.query.text": query})
+    processor.on_end(safe)
+    processor.on_end(span(attributes={"db.query.text": query, "http.route": "x" * 257}))
+    processor.on_end(span(attributes={"db.query.text": "x" * 2049}))
+    control = span()
+    processor.on_end(control)
+    assert processor.force_flush()
+    assert exporter.get_finished_spans() == (safe, control)
+    assert processor.local_dropped_records == 2
+
+
+@pytest.mark.parametrize("surface", ["event", "link", "resource", "log"])
+def test_query_text_extension_does_not_raise_other_surface_limits(
+    span_pipeline, log_pipeline, surface
+):
+    processor, exporter = span_pipeline
+    long_query = "SELECT " + "x" * 300
+    if surface == "log":
+        logs, log_exporter = log_pipeline
+        unsafe = log_record()
+        unsafe.log_record.attributes = {"db.query.text": long_query}
+        logs.on_emit(unsafe)
+        logs.on_emit(log_record())
+        assert logs.force_flush()
+        assert len(log_exporter.get_finished_logs()) == 1
+        assert log_exporter.get_finished_logs()[0].log_record.body == "request.complete"
+        return
+    attributes = {"db.query.text": long_query}
+    changes = {
+        "event": {"events": [Event("request.complete", attributes)]},
+        "link": {"links": [Link(CONTEXT, attributes)]},
+        "resource": {"resource": Resource(attributes)},
+    }[surface]
+    processor.on_end(span(**changes))
+    safe = span()
+    processor.on_end(safe)
+    assert processor.force_flush()
+    assert exporter.get_finished_spans() == (safe,)
 
 
 @pytest.fixture
@@ -616,7 +747,7 @@ def test_native_span_and_log_limits_override_sdk_environment(monkeypatch):
     assert span_limits.max_events == 8
     assert span_limits.max_links == 4
     assert span_limits.max_attribute_length == 256
-    assert span_limits.max_span_attribute_length == 256
+    assert span_limits.max_span_attribute_length == 2048
     assert log_limits.max_log_record_attributes == 32
     assert log_limits.max_log_record_attribute_length == 256
 

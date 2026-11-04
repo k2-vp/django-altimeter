@@ -335,8 +335,6 @@ def test_readable_http_names_require_exact_approved_value(key, value, method):
     policy = replace(POLICY, attribute_values=frozenset({(key, value)}))
     safe = f"{method} {value}"
     unsafe = f"{method} {value}/{CANARY}?secret={CANARY}"
-    # Registering an HTTP-shaped name cannot bypass its route/host approval.
-    policy = replace(policy, span_names=policy.span_names | {unsafe})
     expected = "SPAN" if method == "HTTP" else method
     assert normalize_span_name(safe, policy=policy) == safe
     assert normalize_span_name(unsafe, policy=policy) == expected
@@ -377,6 +375,84 @@ def test_readable_http_names_do_not_infer_approval(name, expected):
         normalize_span_name("GET api.example.test", policy=policy)
         == "GET api.example.test"
     )
+
+
+@pytest.mark.parametrize("name", ["Get profile", "HTTP fetch", "GET profile"])
+def test_registered_http_names_keep_their_exact_spelling(name):
+    policy = replace(POLICY, span_names=POLICY.span_names | {name})
+    assert normalize_span_name(name, policy=policy) == name
+    request = ExportTraceServiceRequest()
+    scope = request.resource_spans.add().scope_spans.add()
+    scope.spans.add(name=name)
+    scope.spans.add(name=f"GET /raw/{CANARY}")
+    result = project_traces(request, policy=policy)
+    assert [span.name for span in result.resource_spans[0].scope_spans[0].spans] == [
+        name,
+        "GET",
+    ]
+    assert CANARY.encode() not in result.SerializeToString()
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["DELETE example.com", "DELETE localhost", "UPDATE customer_4111111111111111"],
+)
+def test_unbound_database_summary_name_does_not_authorize_a_value(name):
+    operation = name.partition(" ")[0]
+    assert normalize_span_name(name) == operation
+    request = ExportTraceServiceRequest()
+    scope = request.resource_spans.add().scope_spans.add()
+    scope.spans.add(name=name)
+    positive = scope.spans.add(name="SELECT cart_item")
+    positive.attributes.append(attribute("db.query.text", "SELECT * FROM cart_item"))
+    result = project_traces(request)
+    assert [span.name for span in result.resource_spans[0].scope_spans[0].spans] == [
+        operation,
+        "SELECT cart_item",
+    ]
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        None,
+        "SELECT * FROM another_table",
+        f"SELECT * FROM cart_item WHERE id = '{CANARY}'",
+        "SELECT  * FROM cart_item",
+    ],
+)
+def test_database_summary_requires_its_own_matching_fixed_point(query):
+    request = ExportTraceServiceRequest()
+    scope = request.resource_spans.add().scope_spans.add()
+    candidate = scope.spans.add(name="SELECT cart_item")
+    if query is not None:
+        candidate.attributes.append(attribute("db.query.text", query))
+    # A sibling, event or link with a valid query cannot authorize this name.
+    candidate.events.add(name="exception").attributes.append(
+        attribute("db.query.text", "SELECT * FROM cart_item")
+    )
+    candidate.links.add(trace_id=TRACE_ID, span_id=SPAN_ID).attributes.append(
+        attribute("db.query.text", "SELECT * FROM cart_item")
+    )
+    positive = scope.spans.add(name="SELECT cart_item")
+    positive.attributes.append(attribute("db.query.text", "SELECT * FROM cart_item"))
+    policy = replace(POLICY, span_names=POLICY.span_names | {"SELECT cart_item"})
+    result = project_traces(request, policy=policy)
+    assert [span.name for span in result.resource_spans[0].scope_spans[0].spans] == [
+        "SELECT",
+        "SELECT cart_item",
+    ]
+    assert CANARY.encode() not in result.SerializeToString()
+
+
+def test_delete_host_still_requires_host_approval_without_a_query():
+    name = "DELETE example.com"
+    policy = replace(
+        POLICY,
+        attribute_values=POLICY.attribute_values | {("server.address", "example.com")},
+    )
+    assert normalize_span_name(name, policy=policy) == name
+    assert normalize_span_name(name) == "DELETE"
 
 
 @pytest.mark.parametrize(
@@ -951,7 +1027,7 @@ def test_query_text_rejects_unknown_objects_without_inspection(kind):
         ("INSERT public.cart_item", "INSERT public.cart_item"),
         ("UPDATE _cart$", "UPDATE _cart$"),
         ("DELETE cart_item", "DELETE cart_item"),
-        ("WITH cart_item", "WITH cart_item"),
+        ("WITH cart_item", "WITH"),
         ("SELECT " + "x" * 128, "SELECT " + "x" * 128),
         ("SELECT " + "x" * 129, "SELECT"),
         ("SELECT 123", "SELECT"),
@@ -971,12 +1047,26 @@ def test_database_summary_names_admit_only_bounded_operation_and_identifier(
     name, expected
 ):
     policy = replace(POLICY, span_names=frozenset({name}))
-    assert normalize_span_name(name, policy=policy) == expected
-    assert normalize_span_name("SELECT cart_item", policy=policy) == "SELECT cart_item"
+    operation, _, target = name.partition(" ")
+    assert normalize_span_name(name, policy=policy) == name.split(None, 1)[0].upper()
+    assert normalize_span_name("SELECT cart_item", policy=policy) == "SELECT"
     request = ExportTraceServiceRequest()
-    request.resource_spans.add().scope_spans.add().spans.add(name=name)
+    scope = request.resource_spans.add().scope_spans.add()
+    candidate = scope.spans.add(name=name)
+    query = {
+        "SELECT": f"SELECT * FROM {target}",
+        "INSERT": f"INSERT INTO {target}",
+        "UPDATE": f"UPDATE {target}",
+        "DELETE": f"DELETE FROM {target}",
+    }.get(operation.upper(), name)
+    candidate.attributes.append(attribute("db.query.text", query))
+    control = scope.spans.add(name="SELECT cart_item")
+    control.attributes.append(attribute("db.query.text", "SELECT * FROM cart_item"))
     result = project_traces(request, policy=policy)
-    assert result.resource_spans[0].scope_spans[0].spans[0].name == expected
+    assert [span.name for span in result.resource_spans[0].scope_spans[0].spans] == [
+        expected,
+        "SELECT cart_item",
+    ]
     assert CANARY.encode() not in result.SerializeToString()
 
 
@@ -999,7 +1089,12 @@ def test_query_text_projection_keeps_fixed_point_and_drops_planted_values():
     result = project_traces(request, policy=POLICY)
     spans = result.resource_spans[0].scope_spans[0].spans
     assert len(spans) == 4
-    assert all(span.name == "SELECT cart_item" for span in spans)
+    assert [span.name for span in spans] == [
+        "SELECT cart_item",
+        "SELECT",
+        "SELECT",
+        "SELECT",
+    ]
     assert list(spans[0].attributes) == [
         attribute("db.query.text", safe),
         attribute("db.operation.name", "SELECT"),

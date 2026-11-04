@@ -24,7 +24,7 @@ from django_altimeter.headers import (
     destination_address,
     outgoing_headers,
 )
-from django_altimeter.privacy import is_allowed_attribute
+from django_altimeter.privacy import _text, is_allowed_attribute
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -175,7 +175,9 @@ def _http_span(
                 host, port = destination
                 current.set_attribute("server.address", host)
                 current.set_attribute("server.port", port)
-                current.update_name(f"{span_name} {host}")
+                readable_name = f"{span_name} {host}"
+                if _text(readable_name, runtime.config.limits.max_string_bytes):
+                    current.update_name(readable_name)
         except Exception:
             _diagnostic("client.destination_failed")
         try:

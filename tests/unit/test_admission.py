@@ -163,6 +163,78 @@ def test_readable_http_names_survive_admission_and_wire_projection(
     assert CANARY.encode() not in result.SerializeToString()
 
 
+@pytest.mark.parametrize(
+    "method,route,maximum,expected",
+    [
+        ("GET", "r" * 252, 256, "GET " + "r" * 252),
+        ("GET", "r" * 253, 256, "GET"),
+        ("OPTIONS", "r" * 249, 256, "OPTIONS"),
+        ("_OTHER", "r" * 252, 256, "HTTP"),
+        ("GET", "é" * 126, 256, "GET " + "é" * 126),
+        ("GET", "é" * 127, 256, "GET"),
+        ("GET", "r" * 60, 64, "GET " + "r" * 60),
+        ("GET", "r" * 61, 64, "GET"),
+    ],
+)
+def test_long_approved_route_keeps_server_span_and_route(
+    method, route, maximum, expected
+):
+    from opentelemetry.context import Context
+    from opentelemetry.sdk.trace import TracerProvider
+
+    from django_altimeter.conf import Config
+    from django_altimeter.exporting import native_span_limits
+    from django_altimeter.http import RequestState, _finish_span, start_server_span
+
+    limits = replace(DEFAULT_LIMITS, max_string_bytes=maximum)
+    policy = replace(
+        POLICY,
+        attribute_values=POLICY.attribute_values
+        | {("http.route", route), ("http.route", "ok")},
+    )
+    exporter = InMemorySpanExporter()
+    processor = BoundedSpanProcessor(exporter, limits=limits)
+    provider = TracerProvider(
+        resource=Resource({}), span_limits=native_span_limits(limits)
+    )
+    provider.add_span_processor(processor)
+    try:
+        for value in (route, "ok"):
+            state = RequestState(
+                started_at=0,
+                method=method,
+                route=value,
+                status=200,
+                config=Config(limits=limits, policy=policy),
+            )
+            active = start_server_span(
+                provider.get_tracer("django_altimeter"), state, Context(), 1
+            )
+            _finish_span(
+                active, state, outcome="completed", duration=1, end_time=2, failed=False
+            )
+        assert provider.force_flush()
+        records = exporter.get_finished_spans()
+        assert len(records) == 2
+        assert processor.local_dropped_records == 0
+        method_name = "HTTP" if method == "_OTHER" else method
+        assert [item.name for item in records] == [expected, f"{method_name} ok"]
+        result = project_traces(encode_spans(records), policy=policy, limits=limits)
+        projected = result.resource_spans[0].scope_spans[0].spans
+        assert len(projected) == 2
+        assert projected[0].name == expected
+        assert (
+            next(
+                item.value.string_value
+                for item in projected[0].attributes
+                if item.key == "http.route"
+            )
+            == route
+        )
+    finally:
+        provider.shutdown()
+
+
 @pytest.mark.parametrize("maximum", [2048, 512])
 def test_query_text_survives_native_span_limits_and_admission(maximum):
     from opentelemetry.sdk.trace import TracerProvider

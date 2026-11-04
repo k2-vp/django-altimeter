@@ -272,9 +272,11 @@ def test_real_gunicorn_names_only_approved_routes(
 
             ROOT_URLCONF = __name__
             MIDDLEWARE = ['django_altimeter.django.RequestMetadataMiddleware']
+            LONG_ROUTE = 'r' * 240 + '/<str:item_id>'
             ALTIMETER = {
                 'EXCLUDED_ROUTES': ['/health/'],
                 'ATTRIBUTE_VALUES': [('http.route', 'approved/<str:item_id>'),
+                                     ('http.route', LONG_ROUTE),
                                      ('http.route', 'health/')],
             }
             def echo(request, item_id=None):
@@ -283,6 +285,7 @@ def test_real_gunicorn_names_only_approved_routes(
                 response['Cache-Control'] = 'private, no-store'
                 return response
             urlpatterns = [path('health/', echo),
+                           path(LONG_ROUTE, echo),
                            path('approved/<str:item_id>', echo),
                            path('unapproved/<str:item_id>', echo)]
             """
@@ -296,6 +299,7 @@ def test_real_gunicorn_names_only_approved_routes(
         ),
         ("POST", "/unapproved/CANARY_RAW_PATH", "POST"),
         ("BREW", "/approved/CANARY_OTHER_PATH", "HTTP approved/<str:item_id>"),
+        ("GET", "/" + "r" * 240 + "/CANARY_LONG_PATH", "GET"),
     )
     with running_server(
         tmp_path / "server",
@@ -317,9 +321,9 @@ def test_real_gunicorn_names_only_approved_routes(
         assert server.request("/CANARY_UNMATCHED")[0] == 404
         assert server.request("/health/")[0] == 200
     spans = _spans(otlp_receiver)
-    assert len(spans) == 4
+    assert len(spans) == 5
     by_trace = {span.trace_id.hex(): span for span in spans}
-    for (method, _, expected), headers in zip(cases, responses, strict=True):
+    for (method, path, expected), headers in zip(cases, responses, strict=True):
         span = by_trace[headers["x-altimeter-trace-id"]]
         assert span.kind == 2
         assert span.name == expected
@@ -327,15 +331,18 @@ def test_real_gunicorn_names_only_approved_routes(
         assert attrs["http.request.method"] == (
             "_OTHER" if method == "BREW" else method
         )
-        assert attrs.get("http.route") == (
-            "approved/<str:item_id>" if " " in expected else None
-        )
+        if "CANARY_LONG_PATH" in path:
+            assert attrs["http.route"] == "r" * 240 + "/<str:item_id>"
+        else:
+            assert attrs.get("http.route") == (
+                "approved/<str:item_id>" if " " in expected else None
+            )
     unmatched = next(
         span for span in spans if _attributes(span)["http.response.status_code"] == 404
     )
     assert unmatched.name == "GET"
     assert "http.route" not in _attributes(unmatched)
-    assert _metric_count(otlp_receiver, "altimeter.http.server.requests") == 4
+    assert _metric_count(otlp_receiver, "altimeter.http.server.requests") == 5
     for request in otlp_receiver.requests:
         assert b"CANARY" not in request.message.SerializeToString()
 

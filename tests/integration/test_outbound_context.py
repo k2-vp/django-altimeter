@@ -84,6 +84,127 @@ def _attributes(span):
 
 class TestReadableDestinations:
     @pytest.mark.parametrize("client", ["requests", "httpx", "httpx-async"])
+    def test_long_approved_host_keeps_span_and_destination(self, otlp_receiver, client):
+        host = "a" * 55 + ".example"
+        bootstrap = _IMPORTS.replace(
+            "assert setup(config).ok",
+            """
+config = replace(config, limits=replace(config.limits, max_string_bytes=64),
+    policy=replace(config.policy, attribute_values=config.policy.attribute_values
+        | {('server.address', os.environ['LONG_HOST'])}))
+assert setup(config).ok
+""",
+        )
+        with HTTPReceiver() as destination:
+            result = _run(
+                otlp_receiver,
+                destination,
+                """
+                import socket, requests, httpx
+                original_resolver = socket.getaddrinfo
+                # Only DNS is substituted; each client still uses a real socket
+                # and HTTP server for the synthetic approved host.
+                def resolve(host, *args, **kwargs):
+                    approved = os.environ['LONG_HOST']
+                    if host in (approved, approved.encode()):
+                        host = '127.0.0.1'
+                    return original_resolver(host, *args, **kwargs)
+                socket.getaddrinfo = resolve
+                origin = os.environ['INTERNAL_ORIGIN']
+                urls = [origin.replace('127.0.0.1', os.environ['LONG_HOST']), origin]
+                urls = [url + '/OUTBOUND_CANARY_secret' for url in urls]
+                async def fetch():
+                    async with httpx.AsyncClient(trust_env=False) as client:
+                        return [(await client.get(url)).text for url in urls]
+                with span('outbound.parent'):
+                    if os.environ['MODE'] == 'requests':
+                        with requests.Session() as client:
+                            client.trust_env = False
+                            bodies = [client.get(url).text for url in urls]
+                    elif os.environ['MODE'] == 'httpx':
+                        with httpx.Client(trust_env=False) as client:
+                            bodies = [client.get(url).text for url in urls]
+                    else:
+                        bodies = asyncio.run(fetch())
+                assert shutdown(timeout=2).completed
+                print(json.dumps(bodies))
+                """,
+                bootstrap=bootstrap,
+                clients="requests,httpx",
+                LONG_HOST=host,
+                MODE=client,
+            )
+            assert result == ["safe-response", "safe-response"]
+            assert [request.path for request in destination.requests] == [
+                f"/{CANARY}"
+            ] * 2
+        children = [span for span in _spans(otlp_receiver) if span.kind == 3]
+        assert len(children) == 2
+        by_host = {_attributes(span)["server.address"]: span for span in children}
+        assert by_host[host].name == "GET"
+        assert by_host["127.0.0.1"].name == "GET 127.0.0.1"
+        assert all(
+            _attributes(span)["server.port"]
+            == int(destination.origin.rsplit(":", 1)[1])
+            for span in children
+        )
+        assert all(
+            CANARY.encode() not in request.message.SerializeToString()
+            for request in otlp_receiver.requests
+        )
+
+    def test_name_projection_keeps_registration_and_requires_own_query(
+        self, otlp_receiver
+    ):
+        bootstrap = _IMPORTS.replace(
+            "assert setup(config).ok",
+            """
+config = replace(config, policy=replace(config.policy,
+    span_names=config.policy.span_names | {'Get profile', 'HTTP fetch'}))
+assert setup(config).ok
+""",
+        )
+        with HTTPReceiver() as destination:
+            result = _run(
+                otlp_receiver,
+                destination,
+                """
+                provider = get_process_runtime().tracer_provider
+                tracer = provider.get_tracer('django_altimeter')
+                cases = [('Get profile', None), ('HTTP fetch', None),
+                    ('DELETE example.com', None),
+                    ('UPDATE customer_4111111111111111', None),
+                    ('SELECT cart_item', 'SELECT * FROM another_table'),
+                    ('SELECT cart_item', "SELECT * FROM cart_item WHERE value = "
+                        "'OUTBOUND_CANARY_secret'"),
+                    ('SELECT cart_item', 'SELECT * FROM cart_item')]
+                for name, query in cases:
+                    with tracer.start_as_current_span(name) as current:
+                        if query is not None:
+                            current.set_attribute('db.query.text', query)
+                assert shutdown(timeout=2).completed
+                print(json.dumps({'count': len(cases)}))
+                """,
+                bootstrap=bootstrap,
+            )
+        assert result == {"count": 7}
+        spans = _spans(otlp_receiver)
+        assert [span.name for span in spans] == [
+            "Get profile",
+            "HTTP fetch",
+            "DELETE",
+            "UPDATE",
+            "SELECT",
+            "SELECT",
+            "SELECT cart_item",
+        ]
+        assert _attributes(spans[-1])["db.query.text"] == "SELECT * FROM cart_item"
+        assert all(
+            CANARY.encode() not in request.message.SerializeToString()
+            for request in otlp_receiver.requests
+        )
+
+    @pytest.mark.parametrize("client", ["requests", "httpx", "httpx-async"])
     @pytest.mark.parametrize("approval", ["internal", "attribute"])
     def test_names_follow_each_approved_host_without_exporting_url_values(
         self, otlp_receiver, client, approval

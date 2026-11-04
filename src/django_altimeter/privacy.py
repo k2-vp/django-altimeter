@@ -40,7 +40,7 @@ from opentelemetry.proto.resource.v1.resource_pb2 import Resource
 from opentelemetry.proto.trace.v1.trace_pb2 import Span, Status
 
 from django_altimeter.sql import DB_OPERATIONS as _DB_OPERATIONS
-from django_altimeter.sql import is_query_identifier, sanitize_query
+from django_altimeter.sql import sanitized_query_text
 
 if TYPE_CHECKING:
     from google.protobuf.internal.containers import RepeatedCompositeFieldContainer
@@ -282,8 +282,10 @@ def _allowed_attribute(
     if key == "db.query.text":
         if not _text(value, limits.max_query_text_bytes):
             return False
-        sanitized = sanitize_query(value, max_text_bytes=limits.max_query_text_bytes)
-        return sanitized is not None and sanitized.text == value
+        return (
+            sanitized_query_text(value, max_text_bytes=limits.max_query_text_bytes)
+            is not None
+        )
     if not _text(value, limits.max_string_bytes):
         return False
     if key in {"trace_id", "span_id"}:
@@ -357,10 +359,11 @@ def normalize_span_name(
     policy: PrivacyPolicy = DEFAULT_POLICY,
     limits: PrivacyLimits = DEFAULT_LIMITS,
 ) -> str:
-    """Keep approved HTTP names and bounded DB summaries, or reduce to safe tokens.
+    """Keep approved HTTP and registered names, or reduce to safe tokens.
 
     Never parse SQL literals/comments or URLs. Oversized strings are rejected
-    before hashing, splitting or encoding. Unknown names become SPAN.
+    before hashing, splitting or encoding. DB summaries require the span's own
+    sanitized query during projection. Unknown names become SPAN.
     """
     try:
         if not is_valid_configuration(policy, limits):
@@ -390,20 +393,16 @@ def _normalize_span_name(
             )
         ):
             return name
-        # Registration cannot admit a query; only a bounded identifier may follow
-        # an exact operation token. The sanitizer owns that identifier grammar.
+        # A name alone cannot prove this is a DB summary rather than a value or
+        # unapproved HTTP DELETE host. Projection checks the span's own query.
         if first in _DB_OPERATIONS:
-            if method == first and separator and is_query_identifier(destination):
-                return name
             return first
         if name.lstrip().startswith(("/*", "--")):
             return "DB"
-        if first in _HTTP_METHODS:
-            return first
-        if first == "HTTP" and name != "HTTP":
-            return "SPAN"
         if name in policy.span_names or name in _SAFE_NAMES:
             return name
+        if first in _HTTP_METHODS:
+            return first
         return "SPAN"
     except Exception:
         return "SPAN"
@@ -498,6 +497,16 @@ def _span(
         server=source.kind == Span.SPAN_KIND_SERVER,
     )
     name = _normalize_span_name(source.name, policy, limits)
+    if name in _DB_OPERATIONS:
+        for item in result.attributes:
+            if item.key == "db.query.text":
+                query = sanitized_query_text(
+                    item.value.string_value,
+                    max_text_bytes=limits.max_query_text_bytes,
+                )
+                if query is not None and query.summary == source.name:
+                    name = query.summary
+                break
     if name == "SPAN" and any(
         _text(a.key, limits.max_key_bytes)
         and a.key

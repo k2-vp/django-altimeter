@@ -491,14 +491,14 @@ print("WORK_RESULT " + json.dumps({
             )
             queries = [span for span in spans if span.name == "reference.query"]
             assert len(queries) == 2
+            query_names = []
             for query in queries:
                 children = [
                     span for span in clients if span.parent_span_id == query.span_id
                 ]
-                assert len(children) == 1 and children[0].name in {
-                    "SELECT",
-                    "SELECT django_content_type",
-                }
+                assert len(children) == 1
+                query_names.append(children[0].name)
+            assert sorted(query_names) == ["SELECT", "SELECT django_content_type"]
             http = [span for span in clients if span.name == "GET 127.0.0.1"]
             assert len(http) == 2
             outgoing = [span for span in spans if span.name == "reference.outgoing"]

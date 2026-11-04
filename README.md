@@ -233,6 +233,9 @@ Use the exact `resolver_match.route` spelling; Ninja's source path
 `/items/{item_id}` resolves to `api/items/<item_id>` under this URL prefix.
 The SERVER span uses the approved route in its name, for example
 `POST api/items/<item_id>` (`HTTP <route>` for an unknown method).
+Renaming requires the full name to fit `ALTIMETER_MAX_STRING_BYTES` (256 UTF-8
+bytes by default). Otherwise, the span keeps its method-only name and still
+records the approved `http.route`.
 Unknown or unapproved routes omit `http.route` and keep the method-only name;
 raw paths, object IDs and query strings never replace the template.
 `EXCLUDED_ROUTES` contains **exact static request paths**, checked at entry
@@ -364,9 +367,11 @@ export ALTIMETER_INTEGRATIONS=wsgi,django
 
 Configure `RequestMetadataMiddleware` before Django builds its handler, as in
 the ASGI example. WSGI uses the same approved-route naming, such as
-`POST api/items/<int:item_id>`; unknown or unapproved routes keep the method-only
-name, and excluded requests produce no server span. Initialize telemetry after
-Django setup in each serving child, before opening database connections or pools.
+`POST api/items/<int:item_id>`, only when the full name fits the string limit.
+An overlong name keeps the method and approved route attribute. Unknown or
+unapproved routes keep the method-only name, and excluded requests produce no
+server span. Initialize telemetry after Django setup in each serving child,
+before opening database connections or pools.
 A child marker makes an accidental preloaded master detectably unsupported.
 In `gunicorn_conf.py`:
 
@@ -478,12 +483,18 @@ and queries the sanitizer cannot safely describe retain the operation name
 (or `DB`) without query text. Bytes and psycopg Composable inputs keep their
 previous operation-only behavior; the sanitizer does not adapt them.
 
-Query text is capped at 2,048 UTF-8 bytes at a token boundary. Lower it with
-`ALTIMETER_MAX_QUERY_TEXT_BYTES`; it cannot be raised. Inputs over 16,384
-characters are rejected before scanning. A bounded LRU cache retains up to 1,024
-raw query strings of at most 4,096 characters each in process memory only;
-longer inputs are processed without caching. Nothing is persisted. Table and
-column identifiers remain visible, so applications must never put user data in them.
+Query text is capped at 2,048 UTF-8 bytes. Lower it with
+`ALTIMETER_MAX_QUERY_TEXT_BYTES`; it cannot be raised. For an oversized `SELECT`
+with a `FROM` target, the sanitizer first replaces the top-level SELECT list
+with `...`, preserving `DISTINCT` and the target, then truncates at a token
+boundary. Inputs over 16,384 characters are rejected before scanning.
+
+Separate LRU caches retain up to 1,024 raw queries of at most 4,096 characters
+and 32 larger raw queries of at most 16,384 characters. A separate 512-entry
+verifier cache retains sanitized text of at most 2,048 UTF-8 bytes; verification
+cannot evict raw queries. These caches use process memory only; nothing is
+persisted. Table and column identifiers remain visible, so applications must
+never put user data in them.
 
 Literal values, parameter values, comments, connection strings, Redis keys,
 arguments and results never become telemetry. SQLCommenter is off and SQL sent
@@ -518,8 +529,10 @@ Requests and synchronous/asynchronous HTTPX observe physical requests, including
 redirect hops. These child spans end when the transport returns response headers;
 later response-body consumption belongs to the surrounding application work.
 Approved destinations use names such as `GET catalog.example`, plus
-`server.address` and the effective integer `server.port`. Hosts in
-`INTERNAL_ORIGINS` are approved automatically. Approve other hosts through
+`server.address` and the effective integer `server.port`. Renaming requires the
+full name to fit the string limit; otherwise the method-only name remains,
+with both approved destination attributes. Hosts in `INTERNAL_ORIGINS` are
+approved automatically. Approve other hosts through
 `ATTRIBUTE_VALUES`; only exact internal origins receive local W3C trace context:
 
 ```python
@@ -1154,10 +1167,12 @@ before batching, separately from the session's per-export drop count. It does
 not count native batch rejection or SDK queue overflow.
 `native_span_limits()` and `native_log_limits()` supply the corresponding SDK
 limits for explicit provider construction. Call `normalize_span_name()` at an
-early instrumentation hook before admission. It accepts approved HTTP
-route/host names and bounded database operation/identifier summaries; other
-SQL/HTTP names reduce to safe operations. Provider construction and application
-integration remain explicit.
+early instrumentation hook before admission. It preserves approved HTTP
+route/host names and registered application names, while SQL names reduce to
+safe operations. Wire projection keeps a database operation/identifier summary
+only when that span's own fixed-point `db.query.text` produces exactly that
+summary. Registration or another record's query text cannot authorize it.
+Provider construction and application integration remain explicit.
 
 Defaults declared in `PrivacyLimits` and enforced by these components:
 

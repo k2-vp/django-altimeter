@@ -724,6 +724,67 @@ def test_outbound_headers_are_local_valid_context_for_exact_origin(url, approved
 
 
 @pytest.mark.parametrize(
+    "url,address",
+    [
+        ("http://INTERNAL.example/path?secret=CANARY", ("internal.example", 80)),
+        ("https://internal.example/path#CANARY", ("internal.example", 443)),
+        ("https://internal.example:8443/", ("internal.example", 8443)),
+        ("http://[2001:0db8::1]:8080/", ("2001:db8::1", 8080)),
+    ],
+)
+def test_destination_address_contains_only_canonical_host_and_effective_port(
+    url, address
+):
+    from django_altimeter.headers import destination_address
+
+    assert destination_address(url) == address
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        None,
+        b"http://internal.example/",
+        "http://internal.example/" + "x" * 2048,
+        "http://CANARY:password@internal.example/",
+        "http://internal.example\\@attacker/",
+        "http://internal.example%2Fattacker/",
+        "http://*.example/",
+        "http://internal.example:0/",
+        "http://internal.example:65536/",
+        "http://internal.example:invalid/",
+        "http://[invalid]/",
+        "http://internal.example/\n",
+        "http://internal.example/\ud800",
+        "ftp://internal.example/",
+        "/relative/path",
+    ],
+)
+def test_destination_address_rejects_unbounded_or_ambiguous_urls(url):
+    from django_altimeter.headers import destination_address
+
+    assert destination_address("http://internal.example/safe") == (
+        "internal.example",
+        80,
+    )
+    assert destination_address(url) is None
+
+
+def test_destination_address_never_calls_user_accessors():
+    from django_altimeter.headers import destination_address
+
+    class HostileURL(str):
+        def __len__(self):
+            raise AssertionError("Must not inspect user strings")
+
+        def __str__(self):
+            raise AssertionError("Must not format user strings")
+
+    assert destination_address(HostileURL("http://internal.example/")) is None
+    assert destination_address("http://internal.example/") == ("internal.example", 80)
+
+
+@pytest.mark.parametrize(
     "trusted, configured",
     [(True, True), (False, True), (True, False), (1, True), (True, 1), ("true", True)],
 )

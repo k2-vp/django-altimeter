@@ -790,6 +790,23 @@ def validate_config(config: Config) -> ConfigResult:
                 raise _Invalid("config.invalid_settings")
         _strings(config.excluded_routes)
         _internal_origins(config.internal_origins)
+        from django_altimeter.headers import destination_address
+
+        host_values = frozenset(
+            ("server.address", address[0])
+            for origin in config.internal_origins
+            if (address := destination_address(origin)) is not None
+        )
+        if not host_values <= config.policy.attribute_values:
+            config = replace(
+                config,
+                policy=replace(
+                    config.policy,
+                    attribute_values=_pairs(
+                        config.policy.attribute_values | host_values
+                    ),
+                ),
+            )
         _origins(config.frontend_origins)
         _callback(config.identity_resolver)
         _callback(config.log_scrubber)

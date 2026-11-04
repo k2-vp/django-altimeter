@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import textwrap
+from base64 import b64decode
 
 import pytest
 from support.http_receiver import HTTPReceiver
@@ -81,6 +82,134 @@ def _attributes(span):
     }
 
 
+class TestReadableDestinations:
+    @pytest.mark.parametrize("client", ["requests", "httpx", "httpx-async"])
+    @pytest.mark.parametrize("approval", ["internal", "attribute"])
+    def test_names_follow_each_approved_host_without_exporting_url_values(
+        self, otlp_receiver, client, approval
+    ):
+        bootstrap = _IMPORTS.replace(
+            "assert setup(config).ok",
+            """
+if os.environ['APPROVAL'] == 'attribute':
+    config = replace(config, internal_origins=frozenset(),
+        policy=replace(config.policy,
+            attribute_values=frozenset({('server.address', '127.0.0.1')})))
+assert setup(config).ok
+""",
+        )
+        with HTTPReceiver() as approved, HTTPReceiver() as unapproved:
+            outside_origin = unapproved.origin.replace("127.0.0.1", "localhost")
+            approved.respond()
+            approved.respond()
+            approved.respond(
+                status=302,
+                headers={"Location": outside_origin + f"/redirect/{CANARY}?q={CANARY}"},
+            )
+            result = _run(
+                otlp_receiver,
+                approved,
+                """
+                import requests, httpx
+                origin = os.environ['INTERNAL_ORIGIN']
+                suffix = '/OUTBOUND_CANARY_secret?q=OUTBOUND_CANARY_secret'
+                urls = [origin + suffix,
+                        os.environ['EXTERNAL_ORIGIN'] + suffix,
+                        origin.replace('://',
+                            '://OUTBOUND_CANARY_secret:OUTBOUND_CANARY_secret@')
+                            + suffix,
+                        origin + '/redirect-start']
+                def synchronous():
+                    if os.environ['CLIENT_API'] == 'requests':
+                        with requests.Session() as client:
+                            client.trust_env = False
+                            return [client.get(url, timeout=2).text for url in urls]
+                    with httpx.Client(follow_redirects=True, trust_env=False) as client:
+                        return [client.get(url, timeout=2).text for url in urls]
+                async def asynchronous():
+                    async with httpx.AsyncClient(
+                            follow_redirects=True, trust_env=False) as client:
+                        return [(await client.get(url, timeout=2)).text for url in urls]
+                with span('outbound.parent'):
+                    bodies = (asyncio.run(asynchronous())
+                              if os.environ['CLIENT_API'] == 'httpx-async'
+                              else synchronous())
+                assert shutdown().completed
+                print(json.dumps(bodies))
+                """,
+                clients="requests" if client == "requests" else "httpx",
+                bootstrap=bootstrap,
+                APPROVAL=approval,
+                CLIENT_API=client,
+                EXTERNAL_ORIGIN=outside_origin,
+            )
+            assert result == ["safe-response"] * 4
+            assert len(approved.requests) == 3 and len(unapproved.requests) == 2
+            suffix = f"/{CANARY}?q={CANARY}"
+            assert [request.path for request in approved.requests] == [
+                suffix,
+                suffix,
+                "/redirect-start",
+            ]
+            assert [request.path for request in unapproved.requests] == [
+                suffix,
+                f"/redirect{suffix}",
+            ]
+            userinfo_headers = {
+                key.lower(): value for key, value in approved.requests[1].headers
+            }
+            authorization = userinfo_headers["authorization"]
+            assert b64decode(authorization.removeprefix("Basic ")).decode() == (
+                f"{CANARY}:{CANARY}"
+            )
+            spans = _spans(otlp_receiver)
+            parent = next(item for item in spans if item.name == "outbound.parent")
+            children = sorted(
+                (item for item in spans if item.kind == 3),
+                key=lambda item: item.start_time_unix_nano,
+            )
+            assert len(children) == 5
+            assert all(item.parent_span_id == parent.span_id for item in children)
+            assert all(item.trace_id == parent.trace_id for item in children)
+            assert [item.name for item in children] == [
+                "GET 127.0.0.1",
+                "GET",
+                "GET",
+                "GET 127.0.0.1",
+                "GET",
+            ]
+            port = int(approved.origin.rsplit(":", 1)[1])
+            for index, child in enumerate(children):
+                expected = {
+                    "http.request.method": "GET",
+                    "http.response.status_code": 302 if index == 3 else 200,
+                }
+                if index in {0, 3}:
+                    expected.update(
+                        {"server.address": "127.0.0.1", "server.port": port}
+                    )
+                assert _attributes(child) == expected
+            for request, child in zip(
+                approved.requests, (children[0], children[2], children[3]), strict=True
+            ):
+                headers = {key.lower(): value for key, value in request.headers}
+                if approval == "internal" and request is not approved.requests[1]:
+                    assert headers["traceparent"] == (
+                        f"00-{child.trace_id.hex()}-{child.span_id.hex()}-01"
+                    )
+                else:
+                    assert "traceparent" not in headers
+            assert all(
+                "traceparent" not in {key.lower() for key, _ in request.headers}
+                for request in unapproved.requests
+            )
+            assert all(
+                CANARY.encode() not in request.message.SerializeToString()
+                and authorization.encode() not in request.message.SerializeToString()
+                for request in otlp_receiver.requests
+            )
+
+
 class TestStandalonePropagation:
     @pytest.mark.parametrize("client", ["requests", "httpx", "httpx-async"])
     def test_http_safe_child_and_exact_origin(self, otlp_receiver, client):
@@ -153,7 +282,7 @@ class TestStandalonePropagation:
                     & headers.keys()
                 )
             assert all(
-                item.name == "GET"
+                item.name == "GET 127.0.0.1"
                 and _attributes(item)["http.response.status_code"] == 200
                 for item in children
             )
@@ -1039,9 +1168,22 @@ class TestASGIPropagation:
                     value.split("-")[1] for value in parents
                 }
                 assert all(
-                    item.name == "GET"
+                    item.name == "GET 127.0.0.1"
                     and _attributes(item)["http.response.status_code"] == 200
                     for item in children
+                )
+                assert all(
+                    _attributes(item)["server.address"] == "127.0.0.1"
+                    for item in children
+                )
+                assert sorted(
+                    _attributes(item)["server.port"] for item in children
+                ) == (
+                    sorted(
+                        int(receiver.origin.rsplit(":", 1)[1])
+                        for receiver in (internal, external)
+                        for _ in range(2)
+                    )
                 )
             metric_count = sum(
                 point.as_int
@@ -1202,6 +1344,17 @@ class TestWSGIPropagation:
                         <= root.end_time_unix_nano
                     )
                     assert _attributes(child)["http.response.status_code"] == 200
+                    assert child.name == "GET 127.0.0.1"
+                    assert _attributes(child)["server.address"] == "127.0.0.1"
+                assert sorted(
+                    _attributes(item)["server.port"] for item in children
+                ) == (
+                    sorted(
+                        int(receiver.origin.rsplit(":", 1)[1])
+                        for receiver in (internal, external)
+                        for _ in range(4)
+                    )
+                )
                 for parent in parents:
                     child = by_id[bytes.fromhex(parent.split("-")[2])]
                     assert (

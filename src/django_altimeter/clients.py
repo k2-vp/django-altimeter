@@ -19,7 +19,11 @@ from opentelemetry import context, trace
 from opentelemetry.trace import Span, Status, StatusCode
 
 from django_altimeter.context import client_span, get_correlation
-from django_altimeter.headers import OUTBOUND_CONTEXT_HEADERS, outgoing_headers
+from django_altimeter.headers import (
+    OUTBOUND_CONTEXT_HEADERS,
+    destination_address,
+    outgoing_headers,
+)
 from django_altimeter.privacy import is_allowed_attribute
 
 if TYPE_CHECKING:
@@ -158,9 +162,22 @@ def _http_span(
             _diagnostic("client.headers_failed")
         yield None
         return
-    with client_span(
-        "HTTP" if name == "_OTHER" else name, attributes={"http.request.method": name}
-    ) as current:
+    span_name = "HTTP" if name == "_OTHER" else name
+    with client_span(span_name, attributes={"http.request.method": name}) as current:
+        try:
+            destination = destination_address(url)
+            if destination is not None and is_allowed_attribute(
+                "server.address",
+                destination[0],
+                policy=runtime.config.policy,
+                limits=runtime.config.limits,
+            ):
+                host, port = destination
+                current.set_attribute("server.address", host)
+                current.set_attribute("server.port", port)
+                current.update_name(f"{span_name} {host}")
+        except Exception:
+            _diagnostic("client.destination_failed")
         try:
             _apply_headers(carrier, url, runtime, True)
         except Exception:

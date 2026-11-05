@@ -291,7 +291,9 @@ OUTBOUND_CONTEXT_HEADERS = frozenset(
 )
 
 
-def _destination_origin(value: object, *, origin_only: bool = False) -> str | None:
+def _destination_parts(
+    value: object, *, origin_only: bool = False
+) -> tuple[str, str, int] | None:
     from urllib.parse import urlsplit
 
     if type(value) is not str or len(value) > 2048 or not value.isascii():
@@ -318,10 +320,27 @@ def _destination_origin(value: object, *, origin_only: bool = False) -> str | No
         if ":" in host:
             from ipaddress import IPv6Address
 
-            host = f"[{IPv6Address(host).compressed}]"
-        return f"{parsed.scheme}://{host}:{port}"
+            host = IPv6Address(host).compressed
+        return parsed.scheme, host, port
     except (ValueError, UnicodeError):
         return None
+
+
+def _destination_origin(value: object, *, origin_only: bool = False) -> str | None:
+    destination = _destination_parts(value, origin_only=origin_only)
+    if destination is None:
+        return None
+    scheme, host, port = destination
+    authority = f"[{host}]" if ":" in host else host
+    return f"{scheme}://{authority}:{port}"
+
+
+def destination_address(value: object) -> tuple[str, int] | None:
+    """Return only a bounded canonical host and port; never retain URL values."""
+    destination = _destination_parts(value)
+    if destination is None:
+        return None
+    return destination[1], destination[2]
 
 
 def normalize_internal_origin(value: object) -> str | None:

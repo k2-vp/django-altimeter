@@ -141,9 +141,11 @@ only your own project, never another agent's. Use a shell exit trap or an
 
 ## Privacy and safety
 
-- Export by allow-list only. Never export SQL text or parameters, raw paths or
-  query strings, bodies, cookies, auth headers, task arguments or results,
-  exception messages or locals, or unknown structured fields.
+- Export by allow-list only. Export SQL query text only after every literal
+  value, parameter value and comment is removed; literal and parameter values
+  are never exported. Never export raw paths or query strings, bodies, cookies,
+  auth headers, task arguments or results, exception messages or locals, or
+  unknown structured fields.
 - Bound memory before batching. Reject oversized values by bounded traversal;
   never scan or encode unbounded user data to find out it is too large.
 - Never put credentials in resources, logs or displayed configuration. Never

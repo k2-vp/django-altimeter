@@ -938,6 +938,102 @@ def asgi_wheel(tmp_path_factory):
     return install_wheel(tmp_path_factory.mktemp("asgi-wheel"))
 
 
+def test_real_uvicorn_names_only_approved_routes(
+    otlp_receiver: OTLPReceiver, asgi_wheel, tmp_path
+) -> None:
+    from support.uvicorn_server import ROOT, running_server
+
+    (tmp_path / "named_routes.py").write_text(
+        textwrap.dedent(
+            """
+            import os, sys
+            sys.path.insert(0, os.environ['DJANGO_REFERENCE_PATH'])
+            from altimeter_reference.settings import *
+            from altimeter_reference.asgi import create_application
+            from django.http import JsonResponse
+            from django.urls import path
+
+            ROOT_URLCONF = __name__
+            MIDDLEWARE = ['django_altimeter.django.RequestMetadataMiddleware']
+            LONG_ROUTE = 'r' * 240 + '/<str:item_id>'
+            ALTIMETER = {
+                'EXCLUDED_ROUTES': ['/health/'],
+                'ATTRIBUTE_VALUES': [('http.route', 'approved/<str:item_id>'),
+                                     ('http.route', LONG_ROUTE),
+                                     ('http.route', 'health/')],
+            }
+            def echo(request, item_id=None):
+                response = JsonResponse({'ok': True, 'path': request.path,
+                                         'method': request.method})
+                response['Cache-Control'] = 'private, no-store'
+                return response
+            urlpatterns = [path('health/', echo),
+                           path(LONG_ROUTE, echo),
+                           path('approved/<str:item_id>', echo),
+                           path('unapproved/<str:item_id>', echo)]
+            """
+        )
+    )
+    cases = (
+        (
+            "POST",
+            "/approved/CANARY_RAW_PATH?CANARY_QUERY=secret",
+            "POST approved/<str:item_id>",
+        ),
+        ("POST", "/unapproved/CANARY_RAW_PATH", "POST"),
+        ("BREW", "/approved/CANARY_OTHER_PATH", "HTTP approved/<str:item_id>"),
+        ("GET", "/" + "r" * 240 + "/CANARY_LONG_PATH", "GET"),
+    )
+    with running_server(
+        tmp_path / "server",
+        wheel=asgi_wheel,
+        receiver=otlp_receiver,
+        extra_env={
+            "REFERENCE_PATH": str(tmp_path),
+            "REFERENCE_FACTORY": "named_routes:create_application",
+            "DJANGO_REFERENCE_PATH": str(ROOT / "reference"),
+            "DJANGO_SETTINGS_MODULE": "named_routes",
+        },
+    ) as server:
+        responses = []
+        for method, path, _ in cases:
+            status, headers, body = server.request(path, method=method)
+            assert status == 200
+            assert json.loads(body) == {
+                "ok": True,
+                "path": path.partition("?")[0],
+                "method": method,
+            }
+            responses.append(headers)
+        assert server.request("/CANARY_UNMATCHED")[0] == 404
+        assert server.request("/health/")[0] == 200
+    spans = _spans(otlp_receiver)
+    assert len(spans) == 5
+    by_trace = {span.trace_id.hex(): span for span in spans}
+    for (method, path, expected), headers in zip(cases, responses, strict=True):
+        span = by_trace[headers["x-altimeter-trace-id"]]
+        assert span.kind == 2
+        assert span.name == expected
+        attrs = _attributes(span)
+        assert attrs["http.request.method"] == (
+            "_OTHER" if method == "BREW" else method
+        )
+        if "CANARY_LONG_PATH" in path:
+            assert attrs["http.route"] == "r" * 240 + "/<str:item_id>"
+        else:
+            assert attrs.get("http.route") == (
+                "approved/<str:item_id>" if " " in expected else None
+            )
+    unmatched = next(
+        span for span in spans if _attributes(span)["http.response.status_code"] == 404
+    )
+    assert unmatched.name == "GET"
+    assert "http.route" not in _attributes(unmatched)
+    assert _metric_count(otlp_receiver, "altimeter.http.server.requests") == 5
+    for request in otlp_receiver.requests:
+        assert b"CANARY" not in request.message.SerializeToString()
+
+
 def test_real_uvicorn_ninja_observes_resolved_and_unmatched_requests_once(
     otlp_receiver: OTLPReceiver, asgi_wheel, tmp_path
 ) -> None:
@@ -1442,7 +1538,7 @@ def test_real_uvicorn_server_span_has_complete_bounded_attributes(
         assert type(ready) is float
         assert 0 <= ready <= duration + 1e-9
         assert attributes == expected
-        assert span.name == "GET"
+        assert span.name == (f"GET {route}" if route is not None else "GET")
         assert span.kind == 2
         assert span.status.code == (2 if status == 500 else 0)
         assert not span.parent_span_id

@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 from opentelemetry.trace import Span, SpanKind, Status, StatusCode
 
 from django_altimeter.conf import Config
+from django_altimeter.privacy import DEFAULT_LIMITS, _text
 
 if TYPE_CHECKING:
     from opentelemetry.context import Context
@@ -113,6 +114,12 @@ def _finish_span(
                 0.0, min(duration, ready_at - state.started_at)
             )
         span.set_attributes(attributes)
+        if state.route is not None:
+            method = state.method if state.method != "_OTHER" else "HTTP"
+            name = f"{method} {state.route}"
+            limits = state.config.limits if state.config is not None else DEFAULT_LIMITS
+            if _text(name, limits.max_string_bytes):
+                span.update_name(name)
         if failed or outcome == "aborted" or (status is not None and status >= 500):
             span.set_status(_ERROR_STATUS)
         if failed and outcome == "completed":

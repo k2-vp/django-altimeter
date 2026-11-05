@@ -828,3 +828,77 @@ def test_internal_origins_reject_ambiguous_authority_and_non_origin_parts(origin
     assert result.codes == ("config.invalid_origin",)
     valid = parsed()
     assert not validate_config(replace(valid, internal_origins=frozenset({origin}))).ok
+
+
+@pytest.mark.parametrize("source", ["settings", "direct"])
+@pytest.mark.parametrize(
+    "origin,host",
+    [
+        ("http://inventory:8080", "inventory"),
+        ("https://CATALOG.example", "catalog.example"),
+        ("http://[2001:0db8::1]:8080", "2001:db8::1"),
+    ],
+)
+def test_internal_origin_hosts_are_approved_without_approving_other_hosts(
+    source, origin, host
+):
+    if source == "settings":
+        result = load_config(
+            environ=enabled_env(), values={"INTERNAL_ORIGINS": [origin]}
+        )
+    else:
+        result = validate_config(
+            replace(parsed(), internal_origins=frozenset({origin}))
+        )
+    assert result.ok, result.codes
+    config = result.config
+    assert ("server.address", host) in config.policy.attribute_values
+    assert (
+        "server.address",
+        "unapproved.example",
+    ) not in config.policy.attribute_values
+    assert config.internal_origins == frozenset({origin})
+    assert validate_config(config).config == config
+
+
+def test_explicit_host_approval_does_not_add_a_propagation_origin():
+    from django_altimeter.context import Correlation
+    from django_altimeter.headers import outgoing_headers
+
+    config = parsed(values={"ATTRIBUTE_VALUES": [("server.address", "api.example")]})
+    assert ("server.address", "api.example") in config.policy.attribute_values
+    assert config.internal_origins == frozenset()
+    assert (
+        outgoing_headers(
+            "https://api.example/safe",
+            internal_origins=config.internal_origins,
+            correlation=Correlation("1" * 32, "2" * 16, 1),
+            owned_tracing=True,
+        )
+        == {}
+    )
+
+
+def test_internal_origin_approvals_keep_runtime_configuration_checks_idempotent():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+from django_altimeter.conf import Config, SignalConfig
+from django_altimeter.runtime import setup, shutdown, validate_runtime
+config = Config(enabled=True, service_name='client-test',
+    deployment_environment='test', release='v1',
+    traces=SignalConfig(True, 'http://127.0.0.1:1/v1/traces', destination='collector'),
+    internal_origins=frozenset({'http://internal.example'}))
+assert setup(config).ok
+assert validate_runtime(config) == ()
+assert setup(config).ok
+assert shutdown().completed
+""",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr

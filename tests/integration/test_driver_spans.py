@@ -91,6 +91,214 @@ def database_url():
         yield services.postgres_dsn
 
 
+class TestReadableQueries:
+    def test_expression_from_and_null_keep_target_and_query_shape(
+        self, otlp_receiver, database_url
+    ):
+        run = _run(
+            otlp_receiver,
+            database_url,
+            """
+            with psycopg.connect(DSN) as admin:
+                admin.execute("CREATE TABLE cart_item (id integer, value text)")
+                admin.execute("INSERT INTO cart_item VALUES (1, %s)", (CANARY,))
+            query = (
+                "SELECT EXTRACT(YEAR FROM DATE '2026-11-04'), "
+                "substring(value FROM 1 FOR 3) FROM cart_item "
+                "WHERE(value IS NOT NULL AND id=1+%s)"
+            )
+            assert setup(config).ok
+            with span("driver.parent"):
+                with psycopg.connect(DSN) as connection:
+                    row = connection.execute(query, (0,)).fetchone()
+            assert shutdown().completed
+            print(json.dumps({"values_reached": row == (2026, "SQL")}))
+            """,
+        )
+        assert run.result == {"values_reached": True}
+        (child,) = [item for item in run.spans if item.kind == 3]
+        assert child.name == "SELECT cart_item"
+        assert _attributes(child)["db.query.text"] == (
+            "SELECT EXTRACT(YEAR FROM DATE ?), substring(value FROM ? FOR ?) "
+            "FROM cart_item WHERE (value IS NOT NULL AND id = ? + %s)"
+        )
+
+    @pytest.mark.parametrize(
+        "path", ["sync", "async", "pool", "async_pool", "orm", "async_orm"]
+    )
+    def test_query_text_names_target_and_removes_values(
+        self, path, otlp_receiver, database_url
+    ):
+        run = _run(
+            otlp_receiver,
+            database_url,
+            f"""
+            with psycopg.connect(DSN) as admin:
+                admin.execute("CREATE TABLE cart_item (id integer, value text)")
+                admin.execute("INSERT INTO cart_item VALUES (1, %s)", (CANARY,))
+            query = (
+                "SELECT current_query(), value, 'SQL_CANARY_literal', "
+                "$$SQL_CANARY_dollar$$, E'SQL_CANARY_escape', 9284712635 "
+                "FROM cart_item /* SQL_CANARY_block */ "
+                "WHERE value = %s -- SQL_CANARY_line\\n"
+            )
+            if {path!r} in ("orm", "async_orm"):
+                import django
+                from django.conf import settings
+                from psycopg.conninfo import conninfo_to_dict
+                options = conninfo_to_dict(DSN)
+                settings.configure(DATABASES={{"default": {{
+                    "ENGINE": "django.db.backends.postgresql",
+                    "NAME": options["dbname"], "USER": options["user"],
+                    "HOST": options["host"], "PORT": options["port"],
+                }}}}, INSTALLED_APPS=[])
+                django.setup()
+                from django.db import models, connections
+                class CartItem(models.Model):
+                    value = models.TextField()
+                    class Meta:
+                        app_label = "driver"
+                        db_table = "cart_item"
+            assert setup(config).ok
+            async def asynchronous():
+                if {path!r} == "async_orm":
+                    item = await CartItem.objects.aget(value=CANARY)
+                    return [(item.value,)]
+                if {path!r} == "async":
+                    async with await psycopg.AsyncConnection.connect(DSN) as connection:
+                        cursor = await connection.execute(query, (CANARY,))
+                        return await cursor.fetchone()
+                async with AsyncConnectionPool(
+                    DSN, min_size=1, max_size=1, open=False,
+                ) as pool:
+                    await pool.wait()
+                    async with pool.connection() as connection:
+                        cursor = await connection.execute(query, (CANARY,))
+                        return await cursor.fetchone()
+            with span("driver.parent"):
+                if {path!r} in ("orm", "async_orm"):
+                    if {path!r} == "async_orm":
+                        row = asyncio.run(asynchronous())
+                    else:
+                        row = list(
+                            CartItem.objects.filter(value=CANARY).values_list("value")
+                        )
+                    reached = row == [(CANARY,)]
+                    connections.close_all()
+                else:
+                    if {path!r} in ("async", "async_pool"):
+                        row = asyncio.run(asynchronous())
+                    elif {path!r} == "pool":
+                        with ConnectionPool(DSN, min_size=1, max_size=1) as pool:
+                            pool.wait()
+                            with pool.connection() as connection:
+                                row = connection.execute(query, (CANARY,)).fetchone()
+                    else:
+                        with psycopg.connect(DSN) as connection:
+                            row = connection.execute(query, (CANARY,)).fetchone()
+                    reached = (
+                        row[0] == query.replace("%s", "$1")
+                        and row[1:] == (
+                            CANARY, "SQL_CANARY_literal", "SQL_CANARY_dollar",
+                            "SQL_CANARY_escape", 9284712635,
+                        )
+                    )
+            assert shutdown().completed
+            print(json.dumps({{"reached_postgres": reached}}))
+            """,
+        )
+        assert run.result == {"reached_postgres": True}
+        children = [item for item in run.spans if item.kind == 3]
+        (child,) = [item for item in children if item.name == "SELECT cart_item"]
+        text = _attributes(child)["db.query.text"]
+        assert "cart_item" in text and "%s" in text
+        assert _attributes(child)["db.operation.name"] == "SELECT"
+        if path not in {"orm", "async_orm"}:
+            assert text == (
+                "SELECT current_query(), value, ?, ?, ?, ? "
+                "FROM cart_item WHERE value = %s"
+            )
+        assert b"9284712635" not in b"".join(
+            request.message.SerializeToString() for request in otlp_receiver.requests
+        )
+
+    @pytest.mark.parametrize("maximum", [80, 2048])
+    def test_query_text_budget_survives_sdk_and_wire(
+        self, maximum, otlp_receiver, database_url
+    ):
+        run = _run(
+            otlp_receiver,
+            database_url,
+            f"""
+            from django_altimeter.sql import sanitize_query
+            with psycopg.connect(DSN) as admin:
+                admin.execute("CREATE TABLE cart_item (id integer)")
+                admin.execute("INSERT INTO cart_item VALUES (1)")
+            query = "SELECT " + ", ".join(
+                "'SQL_CANARY_long' AS column_" + str(index) for index in range(180)
+            ) + " FROM cart_item WHERE " + " AND ".join(["id = 1"] * 300)
+            config = replace(config, limits=replace(
+                config.limits, max_query_text_bytes={maximum},
+            ))
+            assert setup(config).ok
+            with span("driver.parent"):
+                with psycopg.connect(DSN) as connection:
+                    row = connection.execute(query).fetchone()
+            assert shutdown().completed
+            expected = sanitize_query(query, max_text_bytes={maximum})
+            print(json.dumps({{"values_reached": row == ("SQL_CANARY_long",) * 180,
+                              "expected": expected.text}}))
+            """,
+        )
+        assert run.result["values_reached"] is True
+        (child,) = [item for item in run.spans if item.kind == 3]
+        assert child.name == "SELECT cart_item"
+        text = _attributes(child)["db.query.text"]
+        assert text == run.result["expected"]
+        assert maximum - 24 <= len(text.encode("utf-8")) <= maximum
+
+    @pytest.mark.parametrize("shape", ["bytes", "nested_comment", "backslash", "zero"])
+    def test_declined_description_preserves_operation_and_execution(
+        self, shape, otlp_receiver, database_url
+    ):
+        run = _run(
+            otlp_receiver,
+            database_url,
+            f"""
+            query = "SELECT current_query(), 'SQL_CANARY_literal', %s::text"
+            literal = "SQL_CANARY_literal"
+            if {shape!r} == "bytes":
+                query = query.encode()
+            elif {shape!r} == "nested_comment":
+                query += " /* SQL_CANARY_outer /* SQL_CANARY_inner */ */"
+            elif {shape!r} == "backslash":
+                literal = "SQL_CANARY_literal\\\\suffix"
+                query = "SELECT current_query(), '" + literal + "', %s::text"
+            else:
+                config = replace(config, limits=replace(
+                    config.limits, max_query_text_bytes=0,
+                ))
+            expected = query.decode() if isinstance(query, bytes) else query
+            assert setup(config).ok
+            with span("driver.parent"):
+                with psycopg.connect(DSN) as connection:
+                    row = connection.execute(query, (CANARY,)).fetchone()
+            assert shutdown().completed
+            print(json.dumps({{
+                "query_unchanged": row[0] == expected.replace("%s", "$1"),
+                "values_unchanged": row[1:] == (literal, CANARY),
+            }}))
+            """,
+        )
+        assert run.result == {"query_unchanged": True, "values_unchanged": True}
+        (child,) = [item for item in run.spans if item.kind == 3]
+        assert child.name == "SELECT"
+        assert _attributes(child) == {
+            "db.system.name": "postgresql",
+            "db.operation.name": "SELECT",
+        }
+
+
 class TestStandaloneDrivers:
     @pytest.mark.parametrize("path", ["module", "class", "async", "pool", "async_pool"])
     def test_safe_child_preserves_sql_and_result(
@@ -147,7 +355,9 @@ class TestStandaloneDrivers:
         assert child.parent_span_id == parent.span_id
         assert _attributes(child)["db.system.name"] == "postgresql"
         assert _attributes(child)["db.operation.name"] == "SELECT"
-        assert "db.query.text" not in _attributes(child)
+        assert _attributes(child)["db.query.text"] == (
+            "SELECT current_query(), ?::text, %s::text"
+        )
         assert "db.statement" not in _attributes(child)
 
     def test_pre_setup_connection_is_not_adopted(self, otlp_receiver, database_url):
@@ -171,7 +381,12 @@ class TestStandaloneDrivers:
 
     @pytest.mark.parametrize(
         "query_kind,operation",
-        [("bytes", "SELECT"), ("comment", "DB"), ("large", "DB"), ("composed", "DB")],
+        [
+            ("bytes", "SELECT"),
+            ("comment", "SELECT"),
+            ("large", "DB"),
+            ("composed", "DB"),
+        ],
     )
     def test_bounded_names_never_format_or_change_queries(
         self, query_kind, operation, otlp_receiver, database_url
@@ -217,6 +432,11 @@ class TestStandaloneDrivers:
         assert _attributes(child) == {
             "db.system.name": "postgresql",
             "db.operation.name": operation,
+            **(
+                {"db.query.text": "SELECT current_query(), ?::text, %s::text"}
+                if query_kind == "comment"
+                else {}
+            ),
         }
 
     def test_repeated_concurrent_setup_and_install_export_once(
@@ -403,11 +623,13 @@ print("WORK_RESULT " + json.dumps(result))
         (query,) = [item for item in spans if item.name == "reference.query"]
         (driver,) = [item for item in spans if item.parent_span_id == query.span_id]
         assert query.parent_span_id == parent.span_id
-        assert driver.kind == 3 and driver.name == "SELECT"
+        assert driver.kind == 3 and driver.name == "SELECT django_content_type"
         assert driver.trace_id == query.trace_id == parent.trace_id
         assert _attributes(driver) == {
             "db.system.name": "postgresql",
             "db.operation.name": "SELECT",
+            "db.query.text": 'SELECT COUNT(*) AS "__count" FROM "django_content_type" '
+            'WHERE "django_content_type"."app_label" = %s',
         }
         _assert_safe_wire(otlp_receiver)
 
@@ -507,7 +729,10 @@ print("WORK_RESULT " + json.dumps(result))
         assert run.result == {"consumed": [0, 1, 2], "rows": True}
         (parent,) = [item for item in run.spans if item.name == "driver.parent"]
         children = [item for item in run.spans if item.kind == 3]
-        assert sorted(item.name for item in children) == ["INSERT", "SELECT"]
+        assert sorted(item.name for item in children) == [
+            "INSERT invocation_values",
+            "SELECT invocation_values",
+        ]
         assert all(item.parent_span_id == parent.span_id for item in children)
         assert all(item.trace_id == parent.trace_id for item in children)
 
@@ -664,6 +889,7 @@ print("WORK_RESULT " + json.dumps({"codes": result.codes, "answer": answer}))
             == {
                 "db.system.name": "postgresql",
                 "db.operation.name": "SELECT",
+                "db.query.text": "SELECT nextval(?), ?::text, %s::text",
             }
             for item in children
         )
@@ -708,8 +934,6 @@ def _assert_safe_wire(receiver):
             b"private-row-canary",
             b"sql-value-canary",
             b"sql-comment-canary",
-            b"django_content_type",
-            b"pg_sleep",
         )
     )
 
@@ -789,8 +1013,8 @@ class TestWSGIDriverFlow:
                 assert sorted(item.name for item in clients) == [
                     "DB",
                     "DB",
-                    "GET",
-                    "GET",
+                    "GET 127.0.0.1",
+                    "GET 127.0.0.1",
                     "SELECT",
                 ]
                 assert sorted(
@@ -872,6 +1096,7 @@ class TestWSGIDriverFlow:
                 assert _attributes(driver) == {
                     "db.system.name": "postgresql",
                     "db.operation.name": "SELECT",
+                    "db.query.text": "SELECT current_query(), %s::text",
                 }
                 assert (
                     parent.start_time_unix_nano
@@ -932,12 +1157,25 @@ class TestASGIDriverFlow:
             assert _attributes(server_span)["http.route"] == f"work/{route}"
             (query,) = [item for item in spans if item.name == "reference.query"]
             (driver,) = [item for item in spans if item.parent_span_id == query.span_id]
-            assert driver.kind == 3 and driver.name == "SELECT"
+            expected_name = (
+                "SELECT" if route == "direct" else "SELECT django_content_type"
+            )
+            assert driver.kind == 3 and driver.name == expected_name
             assert driver.trace_id == query.trace_id == server_span.trace_id
             assert query.parent_span_id == server_span.span_id
             assert _attributes(driver) == {
                 "db.system.name": "postgresql",
                 "db.operation.name": "SELECT",
+                "db.query.text": (
+                    "SELECT current_query(), %s::text"
+                    if route == "direct"
+                    else "SELECT app_label, model FROM django_content_type, "
+                    "pg_sleep(?) "
+                    "WHERE app_label = %s ORDER BY model"
+                    if route == "rows"
+                    else 'SELECT COUNT(*) AS "__count" FROM "django_content_type" '
+                    'WHERE "django_content_type"."app_label" = %s'
+                ),
             }
             assert query.start_time_unix_nano <= driver.start_time_unix_nano
             assert driver.end_time_unix_nano <= query.end_time_unix_nano

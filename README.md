@@ -231,10 +231,16 @@ ALTIMETER = {
 
 Use the exact `resolver_match.route` spelling; Ninja's source path
 `/items/{item_id}` resolves to `api/items/<item_id>` under this URL prefix.
-Unknown or unapproved routes omit `http.route`; raw paths, object IDs and query
-strings never replace it. `EXCLUDED_ROUTES` contains **exact static request
-paths**, checked at entry before creating any span or metric. It accepts no
-route templates, wildcards, or regular expressions.
+The SERVER span uses the approved route in its name, for example
+`POST api/items/<item_id>` (`HTTP <route>` for an unknown method).
+Renaming requires the full name to fit `ALTIMETER_MAX_STRING_BYTES` (256 UTF-8
+bytes by default). Otherwise, the span keeps its method-only name and still
+records the approved `http.route`.
+Unknown or unapproved routes omit `http.route` and keep the method-only name;
+raw paths, object IDs and query strings never replace the template.
+`EXCLUDED_ROUTES` contains **exact static request paths**, checked at entry
+before creating any span or metric. It accepts no route templates, wildcards,
+or regular expressions.
 When Altimeter owns tracing, child spans inside an excluded request inherit a
 local unsampled context instead of creating orphan traces. Foreign tracing
 remains unchanged. WSGI applies this during application and iterable operations;
@@ -360,9 +366,14 @@ export ALTIMETER_INTEGRATIONS=wsgi,django
 ```
 
 Configure `RequestMetadataMiddleware` before Django builds its handler, as in
-the ASGI example. Initialize telemetry after Django setup in each serving
-child, before opening database connections or pools. A child marker makes an
-accidental preloaded master detectably unsupported. In `gunicorn_conf.py`:
+the ASGI example. WSGI uses the same approved-route naming, such as
+`POST api/items/<int:item_id>`, only when the full name fits the string limit.
+An overlong name keeps the method and approved route attribute. Unknown or
+unapproved routes keep the method-only name, and excluded requests produce no
+server span. Initialize telemetry after Django setup in each serving child,
+before opening database connections or pools.
+A child marker makes an accidental preloaded master detectably unsupported.
+In `gunicorn_conf.py`:
 
 ```python
 import os
@@ -464,11 +475,31 @@ existing pool members, are not adopted. New pool members created through
 produce fixed setup gap codes and leave the application running. Repeated setup
 does not add another observation around the same operation.
 
-Driver spans use bounded operation names such as `SELECT` or the fallback `DB`.
-SQL text, comments, parameters, connection strings, Redis keys, arguments and
-results never become telemetry. SQLCommenter is off and SQL sent to the database
-is unchanged. Redis commands and pipelines get local child spans; no trace
-context is added to Redis commands.
+Successful Postgres queries get summary names such as `SELECT cart_item` and
+sanitized SQL in `db.query.text`. Literal values become `?`, comments are removed,
+and bind placeholders remain without their values. Placeholder-only `IN` lists
+and repeated `VALUES` rows collapse to a stable shape. Failed queries
+and queries the sanitizer cannot safely describe retain the operation name
+(or `DB`) without query text. Bytes and psycopg Composable inputs keep their
+previous operation-only behavior; the sanitizer does not adapt them.
+
+Query text is capped at 2,048 UTF-8 bytes. Lower it with
+`ALTIMETER_MAX_QUERY_TEXT_BYTES`; it cannot be raised. For an oversized `SELECT`
+with a `FROM` target, the sanitizer first replaces the top-level SELECT list
+with `...`, preserving `DISTINCT` and the target, then truncates at a token
+boundary. Inputs over 16,384 characters are rejected before scanning.
+
+Separate LRU caches retain up to 1,024 raw queries of at most 4,096 characters
+and 32 larger raw queries of at most 16,384 characters. A separate 512-entry
+verifier cache retains sanitized text of at most 2,048 UTF-8 bytes; verification
+cannot evict raw queries. These caches use process memory only; nothing is
+persisted. Table and column identifiers remain visible, so applications must
+never put user data in them.
+
+Literal values, parameter values, comments, connection strings, Redis keys,
+arguments and results never become telemetry. SQLCommenter is off and SQL sent
+to the database is unchanged. Redis spans remain command-only; no trace context
+is added to Redis commands.
 
 Failed or cancelled work marks its recorded child span as an error, including
 async cancellation. The original exception propagates unchanged; normal
@@ -497,14 +528,26 @@ Serialization spans cover the serializer call, not client receipt of the body.
 Requests and synchronous/asynchronous HTTPX observe physical requests, including
 redirect hops. These child spans end when the transport returns response headers;
 later response-body consumption belongs to the surrounding application work.
-Only exact operator-declared internal origins receive local W3C trace context:
+Approved destinations use names such as `GET catalog.example`, plus
+`server.address` and the effective integer `server.port`. Renaming requires the
+full name to fit the string limit; otherwise the method-only name remains,
+with both approved destination attributes. Hosts in `INTERNAL_ORIGINS` are
+approved automatically. Approve other hosts through
+`ATTRIBUTE_VALUES`; only exact internal origins receive local W3C trace context:
 
 ```python
 ALTIMETER = {
     "SPAN_NAMES": ("records.materialize", "records.serialize"),
     "INTERNAL_ORIGINS": ("https://catalog.example", "http://inventory:8080"),
+    "ATTRIBUTE_VALUES": (("server.address", "api.partner.example"),),
 }
 ```
+
+Use lowercase hostnames; IPv6 addresses use compressed spelling without brackets.
+Host approval applies across ports and schemes and does not authorize
+`traceparent` propagation. Each redirect hop checks its own destination.
+Unapproved hosts and URLs rejected by the bounded parser, including userinfo
+URLs, keep method-only names without destination attributes.
 
 Origins consist of scheme, host and optional port; HTTP and HTTPS are allowed.
 Userinfo, paths, queries and wildcards are rejected. Public ingress headers do
@@ -1082,11 +1125,21 @@ and log messages require exact approved values. Fixed HTTP/DB enums, bounded
 status/duration values, and valid trace/span correlation IDs can survive beside
 removed unsafe fields.
 
-Raw paths and queries, SQL text and parameters, bodies, cookies, authentication
-headers, task arguments/results, exception prose/locals, and unknown structured
-fields are excluded. Status descriptions and stack traces are removed. Metrics
-require exact scope/instrument pairs; exemplar filtered attributes are removed
-while native trace/span IDs can remain. The identity resolver may supply only
+Request-work projection includes these keys:
+
+| Key | Allowed value |
+| --- | --- |
+| `http.route`, `server.address` | Exact approved route template or host |
+| `server.port` | Integer from 1 to 65,535 |
+| `db.system.name`, `db.operation.name` | Fixed database system and operation names |
+| `db.query.text` | Bounded sanitized SQL, unchanged by a second sanitizer pass; excluded from resources and metric dimensions |
+
+Raw paths and queries, unsanitized SQL, literal and parameter values, comments,
+bodies, cookies, authentication headers, task arguments/results, exception
+prose/locals, and unknown structured fields are excluded. Status descriptions
+and stack traces are removed. Metrics require exact scope/instrument pairs;
+exemplar filtered attributes are removed while native trace/span IDs can remain.
+The identity resolver may supply only
 `posthogDistinctId` and `altimeter.tenant_id` as nonblank strings of at most
 200 UTF-8 bytes, also respecting a smaller configured string limit. These fields
 are confined to span/log records; resources, metrics, exemplars, events, and
@@ -1114,9 +1167,12 @@ before batching, separately from the session's per-export drop count. It does
 not count native batch rejection or SDK queue overflow.
 `native_span_limits()` and `native_log_limits()` supply the corresponding SDK
 limits for explicit provider construction. Call `normalize_span_name()` at an
-early instrumentation hook to reduce SQL/HTTP names to approved operations
-before admission. Provider construction and application integration remain
-explicit.
+early instrumentation hook before admission. It preserves approved HTTP
+route/host names and registered application names, while SQL names reduce to
+safe operations. Wire projection keeps a database operation/identifier summary
+only when that span's own fixed-point `db.query.text` produces exactly that
+summary. Registration or another record's query text cannot authorize it.
+Provider construction and application integration remain explicit.
 
 Defaults declared in `PrivacyLimits` and enforced by these components:
 
@@ -1127,7 +1183,8 @@ Defaults declared in `PrivacyLimits` and enforced by these components:
 | Record, event, or link attributes | 32 |
 | Resource attributes | 16 |
 | Attribute key | 128 UTF-8 bytes |
-| Allowed string, name, or log body string | 256 UTF-8 bytes |
+| Ordinary string, name, or log body string | 256 UTF-8 bytes |
+| Sanitized span `db.query.text` (`max_query_text_bytes`) | 2,048 UTF-8 bytes; may only be lowered |
 | Span events / links | 8 / 4 |
 | Admitted retained-record payload estimate | 16 KiB |
 | Projected record protobuf | 16 KiB |

@@ -5,6 +5,7 @@ import os
 import socket
 import struct
 import subprocess
+import textwrap
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from http.client import HTTPConnection, IncompleteRead
@@ -257,6 +258,95 @@ def protocol_wheel(tmp_path_factory):
     return install_wheel(tmp_path_factory.mktemp("wsgi-protocol-wheel"))
 
 
+def test_real_gunicorn_names_only_approved_routes(
+    tmp_path, protocol_wheel, otlp_receiver
+):
+    from support.gunicorn_server import running_server
+
+    (tmp_path / "named_routes.py").write_text(
+        textwrap.dedent(
+            """
+            from altimeter_reference.settings import *
+            from django.http import JsonResponse
+            from django.urls import path
+
+            ROOT_URLCONF = __name__
+            MIDDLEWARE = ['django_altimeter.django.RequestMetadataMiddleware']
+            LONG_ROUTE = 'r' * 240 + '/<str:item_id>'
+            ALTIMETER = {
+                'EXCLUDED_ROUTES': ['/health/'],
+                'ATTRIBUTE_VALUES': [('http.route', 'approved/<str:item_id>'),
+                                     ('http.route', LONG_ROUTE),
+                                     ('http.route', 'health/')],
+            }
+            def echo(request, item_id=None):
+                response = JsonResponse({'ok': True, 'path': request.path,
+                                         'method': request.method})
+                response['Cache-Control'] = 'private, no-store'
+                return response
+            urlpatterns = [path('health/', echo),
+                           path(LONG_ROUTE, echo),
+                           path('approved/<str:item_id>', echo),
+                           path('unapproved/<str:item_id>', echo)]
+            """
+        )
+    )
+    cases = (
+        (
+            "POST",
+            "/approved/CANARY_RAW_PATH?CANARY_QUERY=secret",
+            "POST approved/<str:item_id>",
+        ),
+        ("POST", "/unapproved/CANARY_RAW_PATH", "POST"),
+        ("BREW", "/approved/CANARY_OTHER_PATH", "HTTP approved/<str:item_id>"),
+        ("GET", "/" + "r" * 240 + "/CANARY_LONG_PATH", "GET"),
+    )
+    with running_server(
+        tmp_path / "server",
+        wheel=protocol_wheel,
+        receiver=otlp_receiver,
+        module_path=tmp_path,
+        extra_env={"DJANGO_SETTINGS_MODULE": "named_routes"},
+    ) as server:
+        responses = []
+        for method, path, _ in cases:
+            status, headers, body = server.request(path, method=method)
+            assert status == 200
+            assert json.loads(body) == {
+                "ok": True,
+                "path": path.partition("?")[0],
+                "method": method,
+            }
+            responses.append(headers)
+        assert server.request("/CANARY_UNMATCHED")[0] == 404
+        assert server.request("/health/")[0] == 200
+    spans = _spans(otlp_receiver)
+    assert len(spans) == 5
+    by_trace = {span.trace_id.hex(): span for span in spans}
+    for (method, path, expected), headers in zip(cases, responses, strict=True):
+        span = by_trace[headers["x-altimeter-trace-id"]]
+        assert span.kind == 2
+        assert span.name == expected
+        attrs = _attributes(span)
+        assert attrs["http.request.method"] == (
+            "_OTHER" if method == "BREW" else method
+        )
+        if "CANARY_LONG_PATH" in path:
+            assert attrs["http.route"] == "r" * 240 + "/<str:item_id>"
+        else:
+            assert attrs.get("http.route") == (
+                "approved/<str:item_id>" if " " in expected else None
+            )
+    unmatched = next(
+        span for span in spans if _attributes(span)["http.response.status_code"] == 404
+    )
+    assert unmatched.name == "GET"
+    assert "http.route" not in _attributes(unmatched)
+    assert _metric_count(otlp_receiver, "altimeter.http.server.requests") == 5
+    for request in otlp_receiver.requests:
+        assert b"CANARY" not in request.message.SerializeToString()
+
+
 @contextmanager
 def _server(tmp_path, wheel, receiver, mode, **extra):
     from support.gunicorn_server import running_server
@@ -333,7 +423,7 @@ def test_real_gunicorn_preserves_response_and_scopes_each_operation(
     if mode == "enabled":
         assert len(spans) == 1
         span = spans[0]
-        assert span.kind == 2 and span.name == "GET"
+        assert span.kind == 2 and span.name == f"GET {path}"
         attrs = _attributes(span)
         assert attrs["http.route"] == path
         assert attrs["http.response.status_code"] == status

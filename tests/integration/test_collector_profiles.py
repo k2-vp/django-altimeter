@@ -361,7 +361,11 @@ def test_controlled_lock_wait_beside_real_driver_trace_and_process_writer(
         for span in scope.spans
     ]
     parents = [span for span in spans if span.name == "collector.wait"]
-    queries = [span for span in spans if span.name == "SELECT" and span.kind == 3]
+    queries = [
+        span
+        for span in spans
+        if span.name == "SELECT collector_lock" and span.kind == 3
+    ]
     assert len(parents) == len(queries) == 1
     assert queries[0].parent_span_id == parents[0].span_id
     assert (

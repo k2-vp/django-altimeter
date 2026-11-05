@@ -1,6 +1,7 @@
 """Unit evidence for admission before the native SDK batch queues."""
 
 from collections.abc import Iterator
+from dataclasses import replace
 
 import pytest
 from opentelemetry._logs import LogRecord, SeverityNumber
@@ -14,7 +15,13 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from opentelemetry.trace import Link, SpanContext, Status, StatusCode, TraceFlags
 
 from django_altimeter.exporting import BoundedSpanProcessor, bounded_log_processor
-from django_altimeter.privacy import PrivacyPolicy, project_logs, project_traces
+from django_altimeter.privacy import (
+    DEFAULT_LIMITS,
+    PrivacyPolicy,
+    normalize_span_name,
+    project_logs,
+    project_traces,
+)
 
 POLICY = PrivacyPolicy(
     span_names=frozenset({"request"}),
@@ -113,6 +120,249 @@ def test_span_bounds_then_projection_preserve_safe_positive(
         }
     assert safe.name == "request"
     assert safe.attributes == {"http.response.status_code": 200}
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [("http.route", "/boards/{board_id}"), ("server.address", "api.example.test")],
+)
+def test_readable_http_names_survive_admission_and_wire_projection(
+    span_pipeline, key, value
+):
+    processor, exporter = span_pipeline
+    policy = replace(POLICY, attribute_values=frozenset({(key, value)}))
+    name = f"DELETE {value}"
+    attributes = {key: value, "server.port": 443}
+    safe = span(name=normalize_span_name(name, policy=policy), attributes=attributes)
+    unsafe = span(
+        name=f"DELETE /raw/{CANARY}", attributes={key: CANARY, "server.port": 65536}
+    )
+    processor.on_end(unsafe)
+    processor.on_end(safe)
+    assert processor.force_flush()
+    records = exporter.get_finished_spans()
+    assert records == (unsafe, safe)
+    assert records[-1].name == name
+    result = project_traces(encode_spans(records), policy=policy)
+    projected = result.resource_spans[0].scope_spans[0].spans
+    assert [item.name for item in projected] == ["DELETE", name]
+    assert {
+        item.key: item.value.string_value
+        for item in projected[-1].attributes
+        if item.key != "server.port"
+    } == {key: value}
+    assert (
+        next(
+            item.value.int_value
+            for item in projected[-1].attributes
+            if item.key == "server.port"
+        )
+        == 443
+    )
+    assert not projected[0].attributes
+    assert CANARY.encode() not in result.SerializeToString()
+
+
+@pytest.mark.parametrize(
+    "method,route,maximum,expected",
+    [
+        ("GET", "r" * 252, 256, "GET " + "r" * 252),
+        ("GET", "r" * 253, 256, "GET"),
+        ("OPTIONS", "r" * 249, 256, "OPTIONS"),
+        ("_OTHER", "r" * 252, 256, "HTTP"),
+        ("GET", "é" * 126, 256, "GET " + "é" * 126),
+        ("GET", "é" * 127, 256, "GET"),
+        ("GET", "r" * 60, 64, "GET " + "r" * 60),
+        ("GET", "r" * 61, 64, "GET"),
+    ],
+)
+def test_long_approved_route_keeps_server_span_and_route(
+    method, route, maximum, expected
+):
+    from opentelemetry.context import Context
+    from opentelemetry.sdk.trace import TracerProvider
+
+    from django_altimeter.conf import Config
+    from django_altimeter.exporting import native_span_limits
+    from django_altimeter.http import RequestState, _finish_span, start_server_span
+
+    limits = replace(DEFAULT_LIMITS, max_string_bytes=maximum)
+    policy = replace(
+        POLICY,
+        attribute_values=POLICY.attribute_values
+        | {("http.route", route), ("http.route", "ok")},
+    )
+    exporter = InMemorySpanExporter()
+    processor = BoundedSpanProcessor(exporter, limits=limits)
+    provider = TracerProvider(
+        resource=Resource({}), span_limits=native_span_limits(limits)
+    )
+    provider.add_span_processor(processor)
+    try:
+        for value in (route, "ok"):
+            state = RequestState(
+                started_at=0,
+                method=method,
+                route=value,
+                status=200,
+                config=Config(limits=limits, policy=policy),
+            )
+            active = start_server_span(
+                provider.get_tracer("django_altimeter"), state, Context(), 1
+            )
+            _finish_span(
+                active, state, outcome="completed", duration=1, end_time=2, failed=False
+            )
+        assert provider.force_flush()
+        records = exporter.get_finished_spans()
+        assert len(records) == 2
+        assert processor.local_dropped_records == 0
+        method_name = "HTTP" if method == "_OTHER" else method
+        assert [item.name for item in records] == [expected, f"{method_name} ok"]
+        result = project_traces(encode_spans(records), policy=policy, limits=limits)
+        projected = result.resource_spans[0].scope_spans[0].spans
+        assert len(projected) == 2
+        assert projected[0].name == expected
+        assert (
+            next(
+                item.value.string_value
+                for item in projected[0].attributes
+                if item.key == "http.route"
+            )
+            == route
+        )
+    finally:
+        provider.shutdown()
+
+
+@pytest.mark.parametrize("maximum", [2048, 512])
+def test_query_text_survives_native_span_limits_and_admission(maximum):
+    from opentelemetry.sdk.trace import TracerProvider
+
+    from django_altimeter.exporting import native_span_limits
+
+    limits = replace(DEFAULT_LIMITS, max_query_text_bytes=maximum)
+    query = "SELECT " + "x" * (maximum - len("SELECT "))
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider(
+        resource=Resource({}), span_limits=native_span_limits(limits)
+    )
+    processor = BoundedSpanProcessor(
+        exporter, limits=limits, schedule_delay_millis=60_000
+    )
+    provider.add_span_processor(processor)
+    try:
+        with provider.get_tracer("django_altimeter").start_as_current_span(
+            "SELECT"
+        ) as active:
+            active.set_attribute("db.query.text", query)
+        assert provider.force_flush()
+        records = exporter.get_finished_spans()
+        assert len(records) == 1
+        assert records[0].attributes["db.query.text"] == query
+        result = project_traces(encode_spans(records), limits=limits)
+        projected = result.resource_spans[0].scope_spans[0].spans[0]
+        assert {item.key: item.value.string_value for item in projected.attributes} == {
+            "db.query.text": query
+        }
+    finally:
+        provider.shutdown()
+
+
+@pytest.mark.parametrize(
+    "string_limit,query_limit", [(256, 2048), (16, 64), (256, 128)]
+)
+def test_non_query_native_attribute_keeps_existing_truncation_and_safe_span(
+    string_limit, query_limit
+):
+    from opentelemetry.sdk.trace import TracerProvider
+
+    from django_altimeter.exporting import native_span_limits
+
+    limits = replace(
+        DEFAULT_LIMITS, max_string_bytes=string_limit, max_query_text_bytes=query_limit
+    )
+    truncated = "/" + "x" * (string_limit - 1)
+    policy = replace(
+        POLICY, attribute_values=POLICY.attribute_values | {("http.route", truncated)}
+    )
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider(
+        resource=Resource({}), span_limits=native_span_limits(limits)
+    )
+    processor = BoundedSpanProcessor(
+        exporter, limits=limits, schedule_delay_millis=60_000
+    )
+    provider.add_span_processor(processor)
+    try:
+        with provider.get_tracer("django_altimeter").start_as_current_span(
+            "GET"
+        ) as active:
+            active.set_attribute("http.response.status_code", 200)
+            active.set_attribute("http.route", truncated + CANARY)
+            original = dict(active.attributes)
+        assert provider.force_flush()
+        records = exporter.get_finished_spans()
+        assert len(records) == 1
+        assert records[0].attributes == {
+            "http.response.status_code": 200,
+            "http.route": truncated,
+        }
+        assert processor.local_dropped_records == 0
+        assert dict(active.attributes) == original
+        result = project_traces(encode_spans(records), policy=policy, limits=limits)
+        projected = result.resource_spans[0].scope_spans[0].spans[0]
+        assert projected.name == "GET"
+        assert {item.key for item in projected.attributes} == {
+            "http.response.status_code",
+            "http.route",
+        }
+        assert CANARY.encode() not in result.SerializeToString()
+    finally:
+        provider.shutdown()
+
+
+def test_query_text_admission_uses_per_key_limits(span_pipeline):
+    processor, exporter = span_pipeline
+    query = "SELECT " + "x" * 1017
+    safe = span(attributes={"db.query.text": query})
+    processor.on_end(safe)
+    processor.on_end(span(attributes={"db.query.text": query, "http.route": "x" * 257}))
+    processor.on_end(span(attributes={"db.query.text": "x" * 2049}))
+    control = span()
+    processor.on_end(control)
+    assert processor.force_flush()
+    assert exporter.get_finished_spans() == (safe, control)
+    assert processor.local_dropped_records == 2
+
+
+@pytest.mark.parametrize("surface", ["event", "link", "resource", "log"])
+def test_query_text_extension_does_not_raise_other_surface_limits(
+    span_pipeline, log_pipeline, surface
+):
+    processor, exporter = span_pipeline
+    long_query = "SELECT " + "x" * 300
+    if surface == "log":
+        logs, log_exporter = log_pipeline
+        unsafe = log_record()
+        unsafe.log_record.attributes = {"db.query.text": long_query}
+        logs.on_emit(unsafe)
+        logs.on_emit(log_record())
+        assert logs.force_flush()
+        assert len(log_exporter.get_finished_logs()) == 1
+        assert log_exporter.get_finished_logs()[0].log_record.body == "request.complete"
+        return
+    attributes = {"db.query.text": long_query}
+    changes = {
+        "event": {"events": [Event("request.complete", attributes)]},
+        "link": {"links": [Link(CONTEXT, attributes)]},
+        "resource": {"resource": Resource(attributes)},
+    }[surface]
+    processor.on_end(span(**changes))
+    safe = span()
+    processor.on_end(safe)
+    assert processor.force_flush()
+    assert exporter.get_finished_spans() == (safe,)
 
 
 @pytest.fixture
@@ -569,7 +819,7 @@ def test_native_span_and_log_limits_override_sdk_environment(monkeypatch):
     assert span_limits.max_events == 8
     assert span_limits.max_links == 4
     assert span_limits.max_attribute_length == 256
-    assert span_limits.max_span_attribute_length == 256
+    assert span_limits.max_span_attribute_length == 2048
     assert log_limits.max_log_record_attributes == 32
     assert log_limits.max_log_record_attribute_length == 256
 

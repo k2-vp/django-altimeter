@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Mapping, Sequence
 from contextvars import ContextVar
+from copy import copy
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from email.utils import format_datetime, parsedate_to_datetime
@@ -118,7 +119,9 @@ def native_span_limits(limits: PrivacyLimits = DEFAULT_LIMITS) -> SpanLimits:
         max_events=limits.max_events,
         max_links=limits.max_links,
         max_attribute_length=limits.max_string_bytes,
-        max_span_attribute_length=limits.max_string_bytes,
+        max_span_attribute_length=max(
+            limits.max_string_bytes, limits.max_query_text_bytes
+        ),
     )
 
 
@@ -178,6 +181,7 @@ def _attributes_size(
     limits: PrivacyLimits,
     *,
     resource: bool = False,
+    span: bool = False,
 ) -> int:
     if attributes is None:
         return 0
@@ -196,7 +200,12 @@ def _attributes_size(
     for index, (key, value) in enumerate(values.items()):
         if index >= ceiling:
             raise _Rejected("admission.size")
-        size += 16 + _text_size(key, limits.max_key_bytes) + _scalar_size(value, limits)
+        size += 16 + _text_size(key, limits.max_key_bytes)
+        size += (
+            _text_size(value, limits.max_query_text_bytes)
+            if span and key == "db.query.text"
+            else _scalar_size(value, limits)
+        )
         _within_record(size, limits)
     return size
 
@@ -279,6 +288,48 @@ def _sequence(values: object, ceiling: int) -> Sequence[object]:
     return values
 
 
+def _native_span_string_limits(
+    span: ReadableSpan, limits: PrivacyLimits
+) -> ReadableSpan:
+    """Preserve the SDK's prior per-string truncation outside query text.
+
+    Only native attributes using our extended span ceiling need this step.
+    Copy on truncation; the original SDK record and its attributes stay intact.
+    Direct ReadableSpan dictionaries still face the unchanged rejection rules.
+    """
+    if type(span) is not ReadableSpan:
+        return span
+    attributes = span._attributes
+    maximum = max(limits.max_string_bytes, limits.max_query_text_bytes)
+    if (
+        maximum == limits.max_string_bytes
+        or type(attributes) is not BoundedAttributes
+        or type(attributes.max_value_len) is not int
+        or attributes.max_value_len != maximum
+    ):
+        return span
+    values = attributes._dict
+    if type(values) is not dict or len(values) > limits.max_attributes:
+        raise _Rejected("admission.size")
+    truncated = None
+    for key, value in values.items():
+        _text_size(key, limits.max_key_bytes)
+        if type(value) is str and key != "db.query.text":
+            if len(value) > maximum:
+                raise _Rejected("admission.size")
+            if len(value) > limits.max_string_bytes:
+                if truncated is None:
+                    truncated = values.copy()
+                truncated[key] = value[: limits.max_string_bytes]
+    if truncated is None:
+        return span
+    bounded = copy(attributes)
+    bounded._dict = truncated
+    result = copy(span)
+    result._attributes = bounded
+    return result
+
+
 def _span_size(span: ReadableSpan, limits: PrivacyLimits) -> int:
     if type(span) is not ReadableSpan:
         raise _Rejected("admission.type")
@@ -298,7 +349,7 @@ def _span_size(span: ReadableSpan, limits: PrivacyLimits) -> int:
     size += _resource_size(span.resource, limits)
     size += _scope_size(span.instrumentation_scope, limits)
     size += _scope_size(span._instrumentation_info, limits)
-    size += _attributes_size(span._attributes, limits)
+    size += _attributes_size(span._attributes, limits, span=True)
     _within_record(size, limits)
     # ReadableSpan.events/links materialize tuples before callers can inspect
     # their lengths. These narrow reads are pinned to OTel SDK 1.45.x. Indexed
@@ -421,6 +472,7 @@ class BoundedSpanProcessor(SpanProcessor):
         if self._pending_diagnostics:
             self._report_diagnostics()
         try:
+            span = _native_span_string_limits(span, self._limits)
             _span_size(span, self._limits)
             self._delegate.on_end(span)
         except _Rejected as error:

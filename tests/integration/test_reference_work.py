@@ -96,7 +96,10 @@ class TestASGIReferenceWork:
                 span for span in spans if span.parent_span_id == queries[0].span_id
             ]
             assert len(children) == 1
-            assert children[0].kind == 3 and children[0].name == "SELECT"
+            expected_name = (
+                "SELECT" if route == "direct" else "SELECT django_content_type"
+            )
+            assert children[0].kind == 3 and children[0].name == expected_name
             assert children[0].trace_id == roots[0].trace_id
             assert not any(
                 value in str(receiver.requests)
@@ -147,7 +150,7 @@ class TestASGIReferenceWork:
                 if span.kind == 3 and span.parent_span_id == query.span_id
             ]
             assert len(driver) == 1
-            assert driver[0].name == "SELECT"
+            assert driver[0].name == "SELECT django_content_type"
             assert driver[0].trace_id == roots[0].trace_id
             assert ROW_CANARY not in str(receiver.requests)
 
@@ -203,7 +206,7 @@ class TestASGIReferenceWork:
             clients = [span for span in spans if span.kind == 3]
             assert len(roots) == 1 and len(clients) == 2
             assert roots[0].trace_id != bytes.fromhex("1" * 32)
-            assert {span.name for span in clients} == {"GET"}
+            assert {span.name for span in clients} == {"GET 127.0.0.1"}
             assert all(span.trace_id == roots[0].trace_id for span in clients)
             outgoing = [span for span in spans if span.name == "reference.outgoing"]
             assert len(outgoing) == 1
@@ -407,7 +410,7 @@ class TestASGIReferenceWork:
             clients = [span for span in spans if span.kind == 3]
             assert len(clients) == 5
             assert sum(span.name == "SELECT" for span in clients) == 1
-            assert sum(span.name == "GET" for span in clients) == 2
+            assert sum(span.name == "GET 127.0.0.1" for span in clients) == 2
             assert all(span.trace_id == roots[0].trace_id for span in clients)
             logs = _logs(receiver)
             assert len(logs) == 1
@@ -479,15 +482,24 @@ print("WORK_RESULT " + json.dumps({
             assert all(span.trace_id == roots[0].trace_id for span in spans)
             clients = [span for span in spans if span.kind == 3]
             assert len(clients) >= 6
-            assert sum(span.name == "SELECT" for span in clients) >= 2
+            assert (
+                sum(
+                    span.name in {"SELECT", "SELECT django_content_type"}
+                    for span in clients
+                )
+                >= 2
+            )
             queries = [span for span in spans if span.name == "reference.query"]
             assert len(queries) == 2
+            query_names = []
             for query in queries:
                 children = [
                     span for span in clients if span.parent_span_id == query.span_id
                 ]
-                assert len(children) == 1 and children[0].name == "SELECT"
-            http = [span for span in clients if span.name == "GET"]
+                assert len(children) == 1
+                query_names.append(children[0].name)
+            assert sorted(query_names) == ["SELECT", "SELECT django_content_type"]
+            http = [span for span in clients if span.name == "GET 127.0.0.1"]
             assert len(http) == 2
             outgoing = [span for span in spans if span.name == "reference.outgoing"]
             assert len(outgoing) == 1

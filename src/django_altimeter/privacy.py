@@ -39,6 +39,9 @@ from opentelemetry.proto.metrics.v1.metrics_pb2 import (
 from opentelemetry.proto.resource.v1.resource_pb2 import Resource
 from opentelemetry.proto.trace.v1.trace_pb2 import Span, Status
 
+from django_altimeter.sql import DB_OPERATIONS as _DB_OPERATIONS
+from django_altimeter.sql import sanitized_query_text
+
 if TYPE_CHECKING:
     from google.protobuf.internal.containers import RepeatedCompositeFieldContainer
 
@@ -51,6 +54,7 @@ class PrivacyLimits:
     max_resource_attributes: int = 16
     max_key_bytes: int = 128
     max_string_bytes: int = 256
+    max_query_text_bytes: int = 2048
     max_events: int = 8
     max_links: int = 4
     max_depth: int = 2
@@ -126,26 +130,6 @@ _HTTP_METHODS = frozenset(
         "_OTHER",
     }
 )
-_DB_OPERATIONS = frozenset(
-    {
-        "SELECT",
-        "INSERT",
-        "UPDATE",
-        "DELETE",
-        "CREATE",
-        "ALTER",
-        "DROP",
-        "TRUNCATE",
-        "BEGIN",
-        "COMMIT",
-        "ROLLBACK",
-        "SAVEPOINT",
-        "RELEASE",
-        "EXPLAIN",
-        "WITH",
-        "CALL",
-    }
-)
 _REDIS_OPERATIONS = frozenset({"GET", "SET", "DEL", "PING", "PIPELINE"})
 _DB_SYSTEMS = frozenset({"postgresql", "mysql", "sqlite", "redis"})
 _SAFE_NAMES = _HTTP_METHODS | _DB_OPERATIONS | {"HTTP", "DB", "SPAN"}
@@ -189,6 +173,7 @@ _STRING_KEYS = frozenset(
         "http.route",
         "http.method",
         "http.request.method",
+        "server.address",
         "http.response.status_class",
         "altimeter.http.outcome",
         "db.system",
@@ -221,7 +206,7 @@ _RECORD_KEYS = (
     _STRING_KEYS
     | _STATUS_KEYS
     | _DURATION_KEYS
-    | {"trace_id", "span_id", "altimeter.overflow"}
+    | {"trace_id", "span_id", "server.port", "db.query.text", "altimeter.overflow"}
 )
 _IDENTITY_RECORD_KEYS = _RECORD_KEYS | _IDENTITY_KEYS
 _RESOURCE_ATTRIBUTE_KEYS = _RESOURCE_KEYS | {"process.pid", "altimeter.probe"}
@@ -282,6 +267,8 @@ def _allowed_attribute(
         return _text(value, min(200, limits.max_string_bytes)) and bool(value.strip())
     if key in _STATUS_KEYS:
         return type(value) is int and 100 <= value <= 599
+    if key == "server.port":
+        return type(value) is int and 1 <= value <= 65535
     if key == "altimeter.http.server.concurrent_at_start":
         return type(value) is int and 1 <= value <= 2**63 - 1
     if key in _DURATION_KEYS or key == "altimeter.http.response_ready.duration":
@@ -292,6 +279,13 @@ def _allowed_attribute(
         return False
     if key == "altimeter.overflow":
         return type(value) is bool
+    if key == "db.query.text":
+        if not _text(value, limits.max_query_text_bytes):
+            return False
+        return (
+            sanitized_query_text(value, max_text_bytes=limits.max_query_text_bytes)
+            is not None
+        )
     if not _text(value, limits.max_string_bytes):
         return False
     if key in {"trace_id", "span_id"}:
@@ -365,10 +359,11 @@ def normalize_span_name(
     policy: PrivacyPolicy = DEFAULT_POLICY,
     limits: PrivacyLimits = DEFAULT_LIMITS,
 ) -> str:
-    """Reduce a bounded SQL/HTTP name to a constant or an exact registered name.
+    """Keep approved HTTP and registered names, or reduce to safe tokens.
 
     Never parse SQL literals/comments or URLs. Oversized strings are rejected
-    before hashing, splitting or encoding. Unknown names become SPAN.
+    before hashing, splitting or encoding. DB summaries require the span's own
+    sanitized query during projection. Unknown names become SPAN.
     """
     try:
         if not is_valid_configuration(policy, limits):
@@ -386,7 +381,20 @@ def _normalize_span_name(
         if not _text(name, limits.max_string_bytes):
             return "SPAN"
         first = name.split(None, 1)[0].upper() if name.strip() else ""
-        # SQL's exclusion is unconditional, even if accidentally registered.
+        method, separator, destination = name.partition(" ")
+        if (
+            separator
+            and (method in _HTTP_METHODS or method == "HTTP")
+            and (
+                _allowed_attribute("http.route", destination, policy, limits, False)
+                or _allowed_attribute(
+                    "server.address", destination, policy, limits, False
+                )
+            )
+        ):
+            return name
+        # A name alone cannot prove this is a DB summary rather than a value or
+        # unapproved HTTP DELETE host. Projection checks the span's own query.
         if first in _DB_OPERATIONS:
             return first
         if name.lstrip().startswith(("/*", "--")):
@@ -489,6 +497,16 @@ def _span(
         server=source.kind == Span.SPAN_KIND_SERVER,
     )
     name = _normalize_span_name(source.name, policy, limits)
+    if name in _DB_OPERATIONS:
+        for item in result.attributes:
+            if item.key == "db.query.text":
+                query = sanitized_query_text(
+                    item.value.string_value,
+                    max_text_bytes=limits.max_query_text_bytes,
+                )
+                if query is not None and query.summary == source.name:
+                    name = query.summary
+                break
     if name == "SPAN" and any(
         _text(a.key, limits.max_key_bytes)
         and a.key

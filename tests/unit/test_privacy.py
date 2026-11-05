@@ -327,6 +327,186 @@ def test_early_names_never_derive_free_text_from_sql_or_url(name, expected):
     assert normalize_span_name("SELECT", policy=POLICY) == "SELECT"
 
 
+@pytest.mark.parametrize(
+    "key,value", [("http.route", "/items/{id}"), ("server.address", "api.example.test")]
+)
+@pytest.mark.parametrize("method", ["GET", "POST", "DELETE", "HTTP", "_OTHER"])
+def test_readable_http_names_require_exact_approved_value(key, value, method):
+    policy = replace(POLICY, attribute_values=frozenset({(key, value)}))
+    safe = f"{method} {value}"
+    unsafe = f"{method} {value}/{CANARY}?secret={CANARY}"
+    expected = "SPAN" if method == "HTTP" else method
+    assert normalize_span_name(safe, policy=policy) == safe
+    assert normalize_span_name(unsafe, policy=policy) == expected
+    request = ExportTraceServiceRequest()
+    scope = request.resource_spans.add().scope_spans.add()
+    scope.spans.add(name=safe)
+    scope.spans.add(name=unsafe)
+    result = project_traces(request, policy=policy)
+    assert [s.name for s in result.resource_spans[0].scope_spans[0].spans] == [
+        safe,
+        expected,
+    ]
+    assert CANARY.encode() not in result.SerializeToString()
+
+
+@pytest.mark.parametrize(
+    "name,expected",
+    [
+        ("GET /items/{id}/", "GET"),
+        ("GET  /items/{id}", "GET"),
+        ("GET\t/items/{id}", "GET"),
+        ("get /items/{id}", "GET"),
+        ("POST API.EXAMPLE.TEST", "POST"),
+        ("POST https://api.example.test", "POST"),
+        ("PATCH api.example.test:443", "PATCH"),
+        ("GET unapproved.example.test", "GET"),
+        ("CUSTOM /items/{id}", "SPAN"),
+    ],
+)
+def test_readable_http_names_do_not_infer_approval(name, expected):
+    policy = replace(
+        POLICY,
+        attribute_values=POLICY.attribute_values
+        | {("server.address", "api.example.test")},
+    )
+    assert normalize_span_name(name, policy=policy) == expected
+    assert (
+        normalize_span_name("GET api.example.test", policy=policy)
+        == "GET api.example.test"
+    )
+
+
+@pytest.mark.parametrize("name", ["Get profile", "HTTP fetch", "GET profile"])
+def test_registered_http_names_keep_their_exact_spelling(name):
+    policy = replace(POLICY, span_names=POLICY.span_names | {name})
+    assert normalize_span_name(name, policy=policy) == name
+    request = ExportTraceServiceRequest()
+    scope = request.resource_spans.add().scope_spans.add()
+    scope.spans.add(name=name)
+    scope.spans.add(name=f"GET /raw/{CANARY}")
+    result = project_traces(request, policy=policy)
+    assert [span.name for span in result.resource_spans[0].scope_spans[0].spans] == [
+        name,
+        "GET",
+    ]
+    assert CANARY.encode() not in result.SerializeToString()
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["DELETE example.com", "DELETE localhost", "UPDATE customer_4111111111111111"],
+)
+def test_unbound_database_summary_name_does_not_authorize_a_value(name):
+    operation = name.partition(" ")[0]
+    assert normalize_span_name(name) == operation
+    request = ExportTraceServiceRequest()
+    scope = request.resource_spans.add().scope_spans.add()
+    scope.spans.add(name=name)
+    positive = scope.spans.add(name="SELECT cart_item")
+    positive.attributes.append(attribute("db.query.text", "SELECT * FROM cart_item"))
+    result = project_traces(request)
+    assert [span.name for span in result.resource_spans[0].scope_spans[0].spans] == [
+        operation,
+        "SELECT cart_item",
+    ]
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        None,
+        "SELECT * FROM another_table",
+        f"SELECT * FROM cart_item WHERE id = '{CANARY}'",
+        "SELECT  * FROM cart_item",
+    ],
+)
+def test_database_summary_requires_its_own_matching_fixed_point(query):
+    request = ExportTraceServiceRequest()
+    scope = request.resource_spans.add().scope_spans.add()
+    candidate = scope.spans.add(name="SELECT cart_item")
+    if query is not None:
+        candidate.attributes.append(attribute("db.query.text", query))
+    # A sibling, event or link with a valid query cannot authorize this name.
+    candidate.events.add(name="exception").attributes.append(
+        attribute("db.query.text", "SELECT * FROM cart_item")
+    )
+    candidate.links.add(trace_id=TRACE_ID, span_id=SPAN_ID).attributes.append(
+        attribute("db.query.text", "SELECT * FROM cart_item")
+    )
+    positive = scope.spans.add(name="SELECT cart_item")
+    positive.attributes.append(attribute("db.query.text", "SELECT * FROM cart_item"))
+    policy = replace(POLICY, span_names=POLICY.span_names | {"SELECT cart_item"})
+    result = project_traces(request, policy=policy)
+    assert [span.name for span in result.resource_spans[0].scope_spans[0].spans] == [
+        "SELECT",
+        "SELECT cart_item",
+    ]
+    assert CANARY.encode() not in result.SerializeToString()
+
+
+def test_delete_host_still_requires_host_approval_without_a_query():
+    name = "DELETE example.com"
+    policy = replace(
+        POLICY,
+        attribute_values=POLICY.attribute_values | {("server.address", "example.com")},
+    )
+    assert normalize_span_name(name, policy=policy) == name
+    assert normalize_span_name(name) == "DELETE"
+
+
+@pytest.mark.parametrize(
+    "key,value,allowed",
+    [
+        ("server.address", "api.example.test", True),
+        ("server.address", CANARY, False),
+        ("server.address", "API.EXAMPLE.TEST", False),
+        ("server.address", "https://api.example.test", False),
+        ("server.address", ["api.example.test"], False),
+        ("server.port", 1, True),
+        ("server.port", 443, True),
+        ("server.port", 65535, True),
+        ("server.port", 0, False),
+        ("server.port", -1, False),
+        ("server.port", 65536, False),
+        ("server.port", True, False),
+        ("server.port", "443", False),
+        ("server.port", 443.0, False),
+    ],
+)
+def test_server_destination_admission_is_exact_and_bounded(key, value, allowed):
+    policy = replace(
+        POLICY, attribute_values=frozenset({("server.address", "api.example.test")})
+    )
+    assert is_allowed_attribute(key, value, policy=policy) is allowed
+    assert is_allowed_attribute("server.address", "api.example.test", policy=policy)
+    assert is_allowed_attribute("server.port", 443, policy=policy)
+    assert not is_allowed_attribute(key, value, policy=policy, resource=True)
+
+
+def test_server_destination_projection_keeps_approved_host_and_port_only():
+    policy = replace(
+        POLICY, attribute_values=frozenset({("server.address", "api.example.test")})
+    )
+    request = ExportTraceServiceRequest()
+    scope = request.resource_spans.add().scope_spans.add()
+    for host, port in (("api.example.test", 443), (CANARY, 65536)):
+        span = scope.spans.add(name=f"GET {host}")
+        span.attributes.extend(
+            [attribute("server.address", host), attribute("server.port", port)]
+        )
+    result = project_traces(request, policy=policy)
+    safe, rejected = result.resource_spans[0].scope_spans[0].spans
+    assert safe.name == "GET api.example.test"
+    assert list(safe.attributes) == [
+        attribute("server.address", "api.example.test"),
+        attribute("server.port", 443),
+    ]
+    assert rejected.name == "GET"
+    assert not rejected.attributes
+    assert CANARY.encode() not in result.SerializeToString()
+
+
 def test_unknown_database_statement_becomes_db_not_statement_text():
     request = trace_request()
     span = request.resource_spans[0].scope_spans[0].spans[0]
@@ -786,6 +966,190 @@ def test_explicit_span_registration_cannot_override_sql_text_exclusion():
     assert normalize_span_name(name, policy=policy) == "SELECT"
     result = project_traces(trace_request(), policy=policy)
     assert CANARY.encode() not in result.SerializeToString()
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        f"SELECT '{CANARY}'",
+        f"SELECT E'{CANARY}'",
+        f"SELECT $tag${CANARY}$tag$",
+        "SELECT 987654321",
+        f"SELECT ? -- {CANARY}",
+        f"SELECT ? /* {CANARY} */",
+        "SELECT  ?",
+        "SELECT 'unterminated",
+        "SELECT ?\x00",
+        "SELECT ? " + chr(1),
+        "",
+        b"SELECT ?",
+        ["SELECT ?"],
+    ],
+    ids=[
+        "literal",
+        "escaped",
+        "dollar",
+        "number",
+        "line-comment",
+        "block-comment",
+        "noncanonical",
+        "unterminated",
+        "nul",
+        "unknown-character",
+        "empty",
+        "bytes",
+        "list",
+    ],
+)
+def test_query_text_policy_requires_sanitized_fixed_point(query):
+    safe = "SELECT ?"
+    policy = replace(
+        POLICY,
+        attribute_values=frozenset({("db.query.text", f"SELECT '{CANARY}'")}),
+    )
+    assert not is_allowed_attribute("db.query.text", query, policy=policy)
+    assert is_allowed_attribute("db.query.text", safe, policy=policy)
+    assert not is_allowed_attribute("db.statement", safe, policy=policy)
+    assert not is_allowed_attribute("db.query.text", safe, policy=policy, resource=True)
+
+
+@pytest.mark.parametrize("kind", [Uninspectable, UninspectableString])
+def test_query_text_rejects_unknown_objects_without_inspection(kind):
+    value = kind("SELECT ?") if kind is UninspectableString else kind()
+    assert not is_allowed_attribute("db.query.text", value)
+    assert is_allowed_attribute("db.query.text", "SELECT ?")
+
+
+@pytest.mark.parametrize(
+    "name,expected",
+    [
+        ("SELECT cart_item", "SELECT cart_item"),
+        ("INSERT public.cart_item", "INSERT public.cart_item"),
+        ("UPDATE _cart$", "UPDATE _cart$"),
+        ("DELETE cart_item", "DELETE cart_item"),
+        ("WITH cart_item", "WITH"),
+        ("SELECT " + "x" * 128, "SELECT " + "x" * 128),
+        ("SELECT " + "x" * 129, "SELECT"),
+        ("SELECT 123", "SELECT"),
+        (f"SELECT '{CANARY}'", "SELECT"),
+        (f"SELECT cart_item /* {CANARY} */", "SELECT"),
+        ("SELECT cart_item WHERE id = ?", "SELECT"),
+        ('SELECT "cart_item"', "SELECT"),
+        ("SELECT public.cart.item", "SELECT"),
+        ("SELECT cart-item", "SELECT"),
+        ("SELECT cart_item;", "SELECT"),
+        ("SELECT  cart_item", "SELECT"),
+        ("SELECT\tcart_item", "SELECT"),
+        ("select cart_item", "SELECT"),
+    ],
+)
+def test_database_summary_names_admit_only_bounded_operation_and_identifier(
+    name, expected
+):
+    policy = replace(POLICY, span_names=frozenset({name}))
+    operation, _, target = name.partition(" ")
+    assert normalize_span_name(name, policy=policy) == name.split(None, 1)[0].upper()
+    assert normalize_span_name("SELECT cart_item", policy=policy) == "SELECT"
+    request = ExportTraceServiceRequest()
+    scope = request.resource_spans.add().scope_spans.add()
+    candidate = scope.spans.add(name=name)
+    query = {
+        "SELECT": f"SELECT * FROM {target}",
+        "INSERT": f"INSERT INTO {target}",
+        "UPDATE": f"UPDATE {target}",
+        "DELETE": f"DELETE FROM {target}",
+    }.get(operation.upper(), name)
+    candidate.attributes.append(attribute("db.query.text", query))
+    control = scope.spans.add(name="SELECT cart_item")
+    control.attributes.append(attribute("db.query.text", "SELECT * FROM cart_item"))
+    result = project_traces(request, policy=policy)
+    assert [span.name for span in result.resource_spans[0].scope_spans[0].spans] == [
+        expected,
+        "SELECT cart_item",
+    ]
+    assert CANARY.encode() not in result.SerializeToString()
+
+
+def test_query_text_projection_keeps_fixed_point_and_drops_planted_values():
+    safe = "SELECT item_id FROM cart_item WHERE item_id = %s"
+    request = ExportTraceServiceRequest()
+    scope = request.resource_spans.add().scope_spans.add()
+    for text in (
+        safe,
+        f"SELECT '{CANARY}'",
+        f"SELECT ? /* {CANARY} */",
+        "SELECT 987654321",
+    ):
+        span = scope.spans.add(name="SELECT cart_item")
+        span.attributes.extend(
+            [attribute("db.query.text", text), attribute("db.operation.name", "SELECT")]
+        )
+    before = request.SerializeToString()
+    assert CANARY.encode() in before and b"987654321" in before
+    result = project_traces(request, policy=POLICY)
+    spans = result.resource_spans[0].scope_spans[0].spans
+    assert len(spans) == 4
+    assert [span.name for span in spans] == [
+        "SELECT cart_item",
+        "SELECT",
+        "SELECT",
+        "SELECT",
+    ]
+    assert list(spans[0].attributes) == [
+        attribute("db.query.text", safe),
+        attribute("db.operation.name", "SELECT"),
+    ]
+    assert all(
+        list(span.attributes) == [attribute("db.operation.name", "SELECT")]
+        for span in spans[1:]
+    )
+    assert CANARY.encode() not in result.SerializeToString()
+    assert b"987654321" not in result.SerializeToString()
+    assert request.SerializeToString() == before
+
+
+def test_query_text_has_its_own_downward_only_utf8_byte_limit():
+    assert DEFAULT_LIMITS.max_query_text_bytes == 2048
+    safe = 'SELECT "é"'
+    length = len(safe.encode("utf-8"))
+    assert length > len(safe)
+    limits = replace(DEFAULT_LIMITS, max_query_text_bytes=length)
+    assert is_valid_configuration(POLICY, limits)
+    assert is_allowed_attribute("db.query.text", safe, limits=limits)
+    assert not is_allowed_attribute(
+        "db.query.text", safe, limits=replace(limits, max_query_text_bytes=length - 1)
+    )
+    full = "SELECT " + "x" * (2048 - len("SELECT "))
+    assert is_allowed_attribute("db.query.text", full)
+    assert not is_allowed_attribute("db.query.text", full + "x")
+    assert not is_allowed_attribute(
+        "http.route",
+        full,
+        policy=replace(POLICY, attribute_values=frozenset({("http.route", full)})),
+    )
+    for invalid in (-1, 2049, True, 1.0):
+        invalid_limits = replace(DEFAULT_LIMITS, max_query_text_bytes=invalid)
+        assert not is_valid_configuration(POLICY, invalid_limits)
+        assert not is_allowed_attribute(
+            "db.query.text", "SELECT ?", limits=invalid_limits
+        )
+    zero = replace(DEFAULT_LIMITS, max_query_text_bytes=0)
+    assert is_valid_configuration(POLICY, zero)
+    assert not is_allowed_attribute("db.query.text", "SELECT ?", limits=zero)
+
+
+def test_query_text_does_not_become_a_metric_dimension():
+    request = metric_request()
+    point = (
+        request.resource_metrics[0].scope_metrics[0].metrics[0].histogram.data_points[0]
+    )
+    point.attributes.append(attribute("db.query.text", "SELECT ?"))
+    result = project_metrics(request, policy=POLICY)
+    safe = (
+        result.resource_metrics[0].scope_metrics[0].metrics[0].histogram.data_points[0]
+    )
+    assert list(safe.attributes) == [attribute("http.route", "/items/{id}")]
+    assert safe.count == 1 and safe.sum == 0.25
 
 
 @pytest.mark.parametrize("surface", ["span", "log", "metric", "resource"])

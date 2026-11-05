@@ -7,8 +7,8 @@ add SQL comments, or instrument a connection that predates installation.
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping
-from contextlib import AbstractContextManager, nullcontext
+from collections.abc import Iterator, Mapping
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from functools import wraps
 from importlib import import_module
@@ -19,6 +19,7 @@ from opentelemetry import trace
 
 from django_altimeter.context import _diagnostic, client_span
 from django_altimeter.privacy import is_allowed_attribute, normalize_span_name
+from django_altimeter.sql import SanitizedQuery, sanitize_query
 
 if TYPE_CHECKING:
     from django_altimeter.runtime import ProcessRuntime
@@ -46,6 +47,9 @@ def _operation(query: object, runtime: ProcessRuntime) -> str:
     if type(query) is not str:
         return "DB"
     name = normalize_span_name(query, policy=runtime.config.policy, limits=limits)
+    # Summary names are now accepted by privacy, but a declined description
+    # (including bytes) must keep the previous operation-only fallback.
+    name = name.partition(" ")[0]
     return (
         name
         if is_allowed_attribute(
@@ -53,6 +57,25 @@ def _operation(query: object, runtime: ProcessRuntime) -> str:
         )
         else "DB"
     )
+
+
+@contextmanager
+def _described_query(query: SanitizedQuery) -> Iterator[trace.Span]:
+    with client_span(
+        query.operation,
+        attributes={
+            "db.system.name": "postgresql",
+            "db.operation.name": query.operation,
+        },
+    ) as current:
+        # Only successful native execution earns a query description. Failed
+        # statements keep their old operation/error facts and no query content.
+        yield current
+        try:
+            current.update_name(query.summary)
+            current.set_attribute("db.query.text", query.text)
+        except Exception:
+            _diagnostic("driver.psycopg_span_failed")
 
 
 def _query_context(
@@ -65,7 +88,13 @@ def _query_context(
 
         if get_owned_trace_runtime() is not runtime or not is_instrumentation_enabled():
             return nullcontext(trace.INVALID_SPAN)
-        name = _operation(args[0] if args else kwargs.get("query"), runtime)
+        query = args[0] if args else kwargs.get("query")
+        sanitized = sanitize_query(
+            query, max_text_bytes=runtime.config.limits.max_query_text_bytes
+        )
+        if sanitized is not None:
+            return _described_query(sanitized)
+        name = _operation(query, runtime)
         return client_span(
             name,
             attributes={"db.system.name": "postgresql", "db.operation.name": name},

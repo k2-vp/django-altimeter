@@ -748,6 +748,7 @@ def validate_runtime(config: Config) -> tuple[str, ...]:
         validation = validate_config(config)
         if validation.config is None:
             return validation.codes
+        config = validation.config
         if not config.enabled:
             return ()
         codes: list[str] = []
